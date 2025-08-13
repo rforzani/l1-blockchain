@@ -3,6 +3,25 @@
 use sha2::{Digest, Sha256};
 use crate::types::Hash;
 
+const DOM_COMMIT: &[u8] = b"COMMIT";
+const DOM_ORDER:  &[u8] = b"ORDER";
+
+pub fn commitment_hash(tx_bytes: &[u8], salt: &Hash) -> Hash {
+    let mut buf = Vec::with_capacity(6 + tx_bytes.len() + 32);
+    buf.extend_from_slice(DOM_COMMIT);
+    buf.extend_from_slice(tx_bytes);
+    buf.extend_from_slice(salt);
+    hash_bytes_sha256(&buf)
+}
+
+pub fn reveal_order_key(commitment: &Hash, randomness: &Hash) -> Hash {
+    let mut buf = Vec::with_capacity(5 + 32 + 32);
+    buf.extend_from_slice(DOM_ORDER);
+    buf.extend_from_slice(commitment);
+    buf.extend_from_slice(randomness);
+    hash_bytes_sha256(&buf)
+}
+
 pub fn hash_bytes_sha256(data: &[u8]) -> Hash {
     // 1. Create a new SHA-256 hasher
     let mut hasher = Sha256::new();

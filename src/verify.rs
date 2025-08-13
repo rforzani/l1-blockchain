@@ -34,29 +34,46 @@ pub fn verify_block_roots(header: &BlockHeader, block: &Block, receipts: &[Recei
 #[test]
 fn verify_block_roots_catches_tamper() {
     use std::collections::HashMap;
-    use crate::state::{Balances, Nonces};
+    use crate::state::{Balances, Nonces, Commitments};
     use crate::stf::process_block;
-    use crate::types::{Block, Transaction};
+    use crate::types::{Block, Tx, CommitTx, Hash, AccessList, StateKey};
+    use crate::verify::verify_block_roots;
 
-    let mut balances: Balances = HashMap::from([("Alice".into(), 100), ("Bob".into(), 50)]);
+    // State
+    let mut balances: Balances = HashMap::from([("Alice".into(), 100_u64)]);
     let mut nonces: Nonces = Default::default();
-    
-    let block = Block::new(vec![
-        (Transaction::transfer("Alice","Bob", 10, 0)).into()
-    ], 1);
+    let mut comm: Commitments = Default::default();
 
-    // build (builder path)
-    let parent = [0u8;32];
-    let res = process_block(&block, &mut balances, &mut nonces, &parent).expect("ok");
+    let al = AccessList {
+        reads: vec![ StateKey::Balance("Alice".into())],
+        writes: vec![ StateKey::Balance("Alice".into())],
+    };
 
-    // verify (ok)
+    // Block 1 with a single Commit (opaque commitment is fine here)
+    let commitment: Hash = [42u8; 32];
+    let block = Block::new(
+        vec![Tx::Commit(CommitTx {
+            commitment,
+            expires_at: 5,
+            sender: "Alice".into(),
+            access_list: al
+        })],
+        1,
+    );
+
+    // Build (builder path)
+    let parent = [0u8; 32];
+    let res = process_block(&block, &mut balances, &mut nonces, &mut comm, &parent)
+        .expect("ok");
+
+    // Verify (ok)
     verify_block_roots(&res.header, &block, &res.receipts).expect("roots match");
 
-    // tamper one receipt
+    // Tamper one receipt
     let mut bad_receipts = res.receipts.clone();
     bad_receipts[0].gas_used += 1;
 
-    // verify (must fail)
+    // Verify (must fail)
     let err = verify_block_roots(&res.header, &block, &bad_receipts).unwrap_err();
     assert!(err.contains("mismatch"));
 }

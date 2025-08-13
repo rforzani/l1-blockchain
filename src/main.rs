@@ -9,7 +9,7 @@ mod codec;
 mod chain;
 mod verify;
 
-use crate::state::{Balances, print_balances, Nonces};
+use crate::state::{Balances, print_balances, Nonces, Commitments};
 use crate::types::{Transaction, Block};
 use crate::types::Hash;
 use crate::chain::Chain;
@@ -48,7 +48,9 @@ fn main() {
 
     let block2 = Block::new(transactions2, 2);
 
-    match chain.apply_block(&block1, &mut balances, &mut nonces) {
+    let mut commitments: Commitments = Default::default();
+
+    match chain.apply_block(&block1, &mut balances, &mut nonces, &mut commitments) {
         Ok(block_result) => {
             println!("gas_total={}", block_result.gas_total);
             println!("txs_root={}", hex32(&block_result.txs_root));
@@ -61,7 +63,7 @@ fn main() {
         Err(msg ) => {println!("{}", msg)}
     }
 
-    match chain.apply_block(&block2, &mut balances, &mut nonces) {
+    match chain.apply_block(&block2, &mut balances, &mut nonces, &mut commitments) {
         Ok(block_result) => {
             println!("gas_total={}", block_result.gas_total);
             println!("txs_root={}", hex32(&block_result.txs_root));

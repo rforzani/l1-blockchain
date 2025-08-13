@@ -113,7 +113,8 @@ impl AccessList {
 pub struct CommitTx {
     pub commitment: Hash,
     pub expires_at: u64,
-    pub sender: String
+    pub sender: String,
+    pub access_list: AccessList
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -142,4 +143,11 @@ pub struct CommitmentMeta {
     pub expires_at: u64,
     pub consumed: bool,
     pub included_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum Event {
+    CommitStored { commitment: Hash, owner: String, expires_at: u64 },
+    CommitConsumed { commitment: Hash },
+    CommitExpired { commitment: Hash },
 }

@@ -1,10 +1,14 @@
 // src/stf.rs
 
+use crate::crypto::commitment_hash;
 use crate::crypto::merkle_root;
 use crate::crypto::hash_bytes_sha256;
+use crate::state::Commitments;
+use crate::state::COMMIT_FEE;
 use crate::state::{Balances, Nonces};
-use crate::codec::{tx_enum_bytes, receipt_bytes, header_bytes};
-use crate::types::{Block, Receipt, ExecOutcome, Hash, BlockHeader, Transaction, StateKey, Tx};
+use crate::codec::{tx_enum_bytes, receipt_bytes, header_bytes, tx_bytes};
+use crate::types::CommitmentMeta;
+use crate::types::{Block, Receipt, ExecOutcome, Hash, BlockHeader, Transaction, StateKey, Tx, Event, RevealTx, CommitTx};
 use crate::gas::BASE_FEE_PER_TX;
 use std::fmt;
 
@@ -43,6 +47,7 @@ pub struct BlockResult {
     pub receipts_root: Hash,
     pub header: BlockHeader,
     pub block_hash: Hash,
+    pub events: Vec<Event>
 }
 
 /// Process a single transaction against the balances map.
@@ -104,42 +109,136 @@ pub fn process_transaction(
     Ok(Receipt { outcome, gas_used: BASE_FEE_PER_TX, error: error })
 }
 
-pub fn process_block(block: &Block, balances: &mut Balances, nonces: &mut Nonces, parent_hash: &Hash) -> Result<BlockResult, BlockError> {
+fn process_commit(
+    c: &CommitTx,
+    balances: &mut Balances,
+    commitments: &mut Commitments,
+    current_height: u64,
+    events: &mut Vec<Event>,
+) -> Result<Receipt, TxError> {
+    let required = [
+        StateKey::Balance(c.sender.clone())
+    ];
+
+    if !c.access_list.covers(&required) {
+        return Err(TxError::IntrinsicInvalid("access list missing required key".to_string()));
+    }
+
+    let sender = c.sender.clone();
+    let bal = balances.entry(sender.clone()).or_insert(0);
+    if *bal < COMMIT_FEE {
+        return Err(TxError::IntrinsicInvalid("insufficient funds to pay commit fee".to_string()));
+    }
+    *bal -= COMMIT_FEE;
+
+    // 2) reject duplicate active commitment
+    if let Some(meta) = commitments.get(&c.commitment) {
+        if !meta.consumed {
+            return Err(TxError::IntrinsicInvalid("duplicate commitment".to_string()));
+        }
+    }
+
+    // 3) store commitment metadata
+    commitments.insert(
+        c.commitment,
+        CommitmentMeta {
+            owner: sender.clone(),
+            expires_at: c.expires_at,
+            consumed: false,
+            included_at: current_height,
+        },
+    );
+
+    // 4) event
+    events.push(Event::CommitStored {
+        commitment: c.commitment,
+        owner: sender,
+        expires_at: c.expires_at,
+    });
+
+    // 5) receipt
+    Ok(Receipt { outcome: ExecOutcome::Success, gas_used: BASE_FEE_PER_TX, error: None })
+}
+
+fn process_reveal(
+    r: &RevealTx,
+    balances: &mut Balances,
+    nonces: &mut Nonces,
+    current_height: u64,
+    commitments: &mut Commitments,
+    events: &mut Vec<Event>,
+) -> Result<Receipt, TxError> {
+    let required = [
+        StateKey::Nonce(r.tx.from.clone()),
+        StateKey::Balance(r.tx.from.clone()),
+        StateKey::Balance(r.tx.to.clone()),
+    ];
+    
+    if !r.tx.access_list.covers(&required) {
+        return Err(TxError::IntrinsicInvalid("access list missing required key".to_string()));
+    }
+    // Sender sanity
+    if r.sender != r.tx.from {
+        return Err(TxError::IntrinsicInvalid("reveal sender != tx.from".to_string()));
+    }
+
+    let cmt = commitment_hash(&tx_bytes(&r.tx), &r.salt);
+    
+    {
+        let meta = commitments.get_mut(&cmt)
+            .ok_or_else(|| TxError::IntrinsicInvalid("no such commitment".to_string()))?;
+    
+        if meta.owner != r.sender {
+            return Err(TxError::IntrinsicInvalid("owner mismatch".to_string()));
+        }
+        if meta.consumed {
+            return Err(TxError::IntrinsicInvalid("commit already consumed".to_string()));
+        }
+        if current_height <= meta.included_at {
+            return Err(TxError::IntrinsicInvalid("same block reveal".to_string()));
+        }
+        if current_height > meta.expires_at {
+            return Err(TxError::IntrinsicInvalid("commit expired".to_string()));
+        }
+    
+        meta.consumed = true;  // borrow consumed now
+    }
+
+    events.push(Event::CommitConsumed { commitment: cmt });
+
+    process_transaction(&r.tx, balances, nonces)
+}
+
+pub fn process_block(block: &Block, balances: &mut Balances, nonces: &mut Nonces, commitments: &mut Commitments, parent_hash: &Hash) -> Result<BlockResult, BlockError> {
     let mut receipts : Vec<Receipt> = Vec::new();
     let mut gas_total : u64 = 0;
 
     let mut txs_hashes : Vec<Hash> = Vec::new();
     let mut receipt_hashes : Vec<Hash> = Vec::new();
+    let mut events: Vec<Event> = Vec::new();
 
     for (i, tx) in block.transactions.iter().enumerate() {
-        match tx {
-            Tx::Transfer(t) => {
-                match process_transaction(t, balances, nonces) {
-                    Ok(receipt) => { 
-                        gas_total = gas_total + receipt.gas_used; 
-                        txs_hashes.push(hash_bytes_sha256(&tx_enum_bytes(tx))); 
-                        receipt_hashes.push(hash_bytes_sha256(&receipt_bytes(&receipt))); 
-                        receipts.push(receipt); 
-                    }
-                    Err(TxError::IntrinsicInvalid(e)) => {
-                        return Err(BlockError::IntrinsicInvalid(format!(
-                            "block={} tx_index={} error={}",
-                            block.block_number,
-                            i + 1,
-                            e
-                        )));
-                    }
-                }
-            },
-            Tx::Commit(_) => {
+        let rcpt_res = match tx {
+            Tx::Transfer(_) => {
                 return Err(BlockError::IntrinsicInvalid(
-                    "commit/reveal not implemented yet".to_string(),
+                    "plain transfers disabled".to_string()
                 ));
-            },
-            Tx::Reveal(_) => {
-                return Err(BlockError::IntrinsicInvalid(
-                    "commit/reveal not implemented yet".to_string(),
-                ));
+            }
+            Tx::Commit(c)   => process_commit(c, balances, commitments, block.block_number, &mut events),
+            Tx::Reveal(r)   => process_reveal(r, balances, nonces, block.block_number, commitments, &mut events),
+        };
+
+        match rcpt_res {
+            Ok(receipt) => {
+                gas_total += receipt.gas_used;
+                txs_hashes.push(hash_bytes_sha256(&tx_enum_bytes(tx)));
+                receipt_hashes.push(hash_bytes_sha256(&receipt_bytes(&receipt)));
+                receipts.push(receipt);
+            }
+            Err(TxError::IntrinsicInvalid(e)) => {
+                return Err(BlockError::IntrinsicInvalid(format!(
+                    "block={} tx_index={} error={}", block.block_number, i + 1, e
+                )));
             }
         }
     }
@@ -158,29 +257,94 @@ pub fn process_block(block: &Block, balances: &mut Balances, nonces: &mut Nonces
     
     let block_hash = hash_bytes_sha256(&header_bytes(&header));
 
-    Ok(BlockResult { receipts, gas_total, txs_root, receipts_root, header, block_hash })
+    Ok(BlockResult { receipts, gas_total, txs_root, receipts_root, header, block_hash, events })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Transaction;
+    use crate::types::{AccessList, Transaction};
     use std::collections::HashMap;
 
     #[test]
-    fn transfer_transaction_successful() {
-        let mut balances = HashMap::from([
+    fn transfer_via_commit_reveal_success() {
+        use std::collections::HashMap;
+        use crate::chain::Chain;
+        use crate::codec::tx_bytes;
+        use crate::crypto::commitment_hash;
+        use crate::state::{Balances, Nonces, Commitments, COMMIT_FEE};
+        use crate::types::{
+            Transaction, Tx, CommitTx, RevealTx, Block, ExecOutcome, Hash,
+        };
+        use crate::stf::BASE_FEE_PER_TX;
+    
+        // Initial state
+        let mut balances: Balances = HashMap::from([
             ("Alice".to_string(), 100),
             ("Bob".to_string(), 50),
         ]);
-        let mut nonces = Default::default();
+        
+        let al = AccessList {
+            reads: vec![ StateKey::Balance("Alice".into()),  StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into()) ],
+            writes: vec![ StateKey::Balance("Alice".into()),  StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into()) ],
+        };
 
-        let tx = Transaction::transfer("Alice","Bob", 30, 0);
-        let rcpt = process_transaction(&tx, &mut balances, &mut nonces).expect("valid");
+        let mut nonces: Nonces = Default::default();
+        let mut commitments: Commitments = Default::default();
+        let mut chain = Chain::new();
+    
+        // Inner plaintext transfer (to be revealed later)
+        let tx = Transaction::transfer("Alice", "Bob", 30, 0);
+    
+        // Salt and commitment
+        let salt: Hash = [7u8; 32];
+        let cmt = commitment_hash(&tx_bytes(&tx), &salt);
+    
+        // --- Block 1: Commit ---
+        let b1 = Block::new(
+            vec![Tx::Commit(CommitTx {
+                commitment: cmt,
+                expires_at: 5,       // any height >= 2 and <= 1+EXPIRY_WINDOW is fine for the test
+                sender: "Alice".into(),
+                access_list: al
+            })],
+            1,
+        );
+        let _res1 = chain
+            .apply_block(&b1, &mut balances, &mut nonces, &mut commitments)
+            .expect("block 1 (commit) should apply");
+    
+        // After commit: only commit fee is burned, nonce unchanged
+        assert_eq!(balances["Alice"], 100 - COMMIT_FEE);
+        assert_eq!(balances["Bob"], 50);
+        assert_eq!(*nonces.get("Alice").unwrap_or(&0), 0);
+    
+        // --- Block 2: Reveal (executes the transfer) ---
+        let b2 = Block::new(
+            vec![Tx::Reveal(RevealTx {
+                tx: tx.clone(),
+                salt,
+                sender: "Alice".into(),
+            })],
+            2,
+        );
+        let res2 = chain
+            .apply_block(&b2, &mut balances, &mut nonces, &mut commitments)
+            .expect("block 2 (reveal) should apply");
+    
+        // Receipt checks
+        assert_eq!(res2.receipts.len(), 1);
+        let rcpt = &res2.receipts[0];
         assert_eq!(rcpt.outcome, ExecOutcome::Success);
         assert_eq!(rcpt.gas_used, BASE_FEE_PER_TX);
-        assert_eq!(balances["Alice"], 69);
+    
+        // Final balances:
+        // Alice: 100 - COMMIT_FEE(1) - BASE_FEE(1) - 30 = 68
+        // Bob:   50 + 30 = 80
+        assert_eq!(balances["Alice"], 68);
         assert_eq!(balances["Bob"], 80);
+    
+        // Nonce consumed on reveal (not on commit)
         assert_eq!(*nonces.get("Alice").unwrap(), 1);
     }
 
