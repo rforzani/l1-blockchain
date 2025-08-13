@@ -5,12 +5,13 @@ pub struct Transaction {
     pub from: String,
     pub to: String,
     pub amount: u64,
-    pub nonce: u64
+    pub nonce: u64,
+    pub access_list: AccessList
 }
 
 impl Transaction {
-    pub fn new(from: impl Into<String>, to: impl Into<String>, amount: u64, nonce: u64) -> Self {
-        Self { from: from.into(), to: to.into(), amount, nonce }
+    pub fn new(from: impl Into<String>, to: impl Into<String>, amount: u64, nonce: u64, access_list: AccessList) -> Self {
+        Self { from: from.into(), to: to.into(), amount, nonce, access_list }
     }
 }
 

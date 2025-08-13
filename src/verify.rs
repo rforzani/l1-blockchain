@@ -36,12 +36,18 @@ fn verify_block_roots_catches_tamper() {
     use std::collections::HashMap;
     use crate::state::{Balances, Nonces};
     use crate::stf::process_block;
-    use crate::types::{Block, Transaction};
+    use crate::types::{Block, Transaction, AccessList, StateKey};
 
     let mut balances: Balances = HashMap::from([("Alice".into(), 100), ("Bob".into(), 50)]);
     let mut nonces: Nonces = Default::default();
+
+    let al = AccessList {
+        reads: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
+        writes: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
+    };
+    
     let block = Block::new(vec![
-        Transaction::new("Alice","Bob", 10, 0)
+        Transaction::new("Alice","Bob", 10, 0, al)
     ], 1);
 
     // build (builder path)

@@ -4,7 +4,7 @@ use crate::crypto::merkle_root;
 use crate::crypto::hash_bytes_sha256;
 use crate::state::{Balances, Nonces};
 use crate::codec::{tx_bytes, receipt_bytes, header_bytes};
-use crate::types::{Block, Receipt, ExecOutcome, Hash, BlockHeader};
+use crate::types::{Block, Receipt, ExecOutcome, Hash, BlockHeader, StateKey, AccessList};
 use crate::gas::BASE_FEE_PER_TX;
 use std::fmt;
 
@@ -149,7 +149,11 @@ mod tests {
             ("Bob".to_string(), 50),
         ]);
         let mut nonces = Default::default();
-        let tx = Transaction::new("Alice","Bob", 30, 0);
+        let al = AccessList {
+            reads: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
+            writes: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())]
+        };
+        let tx = Transaction::new("Alice","Bob", 30, 0, al);
         let rcpt = process_transaction(&tx, &mut balances, &mut nonces).expect("valid");
         assert_eq!(rcpt.outcome, ExecOutcome::Success);
         assert_eq!(rcpt.gas_used, BASE_FEE_PER_TX);
@@ -166,7 +170,12 @@ mod tests {
         ]);
         let mut nonces = Default::default();
 
-        let tx = Transaction::new("Alice","Bob", 30,0);
+        let al = AccessList {
+            reads: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
+            writes: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
+        };
+
+        let tx = Transaction::new("Alice","Bob", 30,0, al);
         let rcpt = process_transaction(&tx, &mut balances, &mut nonces).expect("valid but reverts");
         assert_eq!(rcpt.outcome, ExecOutcome::Revert);
         assert!(rcpt.error.is_some());
@@ -182,8 +191,13 @@ mod tests {
             ("Bob".to_string(), 50),
         ]);
         let mut nonces: HashMap<String, u64> = Default::default();
+
+        let al = AccessList {
+            reads: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
+            writes: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
+        };
     
-        let tx = Transaction::new("Alice", "Bob", 1, 0);
+        let tx = Transaction::new("Alice", "Bob", 1, 0, al);
     
         match process_transaction(&tx, &mut balances, &mut nonces) {
             Err(TxError::IntrinsicInvalid(msg)) => {

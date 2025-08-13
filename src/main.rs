@@ -10,7 +10,7 @@ mod chain;
 mod verify;
 
 use crate::state::{Balances, print_balances, Nonces};
-use crate::types::{Transaction, Block};
+use crate::types::{Transaction, Block, StateKey, AccessList};
 use crate::types::Hash;
 use crate::chain::Chain;
 
@@ -34,11 +34,21 @@ fn main() {
 
     let mut chain: Chain = Chain::new();
 
+    let al1 = AccessList {
+        reads: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
+        writes: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
+    };
+
     // 2) successful tx: Alice -> Bob (30)
-    let tx1 = Transaction::new("Alice", "Bob", 20, 0);
+    let tx1 = Transaction::new("Alice", "Bob", 20, 0, al1);
+
+    let al2 = AccessList {
+        reads: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Bob".into())],
+        writes: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Bob".into())],
+    };
 
     // 3) failing tx: Alice -> Bob (200)    
-    let tx2 = Transaction::new("Bob", "Alice", 10, 0);
+    let tx2 = Transaction::new("Bob", "Alice", 10, 0, al2);
 
     let transactions1 = vec![tx1];
 
