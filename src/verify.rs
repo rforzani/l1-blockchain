@@ -3,14 +3,14 @@
 use crate::types::{Receipt, Block, BlockHeader, Hash};
 
 pub fn compute_roots_for(block: &Block, receipts: &[Receipt]) -> (Hash, Hash) {
-    use crate::codec::{tx_bytes, receipt_bytes};
+    use crate::codec::{tx_enum_bytes, receipt_bytes};
     use crate::crypto::{hash_bytes_sha256, merkle_root};
     use crate::types::Hash;
 
     let tx_hashes: Vec<Hash> = block
         .transactions
         .iter()
-        .map(|tx| hash_bytes_sha256(&tx_bytes(tx)))
+        .map(|tx| hash_bytes_sha256(&tx_enum_bytes(tx)))
         .collect();
 
     let receipt_hashes: Vec<Hash> = receipts
@@ -36,18 +36,13 @@ fn verify_block_roots_catches_tamper() {
     use std::collections::HashMap;
     use crate::state::{Balances, Nonces};
     use crate::stf::process_block;
-    use crate::types::{Block, Transaction, AccessList, StateKey};
+    use crate::types::{Block, Transaction};
 
     let mut balances: Balances = HashMap::from([("Alice".into(), 100), ("Bob".into(), 50)]);
     let mut nonces: Nonces = Default::default();
-
-    let al = AccessList {
-        reads: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
-        writes: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
-    };
     
     let block = Block::new(vec![
-        Transaction::new("Alice","Bob", 10, 0, al)
+        (Transaction::transfer("Alice","Bob", 10, 0)).into()
     ], 1);
 
     // build (builder path)

@@ -1,6 +1,6 @@
 // src/types.rs
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Transaction {
     pub from: String,
     pub to: String,
@@ -13,16 +13,22 @@ impl Transaction {
     pub fn new(from: impl Into<String>, to: impl Into<String>, amount: u64, nonce: u64, access_list: AccessList) -> Self {
         Self { from: from.into(), to: to.into(), amount, nonce, access_list }
     }
+    pub fn transfer(from: impl Into<String>, to: impl Into<String>, amount: u64, nonce: u64) -> Self {
+        let from_s = from.into();
+        let to_s = to.into();
+        let al = AccessList::for_transfer(&from_s, &to_s);
+        Transaction { from: from_s, to: to_s, amount, nonce, access_list: al }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Block {
-    pub transactions: Vec<Transaction>,
+    pub transactions: Vec<Tx>,
     pub block_number: u64
 }
 
 impl Block {
-    pub fn new(transactions: impl Into<Vec<Transaction>>, block_number: u64) -> Self {
+    pub fn new(transactions: impl Into<Vec<Tx>>, block_number: u64) -> Self {
         Self { transactions: transactions.into(), block_number }
     }
 }
@@ -48,7 +54,8 @@ pub struct BlockHeader {
     pub height: u64,
     pub txs_root: Hash,
     pub receipts_root: Hash,
-    pub gas_used: u64
+    pub gas_used: u64,
+    pub randomness: Hash
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -73,8 +80,66 @@ When you run transactions in parallel, you must know which parts of state each t
 
 That declared set is the access list.
  */
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AccessList {
     pub reads: Vec<StateKey>,
     pub writes: Vec<StateKey>,
+}
+
+impl AccessList {
+    pub fn for_transfer(from: &str, to: &str) -> Self {
+        AccessList {
+            reads: vec![
+                StateKey::Balance(from.to_string()),
+                StateKey::Balance(to.to_string()),
+                StateKey::Nonce(from.to_string()),
+            ],
+            writes: vec![
+                StateKey::Balance(from.to_string()),
+                StateKey::Balance(to.to_string()),
+                StateKey::Nonce(from.to_string()),
+            ],
+        }
+    }
+    pub fn covers(&self, keys: &[StateKey]) -> bool {
+        use std::collections::HashSet;
+        let r: HashSet<_> = self.reads.iter().cloned().collect();
+        let w: HashSet<_> = self.writes.iter().cloned().collect();
+        keys.iter().all(|k| r.contains(k) && w.contains(k))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommitTx {
+    pub commitment: Hash,
+    pub expires_at: u64,
+    pub sender: String
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RevealTx {
+    pub tx: Transaction,
+    pub salt: Hash,
+    pub sender: String
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Tx {
+    Transfer(Transaction),
+    Commit(CommitTx),
+    Reveal(RevealTx)
+}
+
+impl From<Transaction> for Tx {
+    fn from(t: Transaction) -> Self {
+        Tx::Transfer(t)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CommitmentMeta {
+    pub owner: String,
+    pub expires_at: u64,
+    pub consumed: bool,
+    pub included_at: u64,
 }

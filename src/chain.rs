@@ -65,7 +65,7 @@ impl Chain {
 fn apply_block1_advances_tip() {
     use std::collections::HashMap;
     use crate::state::{Balances, Nonces};
-    use crate::types::{Block, Transaction, AccessList, StateKey};
+    use crate::types::{Block, Transaction};
 
     // 1) state
     let mut balances: Balances = HashMap::from([
@@ -79,20 +79,10 @@ fn apply_block1_advances_tip() {
     assert_eq!(chain.height, 0);
     assert_eq!(chain.tip_hash, [0u8; 32]);
 
-    let al1 = AccessList {
-        reads: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
-        writes: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
-    };
-
-    let al2 = AccessList {
-        reads: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Bob".into())],
-        writes: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Bob".into())],
-    };
-
     // 3) block #1 with two txs (reuse your constructor)
-    let tx1 = Transaction::new("Alice", "Bob", 20, 0, al1);
-    let tx2 = Transaction::new("Bob", "Alice", 10, 0, al2);
-    let b1 = Block::new(vec![tx1, tx2], 1);
+    let tx1 = Transaction::transfer("Alice", "Bob", 20, 0);
+    let tx2 = Transaction::transfer("Bob", "Alice", 10, 0);
+    let b1 = Block::new(vec![tx1.into(), tx2.into()], 1);
 
     // 4) apply
     let res = chain.apply_block(&b1, &mut balances, &mut nonces).expect("block 1 should apply");
@@ -128,24 +118,14 @@ fn applying_same_height_fails() {
 fn apllying_2_blocks_works_correctly() {
     use std::collections::HashMap;
     use crate::state::{Balances, Nonces};
-    use crate::types::{Block, Transaction, AccessList, StateKey};
-
-    let al1 = AccessList {
-        reads: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
-        writes: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
-    };
-
-    let al2 = AccessList {
-        reads: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Bob".into())],
-        writes: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Bob".into())],
-    };
+    use crate::types::{Block, Transaction};
 
     let b1 = Block::new(vec![
-        Transaction::new("Alice", "Bob", 10, 0, al1),
+        Transaction::transfer("Alice", "Bob", 10, 0).into(),
     ], 1);
     
     let b2 = Block::new(vec![
-        Transaction::new("Bob", "Alice", 5, 0, al2),
+        Transaction::transfer("Bob", "Alice", 5, 0).into(),
     ], 2);
 
     let mut chain = Chain::new();
@@ -165,19 +145,14 @@ fn apllying_2_blocks_works_correctly() {
 #[test]
 fn tamper_block_no_state_change() {
     use std::collections::HashMap;
-    use crate::types::{Transaction, AccessList, StateKey};
+    use crate::types::{Transaction};
 
     // Genesis parent
     let parent: Hash = [0u8; 32];
 
-    let al = AccessList {
-        reads: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Bob".into())],
-        writes: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Bob".into())],
-    };
-
     // Build a simple block at height 1
     let block = Block::new(vec![
-        Transaction::new("Bob", "Alice", 5, 0, al),
+        Transaction::transfer("Bob", "Alice", 5, 0).into()
     ], 1);
 
     // Local state for execution

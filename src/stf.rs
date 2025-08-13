@@ -3,8 +3,8 @@
 use crate::crypto::merkle_root;
 use crate::crypto::hash_bytes_sha256;
 use crate::state::{Balances, Nonces};
-use crate::codec::{tx_bytes, receipt_bytes, header_bytes};
-use crate::types::{Block, Receipt, ExecOutcome, Hash, BlockHeader, StateKey, AccessList};
+use crate::codec::{tx_enum_bytes, receipt_bytes, header_bytes};
+use crate::types::{Block, Receipt, ExecOutcome, Hash, BlockHeader, Transaction, StateKey, Tx};
 use crate::gas::BASE_FEE_PER_TX;
 use std::fmt;
 
@@ -47,7 +47,7 @@ pub struct BlockResult {
 
 /// Process a single transaction against the balances map.
 pub fn process_transaction(
-    tx: &crate::types::Transaction,
+    tx: &Transaction,
     balances: &mut Balances,
     nonces: &mut Nonces,
 ) -> Result<Receipt, TxError>
@@ -60,6 +60,16 @@ pub fn process_transaction(
         return Err(TxError::IntrinsicInvalid(
             format!("bad nonce: expected {}, got {}", expected, tx.nonce)
         ));
+    }
+
+    let required = [
+        StateKey::Nonce(tx.from.clone()),
+        StateKey::Balance(tx.from.clone()),
+        StateKey::Balance(tx.to.clone()),
+    ];
+
+    if !tx.access_list.covers(&required) {
+        return Err(TxError::IntrinsicInvalid("access list missing required key".to_string()));
     }
 
     let receiver: String = tx.to.clone();
@@ -102,20 +112,34 @@ pub fn process_block(block: &Block, balances: &mut Balances, nonces: &mut Nonces
     let mut receipt_hashes : Vec<Hash> = Vec::new();
 
     for (i, tx) in block.transactions.iter().enumerate() {
-        match process_transaction(tx, balances, nonces) {
-            Ok(receipt) => { 
-                gas_total = gas_total + receipt.gas_used; 
-                txs_hashes.push(hash_bytes_sha256(&tx_bytes(tx))); 
-                receipt_hashes.push(hash_bytes_sha256(&receipt_bytes(&receipt))); 
-                receipts.push(receipt); 
-            }
-            Err(TxError::IntrinsicInvalid(e)) => {
-                return Err(BlockError::IntrinsicInvalid(format!(
-                    "block={} tx_index={} error={}",
-                    block.block_number,
-                    i + 1,
-                    e
-                )));
+        match tx {
+            Tx::Transfer(t) => {
+                match process_transaction(t, balances, nonces) {
+                    Ok(receipt) => { 
+                        gas_total = gas_total + receipt.gas_used; 
+                        txs_hashes.push(hash_bytes_sha256(&tx_enum_bytes(tx))); 
+                        receipt_hashes.push(hash_bytes_sha256(&receipt_bytes(&receipt))); 
+                        receipts.push(receipt); 
+                    }
+                    Err(TxError::IntrinsicInvalid(e)) => {
+                        return Err(BlockError::IntrinsicInvalid(format!(
+                            "block={} tx_index={} error={}",
+                            block.block_number,
+                            i + 1,
+                            e
+                        )));
+                    }
+                }
+            },
+            Tx::Commit(_) => {
+                return Err(BlockError::IntrinsicInvalid(
+                    "commit/reveal not implemented yet".to_string(),
+                ));
+            },
+            Tx::Reveal(_) => {
+                return Err(BlockError::IntrinsicInvalid(
+                    "commit/reveal not implemented yet".to_string(),
+                ));
             }
         }
     }
@@ -129,6 +153,7 @@ pub fn process_block(block: &Block, balances: &mut Balances, nonces: &mut Nonces
         txs_root,
         receipts_root,
         gas_used: gas_total,
+        randomness: *parent_hash, // placeholder TB CHANGED later with VRF
     };
     
     let block_hash = hash_bytes_sha256(&header_bytes(&header));
@@ -149,11 +174,8 @@ mod tests {
             ("Bob".to_string(), 50),
         ]);
         let mut nonces = Default::default();
-        let al = AccessList {
-            reads: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
-            writes: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())]
-        };
-        let tx = Transaction::new("Alice","Bob", 30, 0, al);
+
+        let tx = Transaction::transfer("Alice","Bob", 30, 0);
         let rcpt = process_transaction(&tx, &mut balances, &mut nonces).expect("valid");
         assert_eq!(rcpt.outcome, ExecOutcome::Success);
         assert_eq!(rcpt.gas_used, BASE_FEE_PER_TX);
@@ -170,12 +192,7 @@ mod tests {
         ]);
         let mut nonces = Default::default();
 
-        let al = AccessList {
-            reads: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
-            writes: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
-        };
-
-        let tx = Transaction::new("Alice","Bob", 30,0, al);
+        let tx = Transaction::transfer("Alice","Bob", 30,0);
         let rcpt = process_transaction(&tx, &mut balances, &mut nonces).expect("valid but reverts");
         assert_eq!(rcpt.outcome, ExecOutcome::Revert);
         assert!(rcpt.error.is_some());
@@ -191,13 +208,8 @@ mod tests {
             ("Bob".to_string(), 50),
         ]);
         let mut nonces: HashMap<String, u64> = Default::default();
-
-        let al = AccessList {
-            reads: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
-            writes: vec![StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into())],
-        };
     
-        let tx = Transaction::new("Alice", "Bob", 1, 0, al);
+        let tx = Transaction::transfer("Alice", "Bob", 1, 0);
     
         match process_transaction(&tx, &mut balances, &mut nonces) {
             Err(TxError::IntrinsicInvalid(msg)) => {
@@ -212,5 +224,69 @@ mod tests {
     
         // Nonces unchanged
         assert_eq!(nonces.get("Alice"), None);
+    }
+
+    #[test]
+    fn underdeclared_accesslist_fails() {
+        use crate::types::AccessList;
+
+        let mut balances = HashMap::from([
+            ("Alice".to_string(), 100),
+            ("Bob".to_string(), 50),
+        ]);
+        let mut nonces: HashMap<String, u64> = Default::default();
+        let al = AccessList {
+            reads: vec![ StateKey::Balance("Alice".into()), StateKey::Nonce("Alice".into()) ],
+            writes: vec![ StateKey::Balance("Alice".into()), StateKey::Nonce("Alice".into()) ],
+        };
+
+        let tx = Transaction::new("Alice", "Bob", 1, 0, al);
+
+        match process_transaction(&tx, &mut balances, &mut nonces) {
+            Err(TxError::IntrinsicInvalid(msg)) => {
+                assert!(msg.contains("missing required key"));
+            }
+            _ => panic!("Expected intrinsic invalid error"),
+        }
+
+           // Balances unchanged
+           assert_eq!(balances["Alice"], 100);
+           assert_eq!(balances["Bob"], 50);
+       
+           // Nonces unchanged
+           assert_eq!(nonces.get("Alice"), None);
+    }
+
+    #[test]
+    fn overdeclared_accesslist_succeeds() {
+        use crate::types::AccessList;
+
+        let mut balances = HashMap::from([
+            ("Alice".to_string(), 100),
+            ("Bob".to_string(), 50),
+        ]);
+        let mut nonces: HashMap<String, u64> = Default::default();
+        let al = AccessList {
+            reads: vec![ StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into()), StateKey::Nonce("Bob".into()) ],
+            writes: vec![ StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into()), StateKey::Nonce("Bob".into()) ],
+        };
+
+        let tx = Transaction::new("Alice", "Bob", 1, 0, al);
+
+        match process_transaction(&tx, &mut balances, &mut nonces) {
+            Err(_) => {
+                panic!("Unexpected Error")
+            },
+            Ok(receipt) => {
+                assert_eq!(receipt.outcome, ExecOutcome::Success)
+            }
+        }
+
+           // Balances unchanged
+           assert_eq!(balances["Alice"], 98);
+           assert_eq!(balances["Bob"], 51);
+       
+           // Nonces unchanged
+           assert_eq!(nonces.get("Alice"), Some(1).as_ref());
     }
 }
