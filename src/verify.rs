@@ -34,7 +34,7 @@ pub fn verify_block_roots(header: &BlockHeader, block: &Block, receipts: &[Recei
 #[test]
 fn verify_block_roots_catches_tamper() {
     use std::collections::HashMap;
-    use crate::state::{Balances, Nonces, Commitments};
+    use crate::state::{Balances, Nonces, Commitments, Available};
     use crate::stf::process_block;
     use crate::types::{Block, Tx, CommitTx, Hash, AccessList, StateKey};
     use crate::verify::verify_block_roots;
@@ -43,10 +43,11 @@ fn verify_block_roots_catches_tamper() {
     let mut balances: Balances = HashMap::from([("Alice".into(), 100_u64)]);
     let mut nonces: Nonces = Default::default();
     let mut comm: Commitments = Default::default();
+    let mut avail: Available  = Default::default();
 
     let al = AccessList {
-        reads: vec![ StateKey::Balance("Alice".into())],
-        writes: vec![ StateKey::Balance("Alice".into())],
+        reads:  vec![StateKey::Balance("Alice".into())],
+        writes: vec![StateKey::Balance("Alice".into())],
     };
 
     // Block 1 with a single Commit (opaque commitment is fine here)
@@ -54,22 +55,30 @@ fn verify_block_roots_catches_tamper() {
     let block = Block::new(
         vec![Tx::Commit(CommitTx {
             commitment,
-            expires_at: 5,
             sender: "Alice".into(),
-            access_list: al
+            ciphertext_hash: [0u8; 32],
+            access_list: al,
         })],
         1,
     );
 
+    // Genesis parent
+    let parent: Hash = [0u8; 32];
+
     // Build (builder path)
-    let parent = [0u8; 32];
-    let res = process_block(&block, &mut balances, &mut nonces, &mut comm, &parent)
-        .expect("ok");
+    let res = process_block(
+        &block,
+        &mut balances,
+        &mut nonces,
+        &mut comm,
+        &mut avail,
+        &parent
+    ).expect("ok");
 
     // Verify (ok)
     verify_block_roots(&res.header, &block, &res.receipts).expect("roots match");
 
-    // Tamper one receipt
+    // Tamper one receipt (commit produced a receipt at index 0)
     let mut bad_receipts = res.receipts.clone();
     bad_receipts[0].gas_used += 1;
 

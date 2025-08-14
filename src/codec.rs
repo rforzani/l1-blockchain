@@ -1,6 +1,6 @@
 // src/codec.rs
 
-use crate::types::{Transaction, Receipt, ExecOutcome, BlockHeader};
+use crate::types::{AccessList, BlockHeader, ExecOutcome, Receipt, StateKey, Transaction};
 use crate::types::{Tx};
 
 pub const CODEC_VERSION: u8 = 1;
@@ -10,6 +10,7 @@ pub const DOM_HDR: &[u8] = b"HDR";
 const TAG_TRANSFER: u8 = 0;
 const TAG_COMMIT:   u8 = 1;
 const TAG_REVEAL:   u8 = 2;
+const TAG_AVAIL:    u8 = 3;
 
 // --- helpers: write primitives deterministically ---
 
@@ -60,6 +61,44 @@ pub fn receipt_bytes(r: &Receipt) -> Vec<u8> {
     v
 }
 
+fn put_access_list(v: &mut Vec<u8>, al: &AccessList) {
+    // Make canonical copies: sort reads and writes by (tag, name)
+    fn key_order<'a>(k: &'a StateKey) -> (u8, &'a str) {
+        match k {
+            StateKey::Balance(acct) => (0, acct.as_str()),
+            StateKey::Nonce(acct)   => (1, acct.as_str()),
+        }
+    }
+
+    let mut reads = al.reads.clone();
+    let mut writes = al.writes.clone();
+
+    
+    reads.sort_by(|a, b| key_order(a).cmp(&key_order(b)));
+    writes.sort_by(|a, b| key_order(a).cmp(&key_order(b)));
+
+    // Encode counts (u32) then items
+    fn put_keys(v: &mut Vec<u8>, ks: &[StateKey]) {
+        let n = ks.len() as u32;
+        v.extend_from_slice(&n.to_le_bytes());
+        for k in ks {
+            match k {
+                StateKey::Balance(acct) => {
+                    v.push(0);           // tag for Balance
+                    put_str(v, acct);    // len + bytes
+                }
+                StateKey::Nonce(acct) => {
+                    v.push(1);           // tag for Nonce
+                    put_str(v, acct);
+                }
+            }
+        }
+    }
+
+    put_keys(v, &reads);
+    put_keys(v, &writes);
+}
+
 pub fn header_bytes(h: &BlockHeader) -> Vec<u8> {
     let mut v = vec![CODEC_VERSION];
     v.extend_from_slice(DOM_HDR);
@@ -70,6 +109,8 @@ pub fn header_bytes(h: &BlockHeader) -> Vec<u8> {
     v.extend_from_slice(&h.receipts_root);
     put_u64(&mut v, h.gas_used);
     v.extend_from_slice(&h.randomness);       
+    v.extend_from_slice(&h.reveal_set_root);
+    v.extend_from_slice(&h.il_root);
 
     v
 }
@@ -89,12 +130,14 @@ pub fn tx_enum_bytes(tx: &Tx) -> Vec<u8> {
         }
         Tx::Commit(c) => {
             v.push(TAG_COMMIT);
-            // commitment (32 bytes)
+            // 32B commitment
             v.extend_from_slice(&c.commitment);
-            // expires_at (u64 LE)
-            put_u64(&mut v, c.expires_at);
-            // sender (len+bytes)
+            // 32B ciphertext hash
+            v.extend_from_slice(&c.ciphertext_hash);
+            // sender
             put_str(&mut v, &c.sender);
+            // canonical AL
+            put_access_list(&mut v, &c.access_list);
         }
         Tx::Reveal(r) => {
             v.push(TAG_REVEAL);
@@ -107,6 +150,10 @@ pub fn tx_enum_bytes(tx: &Tx) -> Vec<u8> {
             v.extend_from_slice(&r.salt);
             // sender (len+bytes)
             put_str(&mut v, &r.sender);
+        }
+        Tx::Avail(a) => {
+            v.push(TAG_AVAIL);
+            v.extend_from_slice(&a.commitment);
         }
     }
     v

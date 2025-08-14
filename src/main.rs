@@ -9,7 +9,7 @@ mod codec;
 mod chain;
 mod verify;
 
-use crate::state::{Balances, print_balances, Nonces, Commitments};
+use crate::state::{Balances, print_balances, Nonces, Commitments, Available}; // ← add Available
 use crate::types::{Transaction, Block};
 use crate::types::Hash;
 use crate::chain::Chain;
@@ -34,23 +34,20 @@ fn main() {
 
     let mut chain: Chain = Chain::new();
 
-    // 2) successful tx: Alice -> Bob (30)
+    // --- sample txs (note: update these to Commit/Avail/Reveal when you switch your main flow) ---
     let tx1 = Transaction::transfer("Alice", "Bob", 20, 0);
-
-    // 3) failing tx: Alice -> Bob (200)    
     let tx2 = Transaction::transfer("Bob", "Alice", 10, 0);
 
     let transactions1 = vec![tx1.into()];
-
     let transactions2 = vec![tx2.into()];
 
     let block1 = Block::new(transactions1, 1);
-
     let block2 = Block::new(transactions2, 2);
 
     let mut commitments: Commitments = Default::default();
+    let mut available:   Available   = Default::default();   // ← NEW state
 
-    match chain.apply_block(&block1, &mut balances, &mut nonces, &mut commitments) {
+    match chain.apply_block(&block1, &mut balances, &mut nonces, &mut commitments, &mut available) { // ← pass it
         Ok(block_result) => {
             println!("gas_total={}", block_result.gas_total);
             println!("txs_root={}", hex32(&block_result.txs_root));
@@ -60,10 +57,12 @@ fn main() {
             }
             println!("block_hash={}", hex::encode(block_result.block_hash));
         }
-        Err(msg ) => {println!("{}", msg)}
+        Err(err) => {
+            println!("{}", err); // assuming Display for BlockError
+        }
     }
 
-    match chain.apply_block(&block2, &mut balances, &mut nonces, &mut commitments) {
+    match chain.apply_block(&block2, &mut balances, &mut nonces, &mut commitments, &mut available) { // ← pass it
         Ok(block_result) => {
             println!("gas_total={}", block_result.gas_total);
             println!("txs_root={}", hex32(&block_result.txs_root));
@@ -73,7 +72,9 @@ fn main() {
             }
             println!("block_hash={}", hex::encode(block_result.block_hash));
         }
-        Err(msg ) => {println!("{}", msg)}
+        Err(err) => {
+            println!("{}", err);
+        }
     }
 
     println!("\nAfter txs:");

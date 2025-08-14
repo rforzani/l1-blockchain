@@ -55,7 +55,9 @@ pub struct BlockHeader {
     pub txs_root: Hash,
     pub receipts_root: Hash,
     pub gas_used: u64,
-    pub randomness: Hash
+    pub randomness: Hash,
+    pub reveal_set_root: Hash,
+    pub il_root: Hash
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -112,10 +114,13 @@ impl AccessList {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommitTx {
     pub commitment: Hash,
-    pub expires_at: u64,
     pub sender: String,
-    pub access_list: AccessList
+    pub access_list: AccessList,
+    pub ciphertext_hash: Hash
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AvailTx { pub commitment: Hash }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RevealTx {
@@ -128,7 +133,8 @@ pub struct RevealTx {
 pub enum Tx {
     Transfer(Transaction),
     Commit(CommitTx),
-    Reveal(RevealTx)
+    Reveal(RevealTx),
+    Avail(AvailTx)
 }
 
 impl From<Transaction> for Tx {
@@ -150,4 +156,5 @@ pub enum Event {
     CommitStored { commitment: Hash, owner: String, expires_at: u64 },
     CommitConsumed { commitment: Hash },
     CommitExpired { commitment: Hash },
+    AvailabilityRecorded { commitment: Hash }
 }
