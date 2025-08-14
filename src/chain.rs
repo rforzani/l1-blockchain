@@ -154,10 +154,30 @@ fn applying_same_height_fails() {
 fn applying_2_blocks_works_correctly() {
     use std::collections::HashMap;
     use crate::chain::Chain;
-    use crate::state::{Balances, Nonces, Commitments, Available, DECRYPTION_DELAY, REVEAL_WINDOW};
-    use crate::types::{Block, Transaction, Tx, CommitTx, RevealTx, Hash, StateKey, AccessList, AvailTx};
+    use crate::state::{
+        Balances, Nonces, Commitments, Available,
+        DECRYPTION_DELAY, REVEAL_WINDOW
+    };
+    use crate::types::{
+        Block, Transaction, Tx, CommitTx, RevealTx, Hash, StateKey, AccessList, AvailTx
+    };
     use crate::codec::tx_bytes;
     use crate::crypto::commitment_hash;
+
+    // helper: advance chain to `target` (exclusive) with empty blocks
+    fn advance_to(
+        chain: &mut Chain,
+        balances: &mut Balances,
+        nonces: &mut Nonces,
+        comm: &mut Commitments,
+        avail: &mut Available,
+        target: u64,
+    ) {
+        while chain.height + 1 < target {
+            let b = Block::new(Vec::new(), chain.height + 1);
+            chain.apply_block(&b, balances, nonces, comm, avail).expect("advance");
+        }
+    }
 
     // Inner tx to be revealed
     let tx = Transaction::transfer("Alice", "Bob", 10, 0);
@@ -180,16 +200,7 @@ fn applying_2_blocks_works_correctly() {
         1,
     );
 
-    // Block ready_at: Avail + Reveal (earliest allowed)
-    let ready_at = 1 + DECRYPTION_DELAY;
-    let b2 = Block::new(
-        vec![
-            Tx::Avail(AvailTx { commitment: cmt }),
-            Tx::Reveal(RevealTx { tx: tx.clone(), salt, sender: "Alice".into() }),
-        ],
-        ready_at,
-    );
-
+    // Chain/state
     let mut chain = Chain::new();
     let mut balances: Balances = HashMap::from([
         ("Alice".to_string(), 100),
@@ -199,13 +210,33 @@ fn applying_2_blocks_works_correctly() {
     let mut comm: Commitments = Default::default();
     let mut avail: Available  = Default::default();
 
-    let res1 = chain.apply_block(&b1, &mut balances, &mut nonces, &mut comm, &mut avail).expect("b1 ok");
-    let res2 = chain.apply_block(&b2, &mut balances, &mut nonces, &mut comm, &mut avail).expect("b2 ok");
+    let res1 = chain
+        .apply_block(&b1, &mut balances, &mut nonces, &mut comm, &mut avail)
+        .expect("b1 ok");
+
+    // Compute the earliest reveal height
+    let ready_at = 1 + DECRYPTION_DELAY;
+
+    // Advance sequentially up to ready_at
+    advance_to(&mut chain, &mut balances, &mut nonces, &mut comm, &mut avail, ready_at);
+
+    // Block ready_at: Avail in transactions + Reveal in the block body
+    let reveals = vec![
+        RevealTx { tx: tx.clone(), salt, sender: "Alice".into() }
+    ];
+    let b2 = Block::new_with_reveals(
+        vec![ Tx::Avail(AvailTx { commitment: cmt }) ],
+        reveals,
+        ready_at,
+    );
+
+    let res2 = chain
+        .apply_block(&b2, &mut balances, &mut nonces, &mut comm, &mut avail)
+        .expect("b2 ok");
 
     assert_eq!(chain.height, ready_at);
     assert_eq!(res2.header.parent_hash, res1.block_hash);
 
-    // Optional: if REVEAL_WINDOW > 0, we can still add an empty block at deadline to ensure no IL due remains.
     let _deadline = ready_at + REVEAL_WINDOW;
 }
 
@@ -327,7 +358,7 @@ fn inclusion_list_due_must_be_included() {
     let ready_at = 1 + DECRYPTION_DELAY;
     let due      = ready_at + REVEAL_WINDOW;
 
-    // If ready_at < due, post availability earlier; otherwise, we'll include it in the due block.
+    // If ready_at < due, post availability earlier; otherwise, include it in the due block.
     if ready_at < due {
         advance_to(&mut chain, &mut balances, &mut nonces, &mut comm, &mut avail, ready_at);
         let b_ready = Block::new(vec![ Tx::Avail(AvailTx { commitment: cmt }) ], ready_at);
@@ -337,12 +368,15 @@ fn inclusion_list_due_must_be_included() {
 
     // ---- Block due: WITHOUT Reveal → must fail ----
     advance_to(&mut chain, &mut balances, &mut nonces, &mut comm, &mut avail, due);
-    let mut b_due_missing_txs = Vec::new();
+
+    // txs for due block (may contain Avail if ready_at == due)
+    let mut due_txs = Vec::new();
     if ready_at == due {
-        // availability must be present in this same block for enforcement to trigger
-        b_due_missing_txs.push(Tx::Avail(AvailTx { commitment: cmt }));
+        due_txs.push(Tx::Avail(AvailTx { commitment: cmt }));
     }
-    let b_due_missing = Block::new(b_due_missing_txs, due);
+
+    // No reveals included → invalid (missing required reveal)
+    let b_due_missing = Block::new_with_reveals(due_txs.clone(), Vec::new(), due);
     let err = chain
         .apply_block(&b_due_missing, &mut balances, &mut nonces, &mut comm, &mut avail)
         .expect_err("must fail due to missing reveal");
@@ -353,14 +387,111 @@ fn inclusion_list_due_must_be_included() {
     }
 
     // ---- Block due: WITH Reveal → success ----
-    // (height hasn't advanced after the failed apply, so we can reuse the same `due` height)
-    let mut b_due_with_txs = Vec::new();
-    if ready_at == due {
-        b_due_with_txs.push(Tx::Avail(AvailTx { commitment: cmt }));
-    }
-    b_due_with_txs.push(Tx::Reveal(RevealTx { tx: inner.clone(), salt, sender: "Alice".into() }));
-
-    let b_due_with = Block::new(b_due_with_txs, due);
+    // height hasn't advanced after the failed apply, so we can reuse `due`
+    let reveals = vec![
+        RevealTx { tx: inner.clone(), salt, sender: "Alice".into() }
+    ];
+    let b_due_with = Block::new_with_reveals(due_txs, reveals, due);
     chain.apply_block(&b_due_with, &mut balances, &mut nonces, &mut comm, &mut avail)
          .expect("due block applies with reveal");
+}
+
+#[test]
+fn reveal_bundle_executes_multiple_reveals_and_satisfies_il() {
+    use std::collections::HashMap;
+    use crate::chain::Chain;
+    use crate::state::{
+        Balances, Nonces, Commitments, Available,
+        DECRYPTION_DELAY, REVEAL_WINDOW, COMMIT_FEE
+    };
+    use crate::types::{
+        Block, Tx, CommitTx, RevealTx, Transaction, AccessList, StateKey, Hash, AvailTx
+    };
+    use crate::codec::tx_bytes;
+    use crate::crypto::commitment_hash;
+    use crate::gas::BASE_FEE_PER_TX;
+
+    // helper: advance chain with empty blocks up to (but not including) `target`
+    fn advance_to(
+        chain: &mut Chain,
+        balances: &mut Balances,
+        nonces: &mut Nonces,
+        comms: &mut Commitments,
+        avail: &mut Available,
+        target: u64,
+    ) {
+        while chain.height + 1 < target {
+            let b = Block::new(Vec::new(), chain.height + 1);
+            chain.apply_block(&b, balances, nonces, comms, avail).expect("advance");
+        }
+    }
+
+    let mut balances: Balances = HashMap::from([("Alice".into(), 1_000)]);
+    let mut nonces: Nonces = Default::default();
+    let mut comms: Commitments = Default::default();
+    let mut avail: Available   = Default::default();
+    let mut chain = Chain::new();
+
+    let al = AccessList {
+        reads:  vec![ StateKey::Balance("Alice".into()) ],
+        writes: vec![ StateKey::Balance("Alice".into()) ],
+    };
+
+    // two inner transfers (use sequential nonces per sender)
+    let t1 = Transaction::transfer("Alice","Bob", 10, 0);
+    let s1: Hash = [1u8; 32];
+    let c1 = commitment_hash(&tx_bytes(&t1), &s1);
+
+    let t2 = Transaction::transfer("Alice","Bob", 20, 1);
+    let s2: Hash = [2u8; 32];
+    let c2 = commitment_hash(&tx_bytes(&t2), &s2);
+
+    // block 1: commits (two)
+    let b1 = Block::new(vec![
+        Tx::Commit(CommitTx { commitment: c1, sender:"Alice".into(), ciphertext_hash:[0u8;32], access_list: al.clone() }),
+        Tx::Commit(CommitTx { commitment: c2, sender:"Alice".into(), ciphertext_hash:[0u8;32], access_list: al.clone() }),
+    ], 1);
+    chain.apply_block(&b1, &mut balances, &mut nonces, &mut comms, &mut avail).expect("b1");
+
+    // compute times
+    let ready_at = 1 + DECRYPTION_DELAY;
+    let due      = ready_at + REVEAL_WINDOW;
+
+    // availability claims (either at ready_at, or same block as due if equal)
+    if ready_at < due {
+        advance_to(&mut chain, &mut balances, &mut nonces, &mut comms, &mut avail, ready_at);
+        let b_ready = Block::new(vec![
+            Tx::Avail(AvailTx { commitment: c1 }),
+            Tx::Avail(AvailTx { commitment: c2 }),
+        ], ready_at);
+        chain.apply_block(&b_ready, &mut balances, &mut nonces, &mut comms, &mut avail).expect("b_ready");
+    }
+
+    // advance to due
+    advance_to(&mut chain, &mut balances, &mut nonces, &mut comms, &mut avail, due);
+
+    // due block: both reveals live in the block body; include Avail(s) too if ready_at == due
+    let reveals = vec![
+        RevealTx { tx: t1.clone(), salt: s1, sender: "Alice".into() },
+        RevealTx { tx: t2.clone(), salt: s2, sender: "Alice".into() },
+    ];
+    let txs = if ready_at == due {
+        vec![
+            Tx::Avail(AvailTx { commitment: c1 }),
+            Tx::Avail(AvailTx { commitment: c2 }),
+        ]
+    } else {
+        Vec::new()
+    };
+    let b_due = Block::new_with_reveals(txs, reveals, due);
+
+    let res = chain.apply_block(&b_due, &mut balances, &mut nonces, &mut comms, &mut avail).expect("b_due");
+
+    // receipts: two reveals
+    assert_eq!(res.receipts.len(), 2);
+
+    // balances: commit fees + reveal gas + transfers
+    // Alice started 1000; paid 2*COMMIT_FEE at b1; then pays 2*BASE_FEE and transfers 30 total
+    let expected_alice = 1_000 - 2*COMMIT_FEE - 2*BASE_FEE_PER_TX - (10 + 20);
+    assert_eq!(balances["Alice"], expected_alice);
 }

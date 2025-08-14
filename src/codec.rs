@@ -9,14 +9,17 @@ pub const DOM_RCPT: &[u8] = b"RCPT";
 pub const DOM_HDR: &[u8] = b"HDR";
 const TAG_TRANSFER: u8 = 0;
 const TAG_COMMIT:   u8 = 1;
-const TAG_REVEAL:   u8 = 2;
-const TAG_AVAIL:    u8 = 3;
+const TAG_AVAIL:    u8 = 2;
 
 // --- helpers: write primitives deterministically ---
 
 // append a u64 to a Vec<u8> in little-endian.
 fn put_u64(dst: &mut Vec<u8>, x: u64) {
     dst.extend_from_slice(&x.to_le_bytes());
+}
+
+pub fn put_u32(v: &mut Vec<u8>, x: u32) {
+    v.extend_from_slice(&x.to_le_bytes());
 }
 
 // append a string as length (u32 LE) + UTF-8 bytes.
@@ -115,19 +118,15 @@ pub fn header_bytes(h: &BlockHeader) -> Vec<u8> {
     v
 }
 
+pub fn put_bytes(v: &mut Vec<u8>, bytes: &[u8]) {
+    put_u32(v, bytes.len() as u32);      // 4-byte little-endian length
+    v.extend_from_slice(bytes);
+}
+
 pub fn tx_enum_bytes(tx: &Tx) -> Vec<u8> {
     let mut v = Vec::new();
     v.push(CODEC_VERSION);
     match tx {
-        Tx::Transfer(t) => {
-            v.push(TAG_TRANSFER);
-            // Reuse your existing deterministic encoder for Transaction
-            let inner = tx_bytes(t);
-            // length‑prefix for safety/future extensibility
-            let len = inner.len() as u32;
-            v.extend_from_slice(&len.to_le_bytes());
-            v.extend_from_slice(&inner);
-        }
         Tx::Commit(c) => {
             v.push(TAG_COMMIT);
             // 32B commitment
@@ -138,18 +137,6 @@ pub fn tx_enum_bytes(tx: &Tx) -> Vec<u8> {
             put_str(&mut v, &c.sender);
             // canonical AL
             put_access_list(&mut v, &c.access_list);
-        }
-        Tx::Reveal(r) => {
-            v.push(TAG_REVEAL);
-            // embedded transaction (length‑prefixed bytes)
-            let inner = tx_bytes(&r.tx);
-            let len = inner.len() as u32;
-            v.extend_from_slice(&len.to_le_bytes());
-            v.extend_from_slice(&inner);
-            // salt (32 bytes)
-            v.extend_from_slice(&r.salt);
-            // sender (len+bytes)
-            put_str(&mut v, &r.sender);
         }
         Tx::Avail(a) => {
             v.push(TAG_AVAIL);

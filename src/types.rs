@@ -24,12 +24,16 @@ impl Transaction {
 #[derive(Debug, Clone)]
 pub struct Block {
     pub transactions: Vec<Tx>,
-    pub block_number: u64
+    pub reveals: Vec<RevealTx>,
+    pub block_number: u64,
 }
 
 impl Block {
-    pub fn new(transactions: impl Into<Vec<Tx>>, block_number: u64) -> Self {
-        Self { transactions: transactions.into(), block_number }
+    pub fn new_with_reveals(txs: Vec<Tx>, reveals: Vec<RevealTx>, n: u64) -> Self {
+        Self { transactions: txs, reveals, block_number: n }
+    }
+    pub fn new(txs: Vec<Tx>, n: u64) -> Self {
+        Self::new_with_reveals(txs, Vec::new(), n) // keep old call sites working
     }
 }
 
@@ -131,16 +135,8 @@ pub struct RevealTx {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tx {
-    Transfer(Transaction),
     Commit(CommitTx),
-    Reveal(RevealTx),
-    Avail(AvailTx)
-}
-
-impl From<Transaction> for Tx {
-    fn from(t: Transaction) -> Self {
-        Tx::Transfer(t)
-    }
+    Avail(AvailTx),
 }
 
 #[derive(Debug, Clone)]

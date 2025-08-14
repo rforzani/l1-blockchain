@@ -22,6 +22,14 @@ pub enum TxError {
     IntrinsicInvalid(String),
 }
 
+impl From<TxError> for BlockError {
+    fn from(e: TxError) -> Self {
+        match e {
+            TxError::IntrinsicInvalid(msg) => BlockError::IntrinsicInvalid(msg),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum BlockError {
     IntrinsicInvalid(String),
@@ -245,53 +253,41 @@ fn process_reveal(
     process_transaction(&r.tx, balances, nonces)
 }
 
-pub fn process_block(block: &Block, balances: &mut Balances, nonces: &mut Nonces, commitments: &mut Commitments, available: &mut Available, parent_hash: &Hash) -> Result<BlockResult, BlockError> {
-    let mut receipts : Vec<Receipt> = Vec::new();
-    let mut gas_total : u64 = 0;
+pub fn process_block(
+    block: &Block,
+    balances: &mut Balances,
+    nonces: &mut Nonces,
+    commitments: &mut Commitments,
+    available: &mut Available,
+    parent_hash: &Hash,
+) -> Result<BlockResult, BlockError> {
+    let mut receipts: Vec<Receipt> = Vec::new();
+    let mut gas_total: u64 = 0;
 
-    let mut txs_hashes : Vec<Hash> = Vec::new();
-    let mut receipt_hashes : Vec<Hash> = Vec::new();
+    let mut txs_hashes: Vec<Hash> = Vec::new();
+    let mut receipt_hashes: Vec<Hash> = Vec::new();
     let mut events: Vec<Event> = Vec::new();
     let mut revealed_pairs: Vec<(Hash, Hash)> = Vec::new(); // (commitment, tx_hash)
 
-    // Track reveals we actually include in THIS block
+    // Track reveals included in THIS block, and build IL for "due AND available"
     let mut revealed_this_block: HashSet<Hash> = HashSet::new();
     let mut il_due: Vec<Hash> = Vec::new();
-    
+
     for (cmt, meta) in commitments.iter() {
         if meta.consumed { continue; }
-        let ready_at  = meta.included_at + DECRYPTION_DELAY;
-        let deadline  = ready_at + REVEAL_WINDOW;
+        let ready_at = meta.included_at + DECRYPTION_DELAY;
+        let deadline = ready_at + REVEAL_WINDOW;
         if block.block_number == deadline && available.contains(cmt) {
-            il_due.push(*cmt); // due AND explicitly available
+            il_due.push(*cmt);
         }
     }
-    il_due.sort();
+    il_due.sort(); // deterministic IL root
 
+    // 1) Process "transactions" (commit/avail only)
     for (i, tx) in block.transactions.iter().enumerate() {
         let rcpt_res = match tx {
-            Tx::Transfer(_) => {
-                return Err(BlockError::IntrinsicInvalid(
-                    "plain transfers disabled".to_string()
-                ));
-            }
-            Tx::Commit(c)   => process_commit(c, balances, commitments, block.block_number, &mut events),
-            Tx::Reveal(r) => {
-                let rcpt_res = process_reveal(r, balances, nonces, block.block_number, commitments, &mut events);
-
-                if let Ok(_) = rcpt_res {
-                    let tx_ser = tx_bytes(&r.tx);
-                    let cmt    = commitment_hash(&tx_ser, &r.salt);
-                    let txh    = hash_bytes_sha256(&tx_ser);
-                    revealed_pairs.push((cmt, txh));
-                    revealed_this_block.insert(cmt);  
-                }
-
-                rcpt_res
-            }
-            Tx::Avail(a) => {
-                process_avail(a, commitments, available, block.block_number, &mut events)
-            }
+            Tx::Commit(c) => process_commit(c, balances, commitments, block.block_number, &mut events),
+            Tx::Avail(a)  => process_avail(a, commitments, available, block.block_number, &mut events),
         };
 
         match rcpt_res {
@@ -309,11 +305,27 @@ pub fn process_block(block: &Block, balances: &mut Balances, nonces: &mut Nonces
         }
     }
 
-    // turn (commitment, tx_hash) → leaf = H(commitment || tx_hash)
-    let mut leaves: Vec<(Hash, Hash)> = revealed_pairs;  // keep commitment for sorting
-    leaves.sort_by(|(c1, _), (c2, _)| c1.cmp(c2)); // sort by commitment
+    // 2) Process block-level reveals (sorted for deterministic nonce progression)
+    let mut reveals_sorted = block.reveals.clone();
+    reveals_sorted.sort_by(|a, b| a.sender.cmp(&b.sender).then(a.tx.nonce.cmp(&b.tx.nonce)));
 
-    let reveal_leaves: Vec<Hash> = leaves.into_iter().map(|(cmt, txh)| {
+    for r in &reveals_sorted {
+        let rcpt = process_reveal(r, balances, nonces, block.block_number, commitments, &mut events)?;
+        gas_total += rcpt.gas_used;
+        receipt_hashes.push(hash_bytes_sha256(&receipt_bytes(&rcpt)));
+        receipts.push(rcpt);
+
+        // pair for reveal_set_root
+        let tx_ser = tx_bytes(&r.tx);
+        let cmt    = commitment_hash(&tx_ser, &r.salt);
+        let txh    = hash_bytes_sha256(&tx_ser);
+        revealed_pairs.push((cmt, txh));
+        revealed_this_block.insert(cmt);
+    }
+
+    // 3) Roots
+    revealed_pairs.sort_by(|(c1,_),(c2,_)| c1.cmp(c2)); // canonical order
+    let reveal_leaves: Vec<Hash> = revealed_pairs.into_iter().map(|(cmt, txh)| {
         let mut buf = Vec::with_capacity(64);
         buf.extend_from_slice(&cmt);
         buf.extend_from_slice(&txh);
@@ -321,29 +333,29 @@ pub fn process_block(block: &Block, balances: &mut Balances, nonces: &mut Nonces
     }).collect();
 
     let reveal_set_root = merkle_root(&reveal_leaves);
-    let txs_root = merkle_root(&txs_hashes);
-    let receipts_root = merkle_root(&receipt_hashes);
+    let txs_root        = merkle_root(&txs_hashes);
+    let receipts_root   = merkle_root(&receipt_hashes);
 
+    // 4) IL enforcement: all due must be revealed in this block
     for c in &il_due {
         if !revealed_this_block.contains(c) {
-            return Err(BlockError::IntrinsicInvalid("missing required reveal from inclusion list".to_string()));
+            return Err(BlockError::IntrinsicInvalid("missing required reveal from inclusion list".into()));
         }
     }
-    
     let il_leaves: Vec<Hash> = il_due.iter().map(|c| hash_bytes_sha256(c)).collect();
     let il_root = merkle_root(&il_leaves);
 
+    // 5) Header & hash
     let header = BlockHeader {
-        parent_hash: *parent_hash,                
+        parent_hash: *parent_hash,
         height: block.block_number,
         txs_root,
         receipts_root,
         gas_used: gas_total,
-        randomness: *parent_hash, // placeholder TB CHANGED later with VRF
-        reveal_set_root: reveal_set_root,
-        il_root
+        randomness: *parent_hash,
+        reveal_set_root,
+        il_root,
     };
-    
     let block_hash = hash_bytes_sha256(&header_bytes(&header));
 
     Ok(BlockResult { receipts, gas_total, txs_root, receipts_root, header, block_hash, events })
@@ -362,9 +374,9 @@ mod tests {
         use crate::codec::tx_bytes;
         use crate::crypto::commitment_hash;
         use crate::state::{Balances, Nonces, Commitments, Available, COMMIT_FEE, DECRYPTION_DELAY, REVEAL_WINDOW};
-        use crate::types::{Transaction, Tx, CommitTx, RevealTx, AvailTx, Block, ExecOutcome, Hash, AccessList, StateKey,};
-        use crate::stf::BASE_FEE_PER_TX;
-    
+        use crate::types::{Transaction, Tx, CommitTx, RevealTx, AvailTx, Block, ExecOutcome, Hash, AccessList, StateKey};
+        use crate::gas::BASE_FEE_PER_TX;
+
         // helper: fill chain with empty blocks up to (but not including) `target`
         fn advance_to(
             chain: &mut Chain,
@@ -379,7 +391,7 @@ mod tests {
                 chain.apply_block(&b, balances, nonces, comms, avail).expect("advance");
             }
         }
-    
+
         // Initial state
         let mut balances: Balances = HashMap::from([
             ("Alice".to_string(), 100),
@@ -389,20 +401,20 @@ mod tests {
         let mut commitments: Commitments = Default::default();
         let mut available:   Available   = Default::default();
         let mut chain = Chain::new();
-    
+
         // Access list for commit (touches Alice’s balance to pay commit fee)
         let al = AccessList {
             reads:  vec![ StateKey::Balance("Alice".into()) ],
             writes: vec![ StateKey::Balance("Alice".into()) ],
         };
-    
+
         // Inner plaintext transfer (to be revealed later)
         let tx = Transaction::transfer("Alice", "Bob", 30, 0);
-    
+
         // Salt and commitment
         let salt: Hash = [7u8; 32];
         let cmt = commitment_hash(&tx_bytes(&tx), &salt);
-    
+
         // ---- Block 1: Commit ----
         let b1 = Block::new(
             vec![Tx::Commit(CommitTx {
@@ -416,46 +428,48 @@ mod tests {
         chain
             .apply_block(&b1, &mut balances, &mut nonces, &mut commitments, &mut available)
             .expect("block 1 (commit) should apply");
-    
+
         // After commit: only commit fee is burned, nonce unchanged
         assert_eq!(balances["Alice"], 100 - COMMIT_FEE);
         assert_eq!(balances["Bob"], 50);
         assert_eq!(*nonces.get("Alice").unwrap_or(&0), 0);
-    
+
         // Compute ready/due heights
         let ready_at = 1 + DECRYPTION_DELAY;
         let deadline = ready_at + REVEAL_WINDOW;
-    
+
         // Advance sequentially up to ready_at
         advance_to(&mut chain, &mut balances, &mut nonces, &mut commitments, &mut available, ready_at);
-    
-        // ---- Block ready_at: Avail + Reveal (earliest allowed) ----
-        let b_ready = Block::new(
-            vec![
-                Tx::Avail(AvailTx { commitment: cmt }),
-                Tx::Reveal(RevealTx { tx: tx.clone(), salt, sender: "Alice".into() }),
-            ],
+
+        // ---- Block ready_at: Avail (in transactions) + Reveal (in block body) ----
+        let reveals = vec![
+            RevealTx { tx: tx.clone(), salt, sender: "Alice".into() }
+        ];
+        let b_ready = Block::new_with_reveals(
+            vec![ Tx::Avail(AvailTx { commitment: cmt }) ],
+            reveals,
             ready_at,
         );
+
         let res2 = chain
             .apply_block(&b_ready, &mut balances, &mut nonces, &mut commitments, &mut available)
             .expect("block ready_at (avail + reveal) should apply");
-    
-        // Receipt checks (Avail + Reveal)
+
+        // Receipt checks (Avail + Reveal => 2 receipts)
         assert_eq!(res2.receipts.len(), 2);
         let rcpt_reveal = res2.receipts.last().unwrap();
         assert_eq!(rcpt_reveal.outcome, ExecOutcome::Success);
         assert_eq!(rcpt_reveal.gas_used, BASE_FEE_PER_TX);
-    
+
         // Final balances:
         // Alice: 100 - COMMIT_FEE(1) - BASE_FEE(1) - 30 = 68
         // Bob:   50 + 30 = 80
         assert_eq!(balances["Alice"], 68);
         assert_eq!(balances["Bob"], 80);
-    
+
         // Nonce consumed on reveal (not on commit)
         assert_eq!(*nonces.get("Alice").unwrap(), 1);
-    
+
         // Optionally advance to deadline and apply an empty block (no dues remain)
         if deadline > ready_at {
             advance_to(&mut chain, &mut balances, &mut nonces, &mut commitments, &mut available, deadline);
