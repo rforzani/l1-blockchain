@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use crate::types::{Hash, CommitmentMeta};
 
+pub const CHAIN_ID: u64 = 1;
 pub const COMMIT_FEE: u64 = 1;
 pub const REVEAL_WINDOW: u64 = 3;
 pub const DECRYPTION_DELAY: u64 = 1;   // blocks after commit before reveals may start
