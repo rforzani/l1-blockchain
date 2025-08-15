@@ -1,7 +1,7 @@
 //src/chain.rs
 
 use crate::stf::{process_block, BlockResult, BlockError};
-use crate::state::{Available, Balances, Commitments, Nonces, AVAIL_FEE};
+use crate::state::{Available, Balances, Commitments, Nonces, AVAIL_FEE, DECRYPTION_DELAY, REVEAL_WINDOW};
 use crate::types::{Block, Hash};
 use crate::verify::verify_block_roots;
 
@@ -606,5 +606,144 @@ fn duplicate_commit_in_same_block_is_rejected() {
     match err {
         BlockError::IntrinsicInvalid(msg ) => assert!(msg.contains("duplicate commitment"), "got: {msg}"),
         other => panic!("expected TxInvalid duplicate, got {:?}", other),
+    }
+}
+
+#[test]
+fn inclusion_list_due_but_missing_reveal_rejects_block() {
+    use std::collections::HashMap;
+    use crate::chain::Chain;
+    use crate::state::{Balances, Nonces, Commitments, Available, DECRYPTION_DELAY, REVEAL_WINDOW};
+    use crate::types::{Block, Tx, CommitTx, RevealTx, AvailTx, Transaction, AccessList, StateKey, Hash};
+    use crate::codec::tx_bytes;
+    use crate::crypto::commitment_hash;
+    use crate::stf::BlockError;
+
+    // helper: advance chain with empty blocks up to (but not including) `target`
+    fn advance_to(
+        chain: &mut Chain,
+        balances: &mut Balances,
+        nonces: &mut Nonces,
+        comms: &mut Commitments,
+        avail: &mut Available,
+        target: u64,
+    ) {
+        while chain.height + 1 < target {
+            let b = Block::new(Vec::new(), chain.height + 1);
+            chain.apply_block(&b, balances, nonces, comms, avail).expect("advance");
+        }
+    }
+
+    // --- State/chain ---
+    let mut balances: Balances = HashMap::from([("Alice".into(), 100)]);
+    let mut nonces: Nonces = Default::default();
+    let mut comm: Commitments = Default::default();
+    let mut avail: Available  = Default::default();
+    let mut chain = Chain::new();
+
+    let al = AccessList {
+        reads:  vec![ StateKey::Balance("Alice".into()) ],
+        writes: vec![ StateKey::Balance("Alice".into()) ],
+    };
+
+    // Build inner tx + salt → commitment
+    let inner = Transaction::transfer("Alice", "Bob", 10, 0);
+    let salt: Hash = [9u8; 32];
+    let cmt  = commitment_hash(&tx_bytes(&inner), &salt);
+
+    // Block 1: commit
+    let b1 = Block::new(vec![
+        Tx::Commit(CommitTx {
+            commitment: cmt,
+            sender: "Alice".into(),
+            ciphertext_hash: [2u8;32],
+            access_list: al.clone(),
+        })
+    ], 1);
+    chain.apply_block(&b1, &mut balances, &mut nonces, &mut comm, &mut avail).expect("b1 applies");
+
+    // Heights
+    let ready_at = 1 + DECRYPTION_DELAY;  // 2
+    let due      = ready_at + REVEAL_WINDOW; // 5
+
+    // If ready_at < due, post Avail earlier (so it's eligible and will be in IL)
+    if ready_at < due {
+        advance_to(&mut chain, &mut balances, &mut nonces, &mut comm, &mut avail, ready_at);
+        let b_ready = Block::new(vec![ Tx::Avail(AvailTx { commitment: cmt }) ], ready_at);
+        chain.apply_block(&b_ready, &mut balances, &mut nonces, &mut comm, &mut avail).expect("availability block applies");
+    }
+
+    // Advance to due
+    advance_to(&mut chain, &mut balances, &mut nonces, &mut comm, &mut avail, due);
+
+    // Build due block WITHOUT the reveal → must fail
+    let due_txs = if ready_at == due {
+        vec![ Tx::Avail(AvailTx { commitment: cmt }) ]
+    } else {
+        Vec::new()
+    };
+    let b_due_missing = Block::new_with_reveals(due_txs, Vec::new(), due);
+
+    let err = chain.apply_block(&b_due_missing, &mut balances, &mut nonces, &mut comm, &mut avail)
+        .expect_err("must fail due to missing reveal");
+    match err {
+        BlockError::IntrinsicInvalid(msg) => assert!(msg.contains("missing required reveal"), "got: {msg}"),
+        other => panic!("expected IntrinsicInvalid, got {:?}", other),
+    }
+
+    // (Optional) Now include the reveal at the same height → should pass
+    let reveals = vec![ RevealTx { tx: inner.clone(), salt, sender: "Alice".into() } ];
+    let b_due_with = Block::new_with_reveals(Vec::new(), reveals, due);
+    chain.apply_block(&b_due_with, &mut balances, &mut nonces, &mut comm, &mut avail)
+         .expect("due block applies with reveal");
+}
+
+#[test]
+fn availability_outside_window_rejected() {
+    use crate::chain::Chain;
+    use crate::state::{Balances, Nonces, Commitments, Available, COMMIT_FEE, DECRYPTION_DELAY, REVEAL_WINDOW};
+    use crate::types::{Block, Tx, CommitTx, AvailTx, AccessList, StateKey};
+    use crate::stf::BlockError;
+
+    let mut balances: Balances = [("Alice".into(), 2 * COMMIT_FEE)].into_iter().collect();
+    let mut nonces: Nonces = Default::default();
+    let mut comms: Commitments = Default::default();
+    let mut avail: Available   = Default::default();
+    let mut chain = Chain::new();
+
+    let al = AccessList {
+        reads:  vec![StateKey::Balance("Alice".into())],
+        writes: vec![StateKey::Balance("Alice".into())],
+    };
+
+    // Commit at height 1
+    let commitment = [2u8; 32];
+    let b1 = Block::new(vec![
+        Tx::Commit(CommitTx {
+            commitment,
+            sender: "Alice".into(),
+            ciphertext_hash: [0u8; 32],
+            access_list: al.clone(),
+        }),
+    ], 1);
+    chain.apply_block(&b1, &mut balances, &mut nonces, &mut comms, &mut avail).expect("commit ok");
+
+    // Compute window
+    let ready_at = 1 + DECRYPTION_DELAY;           // = 2
+    let deadline = ready_at + REVEAL_WINDOW;       // = 2 + 3 = 5
+
+    // Advance to deadline + 1
+    for h in 2..=deadline { // 2..=5
+        let empty = Block::new(Vec::new(), h);
+        chain.apply_block(&empty, &mut balances, &mut nonces, &mut comms, &mut avail).expect("advance");
+    }
+
+    // Avail too late (deadline + 1)
+    let late_block = Block::new(vec![ Tx::Avail(AvailTx { commitment }) ], deadline + 1); // = 6
+    let err = chain.apply_block(&late_block, &mut balances, &mut nonces, &mut comms, &mut avail)
+        .expect_err("block must be rejected for late availability");
+    match err {
+        BlockError::IntrinsicInvalid(msg) => assert!(msg.contains("avail outside valid window"), "got: {msg}"),
+        other => panic!("expected IntrinsicInvalid for late avail, got {:?}", other),
     }
 }
