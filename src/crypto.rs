@@ -2,12 +2,26 @@
 
 use sha2::{Digest, Sha256};
 use crate::{chain, types::Hash};
+use ed25519_dalek::{Signature, VerifyingKey, Verifier};
 
 const DOM_ORDER:  &[u8] = b"ORDER";
 const COMMIT_DOMAIN: &[u8] = b"CAR_COMMIT_V1";
 const REVEAL_PAIR_DOMAIN: &[u8] = b"CAR_REVEAL_PAIR_V1";
 const SIGN_COMMIT_DOMAIN: &[u8] = b"SIGN_COMMIT_V1";
 const SIGN_AVAIL_DOMAIN:  &[u8] = b"SIGN_AVAIL_V1";
+
+pub fn verify_ed25519(pubkey: &[u8; 32], sig_bytes: &[u8; 64], msg: &[u8]) -> bool {
+    // VerifyingKey is fallible
+    let pk = match VerifyingKey::from_bytes(pubkey) {
+        Ok(pk) => pk,
+        Err(_) => return false,
+    };
+
+    // Signature::from_bytes is infallible in v2 (takes [u8; 64])
+    let sig = Signature::from_bytes(sig_bytes);
+
+    pk.verify(msg, &sig).is_ok()
+}
 
 pub fn commit_signing_preimage(
     commitment: &Hash,     
@@ -37,10 +51,6 @@ pub fn avail_signing_preimage(
     buf.extend_from_slice(commitment);
     buf.extend_from_slice(sender_bytes);
     buf
-}
-
-pub fn verify_ed25519(_pubkey: &[u8; 32], _sig: &[u8; 64], _msg: &[u8]) -> bool {
-    true
 }
 
 pub fn commitment_hash(tx_bytes: &[u8], salt: &Hash, chain_id: u64) -> Hash {
@@ -121,5 +131,23 @@ pub fn merkle_root(leaves: &[Hash]) -> Hash {
             
             return level[0];
         }
+    }
+}
+
+#[cfg(test)]
+mod test_keys {
+    use super::*;
+    use ed25519_dalek::{SigningKey, VerifyingKey, Signer};
+    use rand::rngs::OsRng;
+
+    pub fn make_keypair() -> (SigningKey, VerifyingKey) {
+        let sk = SigningKey::generate(&mut OsRng);
+        let vk = VerifyingKey::from(&sk);
+        (sk, vk)
+    }
+
+    pub fn sign_bytes(sk: &SigningKey, msg: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer as _;
+        sk.sign(msg).to_bytes()
     }
 }

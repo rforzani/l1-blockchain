@@ -27,6 +27,20 @@ fn put_str(dst: &mut Vec<u8>, s: &str) {
     dst.extend_from_slice(s.as_bytes());       // the bytes
 }
 
+pub fn string_bytes(s: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(4 + s.len());
+    v.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    v.extend_from_slice(s.as_bytes());
+    v
+}
+
+// Returns canonical bytes for AccessList (sorted + length-prefixed lists)
+// Reuse the same logic as put_access_list, but write into a fresh Vec and return it.
+pub fn access_list_bytes(al: &AccessList) -> Vec<u8> {
+    let mut v = Vec::new();
+    put_access_list(&mut v, al);
+    v
+}
 
 // --- public encoders used for hashing ---
 pub fn tx_bytes(tx: &Transaction) -> Vec<u8> {
