@@ -1,7 +1,7 @@
 //src/chain.rs
 
 use crate::stf::{process_block, BlockResult, BlockError};
-use crate::state::{Available, Balances, Commitments, Nonces};
+use crate::state::{Available, Balances, Commitments, Nonces, AVAIL_FEE};
 use crate::types::{Block, Hash};
 use crate::verify::verify_block_roots;
 
@@ -492,6 +492,119 @@ fn reveal_bundle_executes_multiple_reveals_and_satisfies_il() {
 
     // balances: commit fees + reveal gas + transfers
     // Alice started 1000; paid 2*COMMIT_FEE at b1; then pays 2*BASE_FEE and transfers 30 total
-    let expected_alice = 1_000 - 2*COMMIT_FEE - 2*BASE_FEE_PER_TX - (10 + 20);
+    let expected_alice = 1_000 - 2*COMMIT_FEE - 2*BASE_FEE_PER_TX - (10 + 20) - AVAIL_FEE*2;
     assert_eq!(balances["Alice"], expected_alice);
+}
+
+#[test]
+fn too_many_avails_in_block_is_invalid() {
+    use crate::chain::Chain;
+    use crate::state::{Balances, Nonces, Commitments, Available, MAX_AVAILS_PER_BLOCK};
+    use crate::types::{Block, Tx, AvailTx, Hash};
+    use crate::stf::BlockError;
+
+    let mut balances: Balances = Default::default();
+    let mut nonces: Nonces = Default::default();
+    let mut comms: Commitments = Default::default();
+    let mut avail: Available   = Default::default();
+    let mut chain = Chain::new();
+
+    // Build a block with MAX_AVAILS_PER_BLOCK + 1 Avails.
+    // (We rely on the cap check happening before per-item execution.)
+    let mut txs = Vec::with_capacity(MAX_AVAILS_PER_BLOCK + 1);
+    for i in 0..(MAX_AVAILS_PER_BLOCK + 1) {
+        let mut c: Hash = [0u8; 32];
+        c[0] = (i & 0xFF) as u8;
+        txs.push(Tx::Avail(AvailTx { commitment: c }));
+    }
+
+    let b = Block::new(txs, 1);
+    let err = chain.apply_block(&b, &mut balances, &mut nonces, &mut comms, &mut avail)
+        .expect_err("block must be invalid due to too many Avails");
+
+    match err {
+        BlockError::IntrinsicInvalid(msg) => assert!(msg.contains("too many Avails")),
+        other => panic!("expected IntrinsicInvalid, got {:?}", other),
+    }
+}
+
+#[test]
+fn too_many_pending_commits_for_owner_is_rejected() {
+    use crate::chain::Chain;
+    use crate::state::{
+        Balances, Nonces, Commitments, Available,
+        COMMIT_FEE, MAX_PENDING_COMMITS_PER_ACCOUNT
+    };
+    use crate::types::{Block, Tx, CommitTx, AccessList, StateKey};
+    use crate::stf::BlockError;
+
+    let mut balances: Balances = std::collections::HashMap::from([
+        ("Alice".into(), (MAX_PENDING_COMMITS_PER_ACCOUNT as u64 + 10) * COMMIT_FEE),
+    ]);
+    let mut nonces: Nonces = Default::default();
+    let mut comms: Commitments = Default::default();
+    let mut avail: Available   = Default::default();
+    let mut chain = Chain::new();
+
+    let al = AccessList {
+        reads:  vec![ StateKey::Balance("Alice".into()) ],
+        writes: vec![ StateKey::Balance("Alice".into()) ],
+    };
+
+    // Build a single block containing MAX_PENDING + 1 commits from Alice
+    let mut txs = Vec::with_capacity(MAX_PENDING_COMMITS_PER_ACCOUNT + 1);
+    for i in 0..(MAX_PENDING_COMMITS_PER_ACCOUNT + 1) {
+        // use distinct commitments
+        let mut c = [0u8; 32];
+        c[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        txs.push(Tx::Commit(CommitTx {
+            commitment: c,
+            sender: "Alice".into(),
+            ciphertext_hash: [0u8; 32],
+            access_list: al.clone(),
+        }));
+    }
+
+    let b = Block::new(txs, 1);
+    let err = chain.apply_block(&b, &mut balances, &mut nonces, &mut comms, &mut avail)
+        .expect_err("block must be invalid on the (MAX+1)th commit");
+
+    match err {
+        BlockError::IntrinsicInvalid(msg) => {
+            assert!(msg.contains("too many pending commits"), "got msg: {msg}");
+        }
+        other => panic!("expected IntrinsicInvalid, got {:?}", other),
+    }
+}
+
+#[test]
+fn duplicate_commit_in_same_block_is_rejected() {
+    use crate::{chain::Chain, state::{Balances, Nonces, Commitments, Available, COMMIT_FEE},
+        types::{Block, Tx, CommitTx, AccessList, StateKey}, stf::BlockError};
+
+    let mut balances: Balances = [("Alice".into(), 2 * COMMIT_FEE)].into_iter().collect();
+    let mut nonces: Nonces = Default::default();
+    let mut comms: Commitments = Default::default();
+    let mut avail: Available   = Default::default();
+    let mut chain = Chain::new();
+
+    let al = AccessList {
+        reads:  vec![ StateKey::Balance("Alice".into()) ],
+        writes: vec![ StateKey::Balance("Alice".into()) ],
+    };
+
+    let commitment = [7u8; 32];
+    let txs = vec![
+        Tx::Commit(CommitTx { commitment, sender: "Alice".into(), ciphertext_hash: [0;32], access_list: al.clone() }),
+        Tx::Commit(CommitTx { commitment, sender: "Alice".into(), ciphertext_hash: [0;32], access_list: al }),
+    ];
+
+    let b = Block::new(txs, 1);
+    let err = chain.apply_block(&b, &mut balances, &mut nonces, &mut comms, &mut avail)
+        .expect_err("block must be invalid due to duplicate commitment");
+
+    match err {
+        BlockError::IntrinsicInvalid(msg ) => assert!(msg.contains("duplicate commitment"), "got: {msg}"),
+        other => panic!("expected TxInvalid duplicate, got {:?}", other),
+    }
 }

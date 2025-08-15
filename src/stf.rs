@@ -5,8 +5,12 @@ use crate::crypto::merkle_root;
 use crate::crypto::hash_bytes_sha256;
 use crate::state::Available;
 use crate::state::Commitments;
+use crate::state::AVAIL_FEE;
 use crate::state::COMMIT_FEE;
 use crate::state::DECRYPTION_DELAY;
+use crate::state::MAX_AVAILS_PER_BLOCK;
+use crate::state::MAX_PENDING_COMMITS_PER_ACCOUNT;
+use crate::state::MAX_REVEALS_PER_BLOCK;
 use crate::state::REVEAL_WINDOW;
 use crate::state::{Balances, Nonces};
 use crate::codec::{tx_enum_bytes, receipt_bytes, header_bytes, tx_bytes};
@@ -128,6 +132,7 @@ fn process_avail(
     available: &mut Available,
     current_height: u64,
     events: &mut Vec<Event>,
+    balances: &mut Balances
 ) -> Result<Receipt, TxError> {
     // sanity: commitment exists & not consumed
     let meta = commitments.get(&a.commitment)
@@ -135,13 +140,39 @@ fn process_avail(
     if meta.consumed {
         return Err(TxError::IntrinsicInvalid("already consumed".into()));
     }
+
+    // owner-only Avail (v1)   ------ TO BE CHANGED LATER: It now avoids griefing where a third party could force you to pay an Avail fee. Later, when we move to TE, “Avail” becomes a committee root and this logic naturally disappears.
+    let owner = meta.owner.clone();
     
+    // timing window [ready_at .. deadline]
     let ready_at = meta.included_at + DECRYPTION_DELAY;
-    if current_height < ready_at { return Err(TxError::IntrinsicInvalid("avail too early".into())); }
+    let deadline = ready_at + REVEAL_WINDOW;
+    if current_height < ready_at || current_height > deadline {
+        return Err(TxError::IntrinsicInvalid("avail outside valid window".into()));
+    }
+
+    // fee paid by owner (v1)  --- TO BE CHANGED LATER
+    let bal = balances.entry(owner).or_insert(0);
+    if *bal < AVAIL_FEE {
+        return Err(TxError::IntrinsicInvalid("insufficient funds for avail fee".into()));
+    }
+    *bal -= AVAIL_FEE;
 
     available.insert(a.commitment);
-    events.push(Event::AvailabilityRecorded { commitment: a.commitment });
+
+    // idempotent insert
+    let first_time = available.insert(a.commitment);
+    if first_time {
+        events.push(Event::AvailabilityRecorded { commitment: a.commitment });
+    }
+
     Ok(Receipt { outcome: ExecOutcome::Success, gas_used: 0, error: None })
+}
+
+fn pending_for_owner(commitments: &Commitments, owner: &str) -> usize {
+    commitments.values()
+        .filter(|m| !m.consumed && m.owner == owner)
+        .count()
 }
 
 fn process_commit(
@@ -164,6 +195,11 @@ fn process_commit(
     if *bal < COMMIT_FEE {
         return Err(TxError::IntrinsicInvalid("insufficient funds to pay commit fee".to_string()));
     }
+
+    if pending_for_owner(commitments, &c.sender) >= MAX_PENDING_COMMITS_PER_ACCOUNT {
+        return Err(TxError::IntrinsicInvalid("too many pending commits for owner".into()));
+    }
+
     *bal -= COMMIT_FEE;
 
     // 2) reject duplicate active commitment
@@ -273,6 +309,15 @@ pub fn process_block(
     let mut revealed_this_block: HashSet<Hash> = HashSet::new();
     let mut il_due: Vec<Hash> = Vec::new();
 
+    let avail_count = block.transactions.iter().filter(|t| matches!(t, Tx::Avail(_))).count();
+    if avail_count > MAX_AVAILS_PER_BLOCK {
+        return Err(BlockError::IntrinsicInvalid("too many Avails in block".into()));
+    }
+
+    if block.reveals.len() > MAX_REVEALS_PER_BLOCK {
+        return Err(BlockError::IntrinsicInvalid("too many Reveals in block".into()));
+    }
+
     for (cmt, meta) in commitments.iter() {
         if meta.consumed { continue; }
         let ready_at = meta.included_at + DECRYPTION_DELAY;
@@ -287,7 +332,7 @@ pub fn process_block(
     for (i, tx) in block.transactions.iter().enumerate() {
         let rcpt_res = match tx {
             Tx::Commit(c) => process_commit(c, balances, commitments, block.block_number, &mut events),
-            Tx::Avail(a)  => process_avail(a, commitments, available, block.block_number, &mut events),
+            Tx::Avail(a)  => process_avail(a, commitments, available, block.block_number, &mut events, balances),
         };
 
         match rcpt_res {
@@ -464,7 +509,7 @@ mod tests {
         // Final balances:
         // Alice: 100 - COMMIT_FEE(1) - BASE_FEE(1) - 30 = 68
         // Bob:   50 + 30 = 80
-        assert_eq!(balances["Alice"], 68);
+        assert_eq!(balances["Alice"], 68 - AVAIL_FEE);
         assert_eq!(balances["Bob"], 80);
 
         // Nonce consumed on reveal (not on commit)
@@ -585,4 +630,54 @@ mod tests {
            // Nonces unchanged
            assert_eq!(nonces.get("Alice"), Some(1).as_ref());
     }
+    
+    #[test]
+    fn avail_outside_window_is_rejected() {
+        use std::collections::{HashMap, HashSet};
+        use crate::state::{Balances, Commitments, Available, DECRYPTION_DELAY, REVEAL_WINDOW};
+        use crate::types::{Transaction, Hash};
+        use crate::codec::tx_bytes;
+        use crate::crypto::commitment_hash;
+
+        // Minimal state
+        let mut balances: Balances = HashMap::from([("Alice".into(), 10_000)]);
+        let mut commitments: Commitments = Default::default();
+        let mut available:   Available   = HashSet::new();
+        let mut events: Vec<crate::types::Event> = Vec::new();
+
+        // Create a commitment by simulating a commit included at height=5
+        let inner = Transaction::transfer("Alice", "Bob", 1, 0);
+        let salt: Hash = [2u8; 32];
+        let cmt  = commitment_hash(&tx_bytes(&inner), &salt);
+
+        let ready_at = 5 + DECRYPTION_DELAY;
+        let deadline = ready_at + REVEAL_WINDOW;
+
+        // Insert commitment meta as if process_commit ran at height 5
+        commitments.insert(cmt, CommitmentMeta {
+            owner: "Alice".into(),
+            expires_at: deadline,
+            included_at: 5,
+            consumed: false,
+        });
+
+        // Early: height = ready_at - 1
+        let early_h = ready_at - 1;
+        let a = crate::types::AvailTx { commitment: cmt };
+        let err1 = crate::stf::process_avail(
+            &a, &mut commitments, &mut available, early_h, &mut events, &mut balances
+        ).expect_err("early avail must be rejected");
+        match err1 {
+            crate::stf::TxError::IntrinsicInvalid(m) => assert!(m.contains("avail outside valid window")),
+        }
+
+        // Late: height = deadline + 1
+        let late_h = deadline + 1;
+        let err2 = crate::stf::process_avail(
+            &a, &mut commitments, &mut available, late_h, &mut events, &mut balances
+        ).expect_err("late avail must be rejected");
+        match err2 {
+            crate::stf::TxError::IntrinsicInvalid(m) => assert!(m.contains("avail outside valid window")),
+        }
+}
 }
