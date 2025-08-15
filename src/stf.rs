@@ -6,6 +6,7 @@ use crate::crypto::hash_bytes_sha256;
 use crate::state::Available;
 use crate::state::Commitments;
 use crate::state::AVAIL_FEE;
+use crate::state::CHAIN_ID;
 use crate::state::COMMIT_FEE;
 use crate::state::DECRYPTION_DELAY;
 use crate::state::MAX_AVAILS_PER_BLOCK;
@@ -256,7 +257,7 @@ fn process_reveal(
         return Err(TxError::IntrinsicInvalid("reveal sender != tx.from".to_string()));
     }
 
-    let cmt = commitment_hash(&tx_bytes(&r.tx), &r.salt);
+    let cmt = commitment_hash(&tx_bytes(&r.tx), &r.salt, CHAIN_ID);
     
     {
         let meta = commitments.get_mut(&cmt)
@@ -362,7 +363,7 @@ pub fn process_block(
 
         // pair for reveal_set_root
         let tx_ser = tx_bytes(&r.tx);
-        let cmt    = commitment_hash(&tx_ser, &r.salt);
+        let cmt    = commitment_hash(&tx_ser, &r.salt, CHAIN_ID);
         let txh    = hash_bytes_sha256(&tx_ser);
         revealed_pairs.push((cmt, txh));
         revealed_this_block.insert(cmt);
@@ -458,7 +459,7 @@ mod tests {
 
         // Salt and commitment
         let salt: Hash = [7u8; 32];
-        let cmt = commitment_hash(&tx_bytes(&tx), &salt);
+        let cmt = commitment_hash(&tx_bytes(&tx), &salt, CHAIN_ID);
 
         // ---- Block 1: Commit ----
         let b1 = Block::new(
@@ -648,7 +649,7 @@ mod tests {
         // Create a commitment by simulating a commit included at height=5
         let inner = Transaction::transfer("Alice", "Bob", 1, 0);
         let salt: Hash = [2u8; 32];
-        let cmt  = commitment_hash(&tx_bytes(&inner), &salt);
+        let cmt  = commitment_hash(&tx_bytes(&inner), &salt, CHAIN_ID);
 
         let ready_at = 5 + DECRYPTION_DELAY;
         let deadline = ready_at + REVEAL_WINDOW;

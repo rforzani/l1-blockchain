@@ -1,7 +1,7 @@
 //src/chain.rs
 
 use crate::stf::{process_block, BlockResult, BlockError};
-use crate::state::{Available, Balances, Commitments, Nonces, AVAIL_FEE, DECRYPTION_DELAY, REVEAL_WINDOW};
+use crate::state::{Available, Balances, Commitments, Nonces, AVAIL_FEE, CHAIN_ID, DECRYPTION_DELAY, REVEAL_WINDOW};
 use crate::types::{Block, Hash};
 use crate::verify::verify_block_roots;
 
@@ -182,7 +182,7 @@ fn applying_2_blocks_works_correctly() {
     // Inner tx to be revealed
     let tx = Transaction::transfer("Alice", "Bob", 10, 0);
     let salt: Hash = [3u8; 32];
-    let cmt = commitment_hash(&tx_bytes(&tx), &salt);
+    let cmt = commitment_hash(&tx_bytes(&tx), &salt, CHAIN_ID);
 
     let al = AccessList {
         reads:  vec![ StateKey::Balance("Alice".into()) ],
@@ -340,7 +340,7 @@ fn inclusion_list_due_must_be_included() {
     // Build inner tx + salt so we can compute the matching commitment
     let inner = Transaction::transfer("Alice", "Bob", 10, 0);
     let salt: Hash = [9u8; 32];
-    let cmt  = commitment_hash(&tx_bytes(&inner), &salt);
+    let cmt  = commitment_hash(&tx_bytes(&inner), &salt, CHAIN_ID);
 
     // ---- Block 1: Commit ----
     let b1 = Block::new(vec![
@@ -440,11 +440,11 @@ fn reveal_bundle_executes_multiple_reveals_and_satisfies_il() {
     // two inner transfers (use sequential nonces per sender)
     let t1 = Transaction::transfer("Alice","Bob", 10, 0);
     let s1: Hash = [1u8; 32];
-    let c1 = commitment_hash(&tx_bytes(&t1), &s1);
+    let c1 = commitment_hash(&tx_bytes(&t1), &s1, CHAIN_ID);
 
     let t2 = Transaction::transfer("Alice","Bob", 20, 1);
     let s2: Hash = [2u8; 32];
-    let c2 = commitment_hash(&tx_bytes(&t2), &s2);
+    let c2 = commitment_hash(&tx_bytes(&t2), &s2, CHAIN_ID);
 
     // block 1: commits (two)
     let b1 = Block::new(vec![
@@ -649,7 +649,7 @@ fn inclusion_list_due_but_missing_reveal_rejects_block() {
     // Build inner tx + salt → commitment
     let inner = Transaction::transfer("Alice", "Bob", 10, 0);
     let salt: Hash = [9u8; 32];
-    let cmt  = commitment_hash(&tx_bytes(&inner), &salt);
+    let cmt  = commitment_hash(&tx_bytes(&inner), &salt, CHAIN_ID);
 
     // Block 1: commit
     let b1 = Block::new(vec![

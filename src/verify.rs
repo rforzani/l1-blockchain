@@ -1,6 +1,6 @@
 //src/verify.rs
 
-use crate::{codec::{receipt_bytes, tx_bytes, tx_enum_bytes}, crypto::{hash_bytes_sha256, merkle_root}, types::{Block, BlockHeader, Hash, Receipt}};
+use crate::{codec::{receipt_bytes, tx_bytes, tx_enum_bytes}, crypto::{hash_bytes_sha256, merkle_root}, state::CHAIN_ID, types::{Block, BlockHeader, Hash, Receipt}};
 
 pub fn compute_roots_for(block: &Block, receipts: &[Receipt]) -> (Hash, Hash, Hash) {
     // txs_root from block.transactions (reveals are NOT part of txs_root)
@@ -22,7 +22,7 @@ pub fn compute_roots_for(block: &Block, receipts: &[Receipt]) -> (Hash, Hash, Ha
         .iter()
         .map(|r| {
             let ser = tx_bytes(&r.tx);
-            let cmt = crate::crypto::commitment_hash(&ser, &r.salt);
+            let cmt = crate::crypto::commitment_hash(&ser, &r.salt, CHAIN_ID);
             let txh = hash_bytes_sha256(&ser);
             (cmt, txh)
         })

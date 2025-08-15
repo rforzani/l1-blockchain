@@ -1,25 +1,41 @@
 //src/crypto.rs
 
 use sha2::{Digest, Sha256};
-use crate::types::Hash;
+use crate::{chain, types::Hash};
 
-const DOM_COMMIT: &[u8] = b"COMMIT";
 const DOM_ORDER:  &[u8] = b"ORDER";
+const COMMIT_DOMAIN: &[u8] = b"CAR_COMMIT_V1";
+const REVEAL_PAIR_DOMAIN: &[u8] = b"CAR_REVEAL_PAIR_V1";
 
-pub fn commitment_hash(tx_bytes: &[u8], salt: &Hash) -> Hash {
-    let mut buf = Vec::with_capacity(6 + tx_bytes.len() + 32);
-    buf.extend_from_slice(DOM_COMMIT);
+pub fn commitment_hash(tx_bytes: &[u8], salt: &Hash, chain_id: u64) -> Hash {
+    // capacity = domain + chain_id(8) + tx + salt(32)
+    let mut buf = Vec::with_capacity(COMMIT_DOMAIN.len() + 8 + tx_bytes.len() + 32);
+    buf.extend_from_slice(COMMIT_DOMAIN);
+    buf.extend_from_slice(&chain_id.to_le_bytes());
     buf.extend_from_slice(tx_bytes);
     buf.extend_from_slice(salt);
-    hash_bytes_sha256(&buf)
+    H(&buf)
 }
 
 pub fn reveal_order_key(commitment: &Hash, randomness: &Hash) -> Hash {
-    let mut buf = Vec::with_capacity(5 + 32 + 32);
+    let mut buf = Vec::with_capacity(DOM_ORDER.len() + 32 + 32);
     buf.extend_from_slice(DOM_ORDER);
     buf.extend_from_slice(commitment);
     buf.extend_from_slice(randomness);
-    hash_bytes_sha256(&buf)
+    H(&buf)
+}
+
+pub fn hash_reveal_pair(commitment: &Hash, tx_hash: &Hash) -> Hash {
+    // capacity = domain + commitment(32) + tx_hash(32)
+    let mut buf = Vec::with_capacity(REVEAL_PAIR_DOMAIN.len() + 32 + 32);
+    buf.extend_from_slice(REVEAL_PAIR_DOMAIN);
+    buf.extend_from_slice(commitment);
+    buf.extend_from_slice(tx_hash);
+    H(&buf)
+}
+
+fn H(bytes: &[u8]) -> Hash {
+    hash_bytes_sha256(bytes)
 }
 
 pub fn hash_bytes_sha256(data: &[u8]) -> Hash {
@@ -41,14 +57,14 @@ fn parent_hash(left: &Hash, right: &Hash) -> Hash {
     buf.extend_from_slice(b"MRKL");
     buf.extend_from_slice(left);
     buf.extend_from_slice(right);
-    hash_bytes_sha256(&buf)
+    H(&buf)
 }
 
 pub fn merkle_root(leaves: &[Hash]) -> Hash {
     match leaves.len() {
         0 => {
             // Convention: empty tree → hash of empty bytes
-            hash_bytes_sha256(&[])
+            H(&[])
         }
         1 => leaves[0],
         _ => {
