@@ -158,13 +158,20 @@ fn applying_2_blocks_works_correctly() {
     use crate::chain::Chain;
     use crate::state::{
         Balances, Nonces, Commitments, Available,
-        DECRYPTION_DELAY, REVEAL_WINDOW
+        DECRYPTION_DELAY, REVEAL_WINDOW, CHAIN_ID
     };
     use crate::types::{
         Block, Transaction, Tx, CommitTx, RevealTx, Hash, StateKey, AccessList, AvailTx
     };
     use crate::codec::tx_bytes;
     use crate::crypto::commitment_hash;
+    use ed25519_dalek::{SigningKey, VerifyingKey, Signer as _};
+    use crate::codec::{string_bytes, access_list_bytes};
+    use crate::crypto::{commit_signing_preimage, avail_signing_preimage};
+    
+    let sk = SigningKey::from_bytes(&[3u8; 32]);
+    let vk = VerifyingKey::from(&sk);
+    let pk_bytes = vk.to_bytes();
 
     // helper: advance chain to `target` (exclusive) with empty blocks
     fn advance_to(
@@ -191,6 +198,13 @@ fn applying_2_blocks_works_correctly() {
         writes: vec![ StateKey::Balance("Alice".into()) ],
     };
 
+    let sender_bytes = string_bytes("Alice");
+    let al_bytes     = access_list_bytes(&al);
+    let pre_c = commit_signing_preimage(
+        &cmt, &[0u8; 32], &sender_bytes, &al_bytes, CHAIN_ID
+    );
+    let sig_c = sk.sign(&pre_c).to_bytes();
+
     // Block 1: commit
     let b1 = Block::new(
         vec![Tx::Commit(CommitTx {
@@ -198,8 +212,8 @@ fn applying_2_blocks_works_correctly() {
             sender: "Alice".into(),
             ciphertext_hash: [0u8; 32],
             access_list: al,
-            pubkey: [0; 32], 
-            sig: [0; 64]
+            pubkey: pk_bytes, 
+            sig: sig_c
         })],
         1,
     );
@@ -228,8 +242,12 @@ fn applying_2_blocks_works_correctly() {
     let reveals = vec![
         RevealTx { tx: tx.clone(), salt, sender: "Alice".into() }
     ];
+
+    let pre_a = avail_signing_preimage(&cmt, &sender_bytes, CHAIN_ID);
+    let sig_a = sk.sign(&pre_a).to_bytes();
+
     let b2 = Block::new_with_reveals(
-        vec![ Tx::Avail(AvailTx { commitment: cmt, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }) ],
+        vec![ Tx::Avail(AvailTx { commitment: cmt, pubkey: pk_bytes, sig: sig_a, sender: "Alice".into() }) ],
         reveals,
         ready_at,
     );
@@ -247,28 +265,54 @@ fn applying_2_blocks_works_correctly() {
 #[test]
 fn tamper_block_no_state_change() {
     use std::collections::HashMap;
-    use crate::state::{Balances, Nonces, Commitments, Available, COMMIT_FEE};
+    use ed25519_dalek::{SigningKey, VerifyingKey, Signer as _};
+    use crate::state::{Balances, Nonces, Commitments, Available, COMMIT_FEE, CHAIN_ID};
     use crate::types::{Block, Tx, CommitTx, Hash, AccessList, StateKey};
     use crate::stf::process_block;
     use crate::verify::verify_block_roots;
+    use crate::codec::{string_bytes, access_list_bytes};
+    use crate::crypto::commit_signing_preimage;
 
     // Genesis parent
     let parent: Hash = [0u8; 32];
 
+    // Deterministic keypair for signing
+    let sk = SigningKey::from_bytes(&[7u8; 32]);
+    let vk = VerifyingKey::from(&sk);
+    let pk_bytes = vk.to_bytes();
+
+    let sender = "Alice".to_string();
+
     let al = AccessList {
-        reads:  vec![StateKey::Balance("Alice".into())],
-        writes: vec![StateKey::Balance("Alice".into())],
+        reads:  vec![StateKey::Balance(sender.clone())],
+        writes: vec![StateKey::Balance(sender.clone())],
     };
 
-    // Block #1 with a single Commit
+    // Canonical bytes for signing
+    let sender_bytes = string_bytes(&sender);
+    let al_bytes     = access_list_bytes(&al);
+
+    // Block #1 with a single Commit (signed)
     let commitment: Hash = [9u8; 32];
+    let ciphertext_hash: Hash = [0u8; 32];
+
+    let pre_c = commit_signing_preimage(
+        &commitment,
+        &ciphertext_hash,
+        &sender_bytes,
+        &al_bytes,
+        CHAIN_ID,
+    );
+    let sig_c = sk.sign(&pre_c).to_bytes();
+
     let block = Block::new(
         vec![Tx::Commit(CommitTx {
             commitment,
-            sender: "Alice".into(),
-            ciphertext_hash: [0u8; 32],
+            sender: sender.clone(),
+            ciphertext_hash,
             access_list: al,
-            pubkey: [0; 32], sig: [0; 64]
+            pubkey: pk_bytes,
+            sig: sig_c,
         })],
         1,
     );
@@ -285,7 +329,7 @@ fn tamper_block_no_state_change() {
         &mut balances,
         &mut nonces,
         &mut commitments,
-        &mut available, // ← NEW
+        &mut available,
         &parent,
     ).expect("ok");
 
@@ -306,11 +350,16 @@ fn tamper_block_no_state_change() {
 #[test]
 fn inclusion_list_due_must_be_included() {
     use std::collections::HashMap;
+    use ed25519_dalek::{SigningKey, VerifyingKey, Signer as _};
     use crate::chain::Chain;
-    use crate::state::{Balances, Nonces, Commitments, Available, DECRYPTION_DELAY, REVEAL_WINDOW};
-    use crate::types::{Block, Tx, CommitTx, RevealTx, AvailTx, Transaction, AccessList, StateKey, Hash};
-    use crate::codec::tx_bytes;
-    use crate::crypto::commitment_hash;
+    use crate::state::{
+        Balances, Nonces, Commitments, Available, DECRYPTION_DELAY, REVEAL_WINDOW, CHAIN_ID
+    };
+    use crate::types::{
+        Block, Tx, CommitTx, RevealTx, AvailTx, Transaction, AccessList, StateKey, Hash
+    };
+    use crate::codec::{tx_bytes, string_bytes, access_list_bytes};
+    use crate::crypto::{commitment_hash, commit_signing_preimage, avail_signing_preimage};
     use crate::stf::BlockError;
 
     // helper: fill chain with empty blocks up to (but not including) `target`
@@ -337,25 +386,40 @@ fn inclusion_list_due_must_be_included() {
     // --- Chain ---
     let mut chain = Chain::new();
 
+    // deterministic test keypair
+    let sk = SigningKey::from_bytes(&[7u8; 32]);
+    let vk = VerifyingKey::from(&sk);
+    let pk_bytes = vk.to_bytes();
+
+    let sender = "Alice".to_string();
+
     let al = AccessList {
-        reads:  vec![ StateKey::Balance("Alice".into()) ],
-        writes: vec![ StateKey::Balance("Alice".into()) ],
+        reads:  vec![ StateKey::Balance(sender.clone()) ],
+        writes: vec![ StateKey::Balance(sender.clone()) ],
     };
 
+    // canonical bytes for signing
+    let sender_bytes = string_bytes(&sender);
+    let al_bytes     = access_list_bytes(&al);
+
     // Build inner tx + salt so we can compute the matching commitment
-    let inner = Transaction::transfer("Alice", "Bob", 10, 0);
+    let inner = Transaction::transfer(&sender, "Bob", 10, 0);
     let salt: Hash = [9u8; 32];
     let cmt  = commitment_hash(&tx_bytes(&inner), &salt, CHAIN_ID);
 
-    // ---- Block 1: Commit ----
+    // ---- Block 1: Commit (signed) ----
+    let ciphertext_hash = [2u8; 32];
+    let pre_commit = commit_signing_preimage(&cmt, &ciphertext_hash, &sender_bytes, &al_bytes, CHAIN_ID);
+    let sig_commit = sk.sign(&pre_commit).to_bytes();
+
     let b1 = Block::new(vec![
         Tx::Commit(CommitTx {
             commitment: cmt,
-            sender: "Alice".into(),
-            ciphertext_hash: [2u8;32],
+            sender: sender.clone(),
+            ciphertext_hash,
             access_list: al.clone(),
-            pubkey: [0; 32], 
-            sig: [0; 64]
+            pubkey: pk_bytes,
+            sig: sig_commit,
         })
     ], 1);
     chain.apply_block(&b1, &mut balances, &mut nonces, &mut comm, &mut avail)
@@ -368,7 +432,20 @@ fn inclusion_list_due_must_be_included() {
     // If ready_at < due, post availability earlier; otherwise, include it in the due block.
     if ready_at < due {
         advance_to(&mut chain, &mut balances, &mut nonces, &mut comm, &mut avail, ready_at);
-        let b_ready = Block::new(vec![ Tx::Avail(AvailTx { commitment: cmt, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }) ], ready_at);
+
+        // signed Avail
+        let pre_avail = avail_signing_preimage(&cmt, &sender_bytes, CHAIN_ID);
+        let sig_avail = sk.sign(&pre_avail).to_bytes();
+
+        let b_ready = Block::new(
+            vec![ Tx::Avail(AvailTx {
+                commitment: cmt,
+                sender: sender.clone(),
+                pubkey: pk_bytes,
+                sig: sig_avail,
+            }) ],
+            ready_at
+        );
         chain.apply_block(&b_ready, &mut balances, &mut nonces, &mut comm, &mut avail)
              .expect("availability block applies");
     }
@@ -379,10 +456,18 @@ fn inclusion_list_due_must_be_included() {
     // txs for due block (may contain Avail if ready_at == due)
     let mut due_txs = Vec::new();
     if ready_at == due {
-        due_txs.push(Tx::Avail(AvailTx { commitment: cmt, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }));
+        // signed Avail in the due block (still no reveal)
+        let pre_avail = avail_signing_preimage(&cmt, &sender_bytes, CHAIN_ID);
+        let sig_avail = sk.sign(&pre_avail).to_bytes();
+
+        due_txs.push(Tx::Avail(AvailTx {
+            commitment: cmt,
+            sender: sender.clone(),
+            pubkey: pk_bytes,
+            sig: sig_avail,
+        }));
     }
 
-    // No reveals included → invalid (missing required reveal)
     let b_due_missing = Block::new_with_reveals(due_txs.clone(), Vec::new(), due);
     let err = chain
         .apply_block(&b_due_missing, &mut balances, &mut nonces, &mut comm, &mut avail)
@@ -396,26 +481,28 @@ fn inclusion_list_due_must_be_included() {
     // ---- Block due: WITH Reveal → success ----
     // height hasn't advanced after the failed apply, so we can reuse `due`
     let reveals = vec![
-        RevealTx { tx: inner.clone(), salt, sender: "Alice".into() }
+        RevealTx { tx: inner.clone(), salt, sender: sender.clone() }
     ];
     let b_due_with = Block::new_with_reveals(due_txs, reveals, due);
     chain.apply_block(&b_due_with, &mut balances, &mut nonces, &mut comm, &mut avail)
          .expect("due block applies with reveal");
 }
 
+
 #[test]
 fn reveal_bundle_executes_multiple_reveals_and_satisfies_il() {
     use std::collections::HashMap;
+    use ed25519_dalek::{SigningKey, VerifyingKey, Signer as _};
     use crate::chain::Chain;
     use crate::state::{
         Balances, Nonces, Commitments, Available,
-        DECRYPTION_DELAY, REVEAL_WINDOW, COMMIT_FEE
+        DECRYPTION_DELAY, REVEAL_WINDOW, COMMIT_FEE, AVAIL_FEE, CHAIN_ID
     };
     use crate::types::{
         Block, Tx, CommitTx, RevealTx, Transaction, AccessList, StateKey, Hash, AvailTx
     };
-    use crate::codec::tx_bytes;
-    use crate::crypto::commitment_hash;
+    use crate::codec::{tx_bytes, string_bytes, access_list_bytes};
+    use crate::crypto::{commitment_hash, commit_signing_preimage, avail_signing_preimage};
     use crate::gas::BASE_FEE_PER_TX;
 
     // helper: advance chain with empty blocks up to (but not including) `target`
@@ -439,24 +526,54 @@ fn reveal_bundle_executes_multiple_reveals_and_satisfies_il() {
     let mut avail: Available   = Default::default();
     let mut chain = Chain::new();
 
+    // deterministic keypair for tests
+    let sk = SigningKey::from_bytes(&[7u8; 32]);
+    let vk = VerifyingKey::from(&sk);
+    let pk_bytes = vk.to_bytes();
+
+    let sender = "Alice".to_string();
     let al = AccessList {
-        reads:  vec![ StateKey::Balance("Alice".into()) ],
-        writes: vec![ StateKey::Balance("Alice".into()) ],
+        reads:  vec![ StateKey::Balance(sender.clone()) ],
+        writes: vec![ StateKey::Balance(sender.clone()) ],
     };
+    let sender_bytes = string_bytes(&sender);
+    let al_bytes     = access_list_bytes(&al);
 
     // two inner transfers (use sequential nonces per sender)
-    let t1 = Transaction::transfer("Alice","Bob", 10, 0);
+    let t1 = Transaction::transfer(&sender, "Bob", 10, 0);
     let s1: Hash = [1u8; 32];
     let c1 = commitment_hash(&tx_bytes(&t1), &s1, CHAIN_ID);
 
-    let t2 = Transaction::transfer("Alice","Bob", 20, 1);
+    let t2 = Transaction::transfer(&sender, "Bob", 20, 1);
     let s2: Hash = [2u8; 32];
     let c2 = commitment_hash(&tx_bytes(&t2), &s2, CHAIN_ID);
 
-    // block 1: commits (two)
+    // block 1: commits (two) — both signed
+    let ciphertext_hash = [0u8; 32];
+
+    let pre_c1 = commit_signing_preimage(&c1, &ciphertext_hash, &sender_bytes, &al_bytes, CHAIN_ID);
+    let sig_c1 = sk.sign(&pre_c1).to_bytes();
+
+    let pre_c2 = commit_signing_preimage(&c2, &ciphertext_hash, &sender_bytes, &al_bytes, CHAIN_ID);
+    let sig_c2 = sk.sign(&pre_c2).to_bytes();
+
     let b1 = Block::new(vec![
-        Tx::Commit(CommitTx { commitment: c1, sender:"Alice".into(), ciphertext_hash:[0u8;32], access_list: al.clone(), pubkey: [0; 32], sig: [0; 64] }),
-        Tx::Commit(CommitTx { commitment: c2, sender:"Alice".into(), ciphertext_hash:[0u8;32], access_list: al.clone(), pubkey: [0; 32], sig: [0; 64] }),
+        Tx::Commit(CommitTx {
+            commitment: c1,
+            sender: sender.clone(),
+            ciphertext_hash,
+            access_list: al.clone(),
+            pubkey: pk_bytes,
+            sig: sig_c1,
+        }),
+        Tx::Commit(CommitTx {
+            commitment: c2,
+            sender: sender.clone(),
+            ciphertext_hash,
+            access_list: al.clone(),
+            pubkey: pk_bytes,
+            sig: sig_c2,
+        }),
     ], 1);
     chain.apply_block(&b1, &mut balances, &mut nonces, &mut comms, &mut avail).expect("b1");
 
@@ -464,12 +581,19 @@ fn reveal_bundle_executes_multiple_reveals_and_satisfies_il() {
     let ready_at = 1 + DECRYPTION_DELAY;
     let due      = ready_at + REVEAL_WINDOW;
 
-    // availability claims (either at ready_at, or same block as due if equal)
+    // availability claims (either at ready_at, or in due if equal) — signed
     if ready_at < due {
         advance_to(&mut chain, &mut balances, &mut nonces, &mut comms, &mut avail, ready_at);
+
+        let pre_a1 = avail_signing_preimage(&c1, &sender_bytes, CHAIN_ID);
+        let sig_a1 = sk.sign(&pre_a1).to_bytes();
+
+        let pre_a2 = avail_signing_preimage(&c2, &sender_bytes, CHAIN_ID);
+        let sig_a2 = sk.sign(&pre_a2).to_bytes();
+
         let b_ready = Block::new(vec![
-            Tx::Avail(AvailTx { commitment: c1, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }),
-            Tx::Avail(AvailTx { commitment: c2, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }),
+            Tx::Avail(AvailTx { commitment: c1, sender: sender.clone(), pubkey: pk_bytes, sig: sig_a1 }),
+            Tx::Avail(AvailTx { commitment: c2, sender: sender.clone(), pubkey: pk_bytes, sig: sig_a2 }),
         ], ready_at);
         chain.apply_block(&b_ready, &mut balances, &mut nonces, &mut comms, &mut avail).expect("b_ready");
     }
@@ -479,13 +603,19 @@ fn reveal_bundle_executes_multiple_reveals_and_satisfies_il() {
 
     // due block: both reveals live in the block body; include Avail(s) too if ready_at == due
     let reveals = vec![
-        RevealTx { tx: t1.clone(), salt: s1, sender: "Alice".into() },
-        RevealTx { tx: t2.clone(), salt: s2, sender: "Alice".into() },
+        RevealTx { tx: t1.clone(), salt: s1, sender: sender.clone() },
+        RevealTx { tx: t2.clone(), salt: s2, sender: sender.clone() },
     ];
     let txs = if ready_at == due {
+        let pre_a1 = avail_signing_preimage(&c1, &sender_bytes, CHAIN_ID);
+        let sig_a1 = sk.sign(&pre_a1).to_bytes();
+
+        let pre_a2 = avail_signing_preimage(&c2, &sender_bytes, CHAIN_ID);
+        let sig_a2 = sk.sign(&pre_a2).to_bytes();
+
         vec![
-            Tx::Avail(AvailTx { commitment: c1, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }),
-            Tx::Avail(AvailTx { commitment: c2, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }),
+            Tx::Avail(AvailTx { commitment: c1, sender: sender.clone(), pubkey: pk_bytes, sig: sig_a1 }),
+            Tx::Avail(AvailTx { commitment: c2, sender: sender.clone(), pubkey: pk_bytes, sig: sig_a2 }),
         ]
     } else {
         Vec::new()
@@ -497,9 +627,9 @@ fn reveal_bundle_executes_multiple_reveals_and_satisfies_il() {
     // receipts: two reveals
     assert_eq!(res.receipts.len(), 2);
 
-    // balances: commit fees + reveal gas + transfers
-    // Alice started 1000; paid 2*COMMIT_FEE at b1; then pays 2*BASE_FEE and transfers 30 total
-    let expected_alice = 1_000 - 2*COMMIT_FEE - 2*BASE_FEE_PER_TX - (10 + 20) - AVAIL_FEE*2;
+    // balances: commit fees + reveal gas + transfers + avail fees
+    // Alice started 1000; paid 2*COMMIT_FEE at b1; then pays 2*BASE_FEE and transfers 30 total; plus 2 * AVAIL_FEE
+    let expected_alice = 1_000 - 2*COMMIT_FEE - 2*BASE_FEE_PER_TX - (10 + 20) - 2*AVAIL_FEE;
     assert_eq!(balances["Alice"], expected_alice);
 }
 
@@ -537,13 +667,16 @@ fn too_many_avails_in_block_is_invalid() {
 
 #[test]
 fn too_many_pending_commits_for_owner_is_rejected() {
+    use ed25519_dalek::{SigningKey, VerifyingKey, Signer as _};
     use crate::chain::Chain;
     use crate::state::{
         Balances, Nonces, Commitments, Available,
-        COMMIT_FEE, MAX_PENDING_COMMITS_PER_ACCOUNT
+        COMMIT_FEE, MAX_PENDING_COMMITS_PER_ACCOUNT, CHAIN_ID
     };
     use crate::types::{Block, Tx, CommitTx, AccessList, StateKey};
     use crate::stf::BlockError;
+    use crate::codec::{string_bytes, access_list_bytes};
+    use crate::crypto::commit_signing_preimage;
 
     let mut balances: Balances = std::collections::HashMap::from([
         ("Alice".into(), (MAX_PENDING_COMMITS_PER_ACCOUNT as u64 + 10) * COMMIT_FEE),
@@ -553,29 +686,46 @@ fn too_many_pending_commits_for_owner_is_rejected() {
     let mut avail: Available   = Default::default();
     let mut chain = Chain::new();
 
+    let sender = "Alice".to_string();
+
     let al = AccessList {
-        reads:  vec![ StateKey::Balance("Alice".into()) ],
-        writes: vec![ StateKey::Balance("Alice".into()) ],
+        reads:  vec![ StateKey::Balance(sender.clone()) ],
+        writes: vec![ StateKey::Balance(sender.clone()) ],
     };
 
-    // Build a single block containing MAX_PENDING + 1 commits from Alice
+    // deterministic keypair + canonical bytes used for every Commit
+    let sk = SigningKey::from_bytes(&[7u8; 32]);
+    let vk = VerifyingKey::from(&sk);
+    let pk_bytes = vk.to_bytes();
+
+    let sender_bytes = string_bytes(&sender);
+    let al_bytes     = access_list_bytes(&al);
+    let ciphertext_hash = [0u8; 32];
+
+    // Build a single block containing MAX_PENDING + 1 commits from Alice (all signed)
     let mut txs = Vec::with_capacity(MAX_PENDING_COMMITS_PER_ACCOUNT + 1);
     for i in 0..(MAX_PENDING_COMMITS_PER_ACCOUNT + 1) {
-        // use distinct commitments
+        // distinct commitments
         let mut c = [0u8; 32];
         c[..8].copy_from_slice(&(i as u64).to_le_bytes());
+
+        // sign this specific Commit (binds commitment + ciphertext_hash + sender + AL + chain_id)
+        let pre = commit_signing_preimage(&c, &ciphertext_hash, &sender_bytes, &al_bytes, CHAIN_ID);
+        let sig = sk.sign(&pre).to_bytes();
+
         txs.push(Tx::Commit(CommitTx {
             commitment: c,
-            sender: "Alice".into(),
-            ciphertext_hash: [0u8; 32],
+            sender: sender.clone(),
+            ciphertext_hash,
             access_list: al.clone(),
-            pubkey: [0; 32], 
-            sig: [0; 64]
+            pubkey: pk_bytes,
+            sig,
         }));
     }
 
     let b = Block::new(txs, 1);
-    let err = chain.apply_block(&b, &mut balances, &mut nonces, &mut comms, &mut avail)
+    let err = chain
+        .apply_block(&b, &mut balances, &mut nonces, &mut comms, &mut avail)
         .expect_err("block must be invalid on the (MAX+1)th commit");
 
     match err {
@@ -621,11 +771,16 @@ fn duplicate_commit_in_same_block_is_rejected() {
 #[test]
 fn inclusion_list_due_but_missing_reveal_rejects_block() {
     use std::collections::HashMap;
+    use ed25519_dalek::{SigningKey, VerifyingKey, Signer as _};
     use crate::chain::Chain;
-    use crate::state::{Balances, Nonces, Commitments, Available, DECRYPTION_DELAY, REVEAL_WINDOW};
-    use crate::types::{Block, Tx, CommitTx, RevealTx, AvailTx, Transaction, AccessList, StateKey, Hash};
-    use crate::codec::tx_bytes;
-    use crate::crypto::commitment_hash;
+    use crate::state::{
+        Balances, Nonces, Commitments, Available, DECRYPTION_DELAY, REVEAL_WINDOW, CHAIN_ID
+    };
+    use crate::types::{
+        Block, Tx, CommitTx, RevealTx, AvailTx, Transaction, AccessList, StateKey, Hash
+    };
+    use crate::codec::{tx_bytes, string_bytes, access_list_bytes};
+    use crate::crypto::{commitment_hash, commit_signing_preimage, avail_signing_preimage};
     use crate::stf::BlockError;
 
     // helper: advance chain with empty blocks up to (but not including) `target`
@@ -650,37 +805,67 @@ fn inclusion_list_due_but_missing_reveal_rejects_block() {
     let mut avail: Available  = Default::default();
     let mut chain = Chain::new();
 
+    // --- deterministic test keypair ---
+    let sk = SigningKey::from_bytes(&[7u8; 32]);
+    let vk = VerifyingKey::from(&sk);
+    let pk_bytes = vk.to_bytes();
+
+    let sender = "Alice".to_string();
+
     let al = AccessList {
-        reads:  vec![ StateKey::Balance("Alice".into()) ],
-        writes: vec![ StateKey::Balance("Alice".into()) ],
+        reads:  vec![ StateKey::Balance(sender.clone()) ],
+        writes: vec![ StateKey::Balance(sender.clone()) ],
     };
 
+    // canonical bytes for signing
+    let sender_bytes = string_bytes(&sender);
+    let al_bytes     = access_list_bytes(&al);
+
     // Build inner tx + salt → commitment
-    let inner = Transaction::transfer("Alice", "Bob", 10, 0);
+    let inner = Transaction::transfer(&sender, "Bob", 10, 0);
     let salt: Hash = [9u8; 32];
     let cmt  = commitment_hash(&tx_bytes(&inner), &salt, CHAIN_ID);
 
-    // Block 1: commit
+    // Block 1: commit (signed)
+    let ciphertext_hash = [2u8; 32];
+    let pre_commit = commit_signing_preimage(&cmt, &ciphertext_hash, &sender_bytes, &al_bytes, CHAIN_ID);
+    let sig_commit = sk.sign(&pre_commit).to_bytes();
+
     let b1 = Block::new(vec![
         Tx::Commit(CommitTx {
             commitment: cmt,
-            sender: "Alice".into(),
-            ciphertext_hash: [2u8;32],
+            sender: sender.clone(),
+            ciphertext_hash,
             access_list: al.clone(),
-            pubkey: [0; 32], sig: [0; 64]
+            pubkey: pk_bytes,
+            sig: sig_commit,
         })
     ], 1);
     chain.apply_block(&b1, &mut balances, &mut nonces, &mut comm, &mut avail).expect("b1 applies");
 
     // Heights
-    let ready_at = 1 + DECRYPTION_DELAY;  // 2
-    let due      = ready_at + REVEAL_WINDOW; // 5
+    let ready_at = 1 + DECRYPTION_DELAY;       // e.g., 2
+    let due      = ready_at + REVEAL_WINDOW;   // e.g., 5
 
     // If ready_at < due, post Avail earlier (so it's eligible and will be in IL)
     if ready_at < due {
         advance_to(&mut chain, &mut balances, &mut nonces, &mut comm, &mut avail, ready_at);
-        let b_ready = Block::new(vec![ Tx::Avail(AvailTx { commitment: cmt, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }) ], ready_at);
-        chain.apply_block(&b_ready, &mut balances, &mut nonces, &mut comm, &mut avail).expect("availability block applies");
+
+        // signed Avail
+        let pre_avail = avail_signing_preimage(&cmt, &sender_bytes, CHAIN_ID);
+        let sig_avail = sk.sign(&pre_avail).to_bytes();
+
+        let b_ready = Block::new(
+            vec![ Tx::Avail(AvailTx {
+                commitment: cmt,
+                sender: sender.clone(),
+                pubkey: pk_bytes,
+                sig: sig_avail,
+            }) ],
+            ready_at
+        );
+        chain.apply_block(&b_ready, &mut balances, &mut nonces, &mut comm, &mut avail)
+             .expect("availability block applies");
     }
 
     // Advance to due
@@ -688,7 +873,15 @@ fn inclusion_list_due_but_missing_reveal_rejects_block() {
 
     // Build due block WITHOUT the reveal → must fail
     let due_txs = if ready_at == due {
-        vec![ Tx::Avail(AvailTx { commitment: cmt, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }) ]
+        // If availability is due at the same height, include a signed Avail here (still no reveal)
+        let pre_avail = avail_signing_preimage(&cmt, &sender_bytes, CHAIN_ID);
+        let sig_avail = sk.sign(&pre_avail).to_bytes();
+        vec![ Tx::Avail(AvailTx {
+            commitment: cmt,
+            sender: sender.clone(),
+            pubkey: pk_bytes,
+            sig: sig_avail,
+        }) ]
     } else {
         Vec::new()
     };
@@ -697,65 +890,111 @@ fn inclusion_list_due_but_missing_reveal_rejects_block() {
     let err = chain.apply_block(&b_due_missing, &mut balances, &mut nonces, &mut comm, &mut avail)
         .expect_err("must fail due to missing reveal");
     match err {
-        BlockError::IntrinsicInvalid(msg) => assert!(msg.contains("missing required reveal"), "got: {msg}"),
+        BlockError::IntrinsicInvalid(msg) => {
+            assert!(msg.contains("missing required reveal"), "got: {msg}");
+        }
         other => panic!("expected IntrinsicInvalid, got {:?}", other),
     }
 
     // (Optional) Now include the reveal at the same height → should pass
-    let reveals = vec![ RevealTx { tx: inner.clone(), salt, sender: "Alice".into() } ];
+    let reveals = vec![ RevealTx { tx: inner.clone(), salt, sender: sender.clone() } ];
     let b_due_with = Block::new_with_reveals(Vec::new(), reveals, due);
     chain.apply_block(&b_due_with, &mut balances, &mut nonces, &mut comm, &mut avail)
          .expect("due block applies with reveal");
 }
 
+
 #[test]
 fn availability_outside_window_rejected() {
+    use ed25519_dalek::{SigningKey, VerifyingKey, Signer as _};
     use crate::chain::Chain;
-    use crate::state::{Balances, Nonces, Commitments, Available, COMMIT_FEE, DECRYPTION_DELAY, REVEAL_WINDOW};
+    use crate::state::{Balances, Nonces, Commitments, Available, COMMIT_FEE, DECRYPTION_DELAY, REVEAL_WINDOW, CHAIN_ID};
     use crate::types::{Block, Tx, CommitTx, AvailTx, AccessList, StateKey};
     use crate::stf::BlockError;
+    use crate::codec::{string_bytes, access_list_bytes};
+    use crate::crypto::{commit_signing_preimage, avail_signing_preimage};
 
+    // --- state ---
     let mut balances: Balances = [("Alice".into(), 2 * COMMIT_FEE)].into_iter().collect();
     let mut nonces: Nonces = Default::default();
     let mut comms: Commitments = Default::default();
     let mut avail: Available   = Default::default();
     let mut chain = Chain::new();
 
-    let al = AccessList {
-        reads:  vec![StateKey::Balance("Alice".into())],
-        writes: vec![StateKey::Balance("Alice".into())],
-    };
+    // --- deterministic keypair for tests ---
+    let sk = SigningKey::from_bytes(&[7u8; 32]);
+    let vk = VerifyingKey::from(&sk);
+    let pk_bytes = vk.to_bytes();
 
-    // Commit at height 1
+    // --- access list + canonical bytes for signing ---
+    let sender = "Alice".to_string();
+    let al = AccessList {
+        reads:  vec![StateKey::Balance(sender.clone())],
+        writes: vec![StateKey::Balance(sender.clone())],
+    };
+    let sender_bytes = string_bytes(&sender);
+    let al_bytes     = access_list_bytes(&al);
+
+    // --- Commit at height 1 (we use a fixed commitment as in the original test) ---
     let commitment = [2u8; 32];
+    let ciphertext_hash = [0u8; 32];
+
+    // sign the Commit fields
+    let pre_c = commit_signing_preimage(&commitment, &ciphertext_hash, &sender_bytes, &al_bytes, CHAIN_ID);
+    let sig_c = sk.sign(&pre_c).to_bytes();
+
     let b1 = Block::new(vec![
         Tx::Commit(CommitTx {
             commitment,
-            sender: "Alice".into(),
-            ciphertext_hash: [0u8; 32],
+            sender: sender.clone(),
+            ciphertext_hash,
             access_list: al.clone(),
-            pubkey: [0; 32], 
-            sig: [0; 64]
+            pubkey: pk_bytes,
+            sig: sig_c,
         }),
     ], 1);
-    chain.apply_block(&b1, &mut balances, &mut nonces, &mut comms, &mut avail).expect("commit ok");
+    chain
+        .apply_block(&b1, &mut balances, &mut nonces, &mut comms, &mut avail)
+        .expect("commit ok");
 
-    // Compute window
-    let ready_at = 1 + DECRYPTION_DELAY;           // = 2
-    let deadline = ready_at + REVEAL_WINDOW;       // = 2 + 3 = 5
+    // --- Compute window ---
+    let ready_at = 1 + DECRYPTION_DELAY;     // e.g., 2
+    let deadline = ready_at + REVEAL_WINDOW; // e.g., 5
 
-    // Advance to deadline + 1
-    for h in 2..=deadline { // 2..=5
+    // --- Advance to deadline (inclusive) ---
+    for h in 2..=deadline {
         let empty = Block::new(Vec::new(), h);
-        chain.apply_block(&empty, &mut balances, &mut nonces, &mut comms, &mut avail).expect("advance");
+        chain
+            .apply_block(&empty, &mut balances, &mut nonces, &mut comms, &mut avail)
+            .expect("advance");
     }
 
-    // Avail too late (deadline + 1)
-    let late_block = Block::new(vec![ Tx::Avail(AvailTx { commitment, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }) ], deadline + 1); // = 6
-    let err = chain.apply_block(&late_block, &mut balances, &mut nonces, &mut comms, &mut avail)
+    // --- Avail too late (deadline + 1) ---
+    // sign the Avail fields
+    let pre_a = avail_signing_preimage(&commitment, &sender_bytes, CHAIN_ID);
+    let sig_a = sk.sign(&pre_a).to_bytes();
+
+    let late_block = Block::new(
+        vec![Tx::Avail(AvailTx {
+            commitment,
+            sender: sender.clone(),
+            pubkey: pk_bytes,
+            sig: sig_a,
+        })],
+        deadline + 1,
+    );
+
+    let err = chain
+        .apply_block(&late_block, &mut balances, &mut nonces, &mut comms, &mut avail)
         .expect_err("block must be rejected for late availability");
+
     match err {
-        BlockError::IntrinsicInvalid(msg) => assert!(msg.contains("avail outside valid window"), "got: {msg}"),
+        BlockError::IntrinsicInvalid(msg) => {
+            assert!(
+                msg.contains("avail outside valid window"),
+                "got: {msg}"
+            )
+        }
         other => panic!("expected IntrinsicInvalid for late avail, got {:?}", other),
     }
 }

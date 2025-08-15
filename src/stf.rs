@@ -450,15 +450,20 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    #[test]
     fn transfer_via_commit_reveal_success() {
         use std::collections::HashMap;
+        use ed25519_dalek::{SigningKey, VerifyingKey, Signer as _};
         use crate::chain::Chain;
-        use crate::codec::tx_bytes;
-        use crate::crypto::commitment_hash;
-        use crate::state::{Balances, Nonces, Commitments, Available, COMMIT_FEE, DECRYPTION_DELAY, REVEAL_WINDOW};
-        use crate::types::{Transaction, Tx, CommitTx, RevealTx, AvailTx, Block, ExecOutcome, Hash, AccessList, StateKey};
+        use crate::codec::{tx_bytes, string_bytes, access_list_bytes};
+        use crate::crypto::{commitment_hash, commit_signing_preimage, avail_signing_preimage};
+        use crate::state::{
+            Balances, Nonces, Commitments, Available, COMMIT_FEE, DECRYPTION_DELAY, REVEAL_WINDOW,
+            CHAIN_ID, AVAIL_FEE
+        };
+        use crate::types::{CommitTx, RevealTx, AvailTx, Block, ExecOutcome, Hash, AccessList, StateKey, Transaction};
         use crate::gas::BASE_FEE_PER_TX;
-
+    
         // helper: fill chain with empty blocks up to (but not including) `target`
         fn advance_to(
             chain: &mut Chain,
@@ -473,7 +478,7 @@ mod tests {
                 chain.apply_block(&b, balances, nonces, comms, avail).expect("advance");
             }
         }
-
+    
         // Initial state
         let mut balances: Balances = HashMap::from([
             ("Alice".to_string(), 100),
@@ -483,77 +488,97 @@ mod tests {
         let mut commitments: Commitments = Default::default();
         let mut available:   Available   = Default::default();
         let mut chain = Chain::new();
-
+    
+        // Deterministic keypair for signing
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let vk = VerifyingKey::from(&sk);
+        let pk_bytes = vk.to_bytes();
+    
         // Access list for commit (touches Alice’s balance to pay commit fee)
+        let sender = "Alice".to_string();
         let al = AccessList {
-            reads:  vec![ StateKey::Balance("Alice".into()) ],
-            writes: vec![ StateKey::Balance("Alice".into()) ],
+            reads:  vec![ StateKey::Balance(sender.clone()) ],
+            writes: vec![ StateKey::Balance(sender.clone()) ],
         };
-
+        let sender_bytes = string_bytes(&sender);
+        let al_bytes     = access_list_bytes(&al);
+    
         // Inner plaintext transfer (to be revealed later)
-        let tx = Transaction::transfer("Alice", "Bob", 30, 0);
-
+        let tx = Transaction::transfer(&sender, "Bob", 30, 0);
+    
         // Salt and commitment
         let salt: Hash = [7u8; 32];
         let cmt = commitment_hash(&tx_bytes(&tx), &salt, CHAIN_ID);
-
-        // ---- Block 1: Commit ----
+    
+        // ---- Block 1: Commit (SIGNED) ----
+        let ciphertext_hash = [0u8; 32];
+        let pre_commit = commit_signing_preimage(&cmt, &ciphertext_hash, &sender_bytes, &al_bytes, CHAIN_ID);
+        let sig_commit = sk.sign(&pre_commit).to_bytes();
+    
         let b1 = Block::new(
             vec![Tx::Commit(CommitTx {
                 commitment: cmt,
-                sender: "Alice".into(),
-                ciphertext_hash: [0u8; 32],
+                sender: sender.clone(),
+                ciphertext_hash,
                 access_list: al,
-                pubkey: [0; 32], 
-                sig: [0; 64]
+                pubkey: pk_bytes,
+                sig: sig_commit,
             })],
             1,
         );
         chain
             .apply_block(&b1, &mut balances, &mut nonces, &mut commitments, &mut available)
             .expect("block 1 (commit) should apply");
-
+    
         // After commit: only commit fee is burned, nonce unchanged
         assert_eq!(balances["Alice"], 100 - COMMIT_FEE);
         assert_eq!(balances["Bob"], 50);
         assert_eq!(*nonces.get("Alice").unwrap_or(&0), 0);
-
+    
         // Compute ready/due heights
         let ready_at = 1 + DECRYPTION_DELAY;
         let deadline = ready_at + REVEAL_WINDOW;
-
+    
         // Advance sequentially up to ready_at
         advance_to(&mut chain, &mut balances, &mut nonces, &mut commitments, &mut available, ready_at);
-
-        // ---- Block ready_at: Avail (in transactions) + Reveal (in block body) ----
+    
+        // ---- Block ready_at: Avail (SIGNED, in transactions) + Reveal (in block body) ----
+        let pre_avail = avail_signing_preimage(&cmt, &sender_bytes, CHAIN_ID);
+        let sig_avail = sk.sign(&pre_avail).to_bytes();
+    
         let reveals = vec![
-            RevealTx { tx: tx.clone(), salt, sender: "Alice".into() }
+            RevealTx { tx: tx.clone(), salt, sender: sender.clone() }
         ];
         let b_ready = Block::new_with_reveals(
-            vec![ Tx::Avail(AvailTx { commitment: cmt, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }) ],
+            vec![ Tx::Avail(AvailTx {
+                commitment: cmt,
+                sender: sender.clone(),
+                pubkey: pk_bytes,
+                sig: sig_avail,
+            }) ],
             reveals,
             ready_at,
         );
-
+    
         let res2 = chain
             .apply_block(&b_ready, &mut balances, &mut nonces, &mut commitments, &mut available)
             .expect("block ready_at (avail + reveal) should apply");
-
+    
         // Receipt checks (Avail + Reveal => 2 receipts)
         assert_eq!(res2.receipts.len(), 2);
         let rcpt_reveal = res2.receipts.last().unwrap();
         assert_eq!(rcpt_reveal.outcome, ExecOutcome::Success);
         assert_eq!(rcpt_reveal.gas_used, BASE_FEE_PER_TX);
-
+    
         // Final balances:
-        // Alice: 100 - COMMIT_FEE(1) - BASE_FEE(1) - 30 = 68
-        // Bob:   50 + 30 = 80
-        assert_eq!(balances["Alice"], 68 - AVAIL_FEE);
+        // Alice: 100 - COMMIT_FEE - BASE_FEE - 30 - AVAIL_FEE
+        // Bob:   50 + 30
+        assert_eq!(balances["Alice"], 100 - COMMIT_FEE - BASE_FEE_PER_TX - 30 - AVAIL_FEE);
         assert_eq!(balances["Bob"], 80);
-
+    
         // Nonce consumed on reveal (not on commit)
         assert_eq!(*nonces.get("Alice").unwrap(), 1);
-
+    
         // Optionally advance to deadline and apply an empty block (no dues remain)
         if deadline > ready_at {
             advance_to(&mut chain, &mut balances, &mut nonces, &mut commitments, &mut available, deadline);
@@ -673,25 +698,28 @@ mod tests {
     #[test]
     fn avail_outside_window_is_rejected() {
         use std::collections::{HashMap, HashSet};
-        use crate::state::{Balances, Commitments, Available, DECRYPTION_DELAY, REVEAL_WINDOW};
-        use crate::types::{Transaction, Hash};
-        use crate::codec::tx_bytes;
-        use crate::crypto::commitment_hash;
-
+        use ed25519_dalek::{SigningKey, VerifyingKey, Signer as _};
+        use crate::state::{
+            Balances, Commitments, Available, DECRYPTION_DELAY, REVEAL_WINDOW, CHAIN_ID
+        };
+        use crate::types::{Transaction, Hash, AvailTx};
+        use crate::codec::{tx_bytes, string_bytes};
+        use crate::crypto::{commitment_hash, avail_signing_preimage};
+    
         // Minimal state
         let mut balances: Balances = HashMap::from([("Alice".into(), 10_000)]);
         let mut commitments: Commitments = Default::default();
         let mut available:   Available   = HashSet::new();
         let mut events: Vec<crate::types::Event> = Vec::new();
-
+    
         // Create a commitment by simulating a commit included at height=5
         let inner = Transaction::transfer("Alice", "Bob", 1, 0);
         let salt: Hash = [2u8; 32];
         let cmt  = commitment_hash(&tx_bytes(&inner), &salt, CHAIN_ID);
-
+    
         let ready_at = 5 + DECRYPTION_DELAY;
         let deadline = ready_at + REVEAL_WINDOW;
-
+    
         // Insert commitment meta as if process_commit ran at height 5
         commitments.insert(cmt, CommitmentMeta {
             owner: "Alice".into(),
@@ -699,24 +727,42 @@ mod tests {
             included_at: 5,
             consumed: false,
         });
-
+    
+        // Deterministic keypair and signed Avail for Alice
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let vk = VerifyingKey::from(&sk);
+        let pk_bytes = vk.to_bytes();
+        let sender_bytes = string_bytes("Alice");
+        let pre = avail_signing_preimage(&cmt, &sender_bytes, CHAIN_ID);
+        let sig = sk.sign(&pre).to_bytes();
+    
+        let a = AvailTx {
+            commitment: cmt,
+            sender: "Alice".into(),
+            pubkey: pk_bytes,
+            sig,
+        };
+    
         // Early: height = ready_at - 1
         let early_h = ready_at - 1;
-        let a = crate::types::AvailTx { commitment: cmt, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() };
         let err1 = crate::stf::process_avail(
             &a, &mut commitments, &mut available, early_h, &mut events, &mut balances
         ).expect_err("early avail must be rejected");
         match err1 {
-            crate::stf::TxError::IntrinsicInvalid(m) => assert!(m.contains("avail outside valid window")),
+            crate::stf::TxError::IntrinsicInvalid(m) => {
+                assert!(m.contains("avail outside valid window"), "got: {m}");
+            }
         }
-
+    
         // Late: height = deadline + 1
         let late_h = deadline + 1;
         let err2 = crate::stf::process_avail(
             &a, &mut commitments, &mut available, late_h, &mut events, &mut balances
         ).expect_err("late avail must be rejected");
         match err2 {
-            crate::stf::TxError::IntrinsicInvalid(m) => assert!(m.contains("avail outside valid window")),
+            crate::stf::TxError::IntrinsicInvalid(m) => {
+                assert!(m.contains("avail outside valid window"), "got: {m}");
+            }
         }
-}
+    }
 }

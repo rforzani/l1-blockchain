@@ -135,19 +135,44 @@ pub fn merkle_root(leaves: &[Hash]) -> Hash {
 }
 
 #[cfg(test)]
-mod test_keys {
+pub mod test_sig {
     use super::*;
     use ed25519_dalek::{SigningKey, VerifyingKey, Signer};
-    use rand::rngs::OsRng;
+    use crate::codec::{string_bytes, access_list_bytes};
+    use crate::state::CHAIN_ID;
+    use crate::types::{AccessList, Hash};
 
-    pub fn make_keypair() -> (SigningKey, VerifyingKey) {
-        let sk = SigningKey::generate(&mut OsRng);
+    /// Deterministic keypair from a fixed 32-byte seed (no RNG needed)
+    pub fn keypair_from_seed(seed: [u8; 32]) -> (SigningKey, VerifyingKey) {
+        let sk = SigningKey::from_bytes(&seed);   // <-- v2 API
         let vk = VerifyingKey::from(&sk);
         (sk, vk)
     }
 
-    pub fn sign_bytes(sk: &SigningKey, msg: &[u8]) -> [u8; 64] {
-        use ed25519_dalek::Signer as _;
-        sk.sign(msg).to_bytes()
+    /// Build the commit preimage and return (pubkey, signature)
+    pub fn sign_commit_fields(
+        sk: &SigningKey,
+        sender: &str,
+        access_list: &AccessList,
+        commitment: &Hash,
+        ciphertext_hash: &Hash,
+    ) -> ([u8;32], [u8;64]) {
+        let sender_bytes = string_bytes(sender);
+        let al_bytes     = access_list_bytes(access_list);
+        let pre          = commit_signing_preimage(commitment, ciphertext_hash, &sender_bytes, &al_bytes, CHAIN_ID);
+        let sig          = sk.sign(&pre).to_bytes();     // v2: to_bytes() -> [u8;64]
+        (VerifyingKey::from(sk).to_bytes(), sig)
+    }
+
+    /// Build the avail preimage and return (pubkey, signature)
+    pub fn sign_avail_fields(
+        sk: &SigningKey,
+        sender: &str,
+        commitment: &Hash,
+    ) -> ([u8;32], [u8;64]) {
+        let sender_bytes = string_bytes(sender);
+        let pre          = avail_signing_preimage(commitment, &sender_bytes, CHAIN_ID);
+        let sig          = sk.sign(&pre).to_bytes();
+        (VerifyingKey::from(sk).to_bytes(), sig)
     }
 }

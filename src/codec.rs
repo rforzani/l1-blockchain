@@ -7,7 +7,6 @@ pub const CODEC_VERSION: u8 = 1;
 pub const DOM_TX: &[u8] = b"TX";
 pub const DOM_RCPT: &[u8] = b"RCPT";
 pub const DOM_HDR: &[u8] = b"HDR";
-const TAG_TRANSFER: u8 = 0;
 const TAG_COMMIT:   u8 = 1;
 const TAG_AVAIL:    u8 = 2;
 
