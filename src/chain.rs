@@ -667,8 +667,7 @@ fn inclusion_list_due_but_missing_reveal_rejects_block() {
             sender: "Alice".into(),
             ciphertext_hash: [2u8;32],
             access_list: al.clone(),
-            pubkey: [0; 32], 
-            sig: [0; 64]
+            pubkey: [0; 32], sig: [0; 64]
         })
     ], 1);
     chain.apply_block(&b1, &mut balances, &mut nonces, &mut comm, &mut avail).expect("b1 applies");

@@ -135,12 +135,31 @@ fn process_avail(
     events: &mut Vec<Event>,
     balances: &mut Balances
 ) -> Result<Receipt, TxError> {
+    use crate::codec::string_bytes;
+    use crate::crypto::{avail_signing_preimage, verify_ed25519};
+    
     // sanity: commitment exists & not consumed
     let meta = commitments.get(&a.commitment)
         .ok_or_else(|| TxError::IntrinsicInvalid("no such commitment".into()))?;
     if meta.consumed {
         return Err(TxError::IntrinsicInvalid("already consumed".into()));
     }
+
+    // --- owner binding: a.sender must match the commitment owner you stored at commit time ---
+    let Some(meta) = commitments.get(&a.commitment) else {
+        return Err(TxError::IntrinsicInvalid("unknown commitment".into()));
+    };
+    if a.sender != meta.owner {
+        return Err(TxError::IntrinsicInvalid("avail sender mismatch with commitment owner".into()));
+    }
+
+    // --- signature check (avail) ---
+    let sender_bytes = string_bytes(&a.sender);
+    let preimage     = avail_signing_preimage(&a.commitment, &sender_bytes, CHAIN_ID);
+
+    if !verify_ed25519(&a.pubkey, &a.sig, &preimage) {
+        return Err(TxError::IntrinsicInvalid("bad avail signature".into()));
+}
 
     // owner-only Avail (v1)   ------ TO BE CHANGED LATER: It now avoids griefing where a third party could force you to pay an Avail fee. Later, when we move to TE, “Avail” becomes a committee root and this logic naturally disappears.
     let owner = meta.owner.clone();
@@ -183,6 +202,23 @@ fn process_commit(
     current_height: u64,
     events: &mut Vec<Event>,
 ) -> Result<Receipt, TxError> {
+    use crate::codec::{string_bytes, access_list_bytes};
+    use crate::crypto::{commit_signing_preimage, verify_ed25519};
+
+    let sender_bytes = string_bytes(&c.sender);
+    let al_bytes     = access_list_bytes(&c.access_list);
+    let preimage     = commit_signing_preimage(
+        &c.commitment,
+        &c.ciphertext_hash,
+        &sender_bytes,
+        &al_bytes,
+        CHAIN_ID,
+    );
+
+    if !verify_ed25519(&c.pubkey, &c.sig, &preimage) {
+        return Err(TxError::IntrinsicInvalid("bad commit signature".into()));
+    }
+
     let required = [
         StateKey::Balance(c.sender.clone())
     ];
