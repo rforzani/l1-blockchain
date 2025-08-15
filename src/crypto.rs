@@ -6,6 +6,42 @@ use crate::{chain, types::Hash};
 const DOM_ORDER:  &[u8] = b"ORDER";
 const COMMIT_DOMAIN: &[u8] = b"CAR_COMMIT_V1";
 const REVEAL_PAIR_DOMAIN: &[u8] = b"CAR_REVEAL_PAIR_V1";
+const SIGN_COMMIT_DOMAIN: &[u8] = b"SIGN_COMMIT_V1";
+const SIGN_AVAIL_DOMAIN:  &[u8] = b"SIGN_AVAIL_V1";
+
+pub fn commit_signing_preimage(
+    commitment: &Hash,     
+    ciphertext_hash: &Hash,
+    sender_bytes: &[u8],
+    access_list_bytes: &[u8],
+    chain_id: u64,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(SIGN_COMMIT_DOMAIN.len() + 32 + 32 + sender_bytes.len() + access_list_bytes.len() + 8);
+    buf.extend_from_slice(SIGN_COMMIT_DOMAIN);
+    buf.extend_from_slice(&chain_id.to_le_bytes());
+    buf.extend_from_slice(commitment);
+    buf.extend_from_slice(ciphertext_hash);
+    buf.extend_from_slice(sender_bytes);
+    buf.extend_from_slice(access_list_bytes);
+    buf
+}
+
+pub fn avail_signing_preimage(
+    commitment: &Hash,  
+    sender_bytes: &[u8],
+    chain_id: u64,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(SIGN_AVAIL_DOMAIN.len() + 8 + 32 + sender_bytes.len());
+    buf.extend_from_slice(SIGN_AVAIL_DOMAIN);
+    buf.extend_from_slice(&chain_id.to_le_bytes());
+    buf.extend_from_slice(commitment);
+    buf.extend_from_slice(sender_bytes);
+    buf
+}
+
+pub fn verify_ed25519(_pubkey: &[u8; 32], _sig: &[u8; 64], _msg: &[u8]) -> bool {
+    true
+}
 
 pub fn commitment_hash(tx_bytes: &[u8], salt: &Hash, chain_id: u64) -> Hash {
     // capacity = domain + chain_id(8) + tx + salt(32)
@@ -14,7 +50,7 @@ pub fn commitment_hash(tx_bytes: &[u8], salt: &Hash, chain_id: u64) -> Hash {
     buf.extend_from_slice(&chain_id.to_le_bytes());
     buf.extend_from_slice(tx_bytes);
     buf.extend_from_slice(salt);
-    H(&buf)
+    hash(&buf)
 }
 
 pub fn reveal_order_key(commitment: &Hash, randomness: &Hash) -> Hash {
@@ -22,7 +58,7 @@ pub fn reveal_order_key(commitment: &Hash, randomness: &Hash) -> Hash {
     buf.extend_from_slice(DOM_ORDER);
     buf.extend_from_slice(commitment);
     buf.extend_from_slice(randomness);
-    H(&buf)
+    hash(&buf)
 }
 
 pub fn hash_reveal_pair(commitment: &Hash, tx_hash: &Hash) -> Hash {
@@ -31,10 +67,10 @@ pub fn hash_reveal_pair(commitment: &Hash, tx_hash: &Hash) -> Hash {
     buf.extend_from_slice(REVEAL_PAIR_DOMAIN);
     buf.extend_from_slice(commitment);
     buf.extend_from_slice(tx_hash);
-    H(&buf)
+    hash(&buf)
 }
 
-fn H(bytes: &[u8]) -> Hash {
+fn hash(bytes: &[u8]) -> Hash {
     hash_bytes_sha256(bytes)
 }
 
@@ -57,14 +93,14 @@ fn parent_hash(left: &Hash, right: &Hash) -> Hash {
     buf.extend_from_slice(b"MRKL");
     buf.extend_from_slice(left);
     buf.extend_from_slice(right);
-    H(&buf)
+    hash(&buf)
 }
 
 pub fn merkle_root(leaves: &[Hash]) -> Hash {
     match leaves.len() {
         0 => {
             // Convention: empty tree → hash of empty bytes
-            H(&[])
+            hash(&[])
         }
         1 => leaves[0],
         _ => {

@@ -85,6 +85,8 @@ fn verify_block_roots_catches_tamper() {
             sender: "Alice".into(),
             ciphertext_hash: [0u8; 32],
             access_list: al,
+            pubkey: [0; 32], 
+            sig: [0; 64]
         })],
         1,
     );

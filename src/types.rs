@@ -120,11 +120,18 @@ pub struct CommitTx {
     pub commitment: Hash,
     pub sender: String,
     pub access_list: AccessList,
-    pub ciphertext_hash: Hash
+    pub ciphertext_hash: Hash,
+    pub pubkey: [u8; 32], 
+    pub sig: [u8; 64]
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct AvailTx { pub commitment: Hash }
+pub struct AvailTx { 
+    pub commitment: Hash,
+    pub sender: String, 
+    pub pubkey: [u8; 32], 
+    pub sig: [u8; 64]
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RevealTx {

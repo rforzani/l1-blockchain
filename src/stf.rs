@@ -468,6 +468,8 @@ mod tests {
                 sender: "Alice".into(),
                 ciphertext_hash: [0u8; 32],
                 access_list: al,
+                pubkey: [0; 32], 
+                sig: [0; 64]
             })],
             1,
         );
@@ -492,7 +494,7 @@ mod tests {
             RevealTx { tx: tx.clone(), salt, sender: "Alice".into() }
         ];
         let b_ready = Block::new_with_reveals(
-            vec![ Tx::Avail(AvailTx { commitment: cmt }) ],
+            vec![ Tx::Avail(AvailTx { commitment: cmt, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }) ],
             reveals,
             ready_at,
         );
@@ -664,7 +666,7 @@ mod tests {
 
         // Early: height = ready_at - 1
         let early_h = ready_at - 1;
-        let a = crate::types::AvailTx { commitment: cmt };
+        let a = crate::types::AvailTx { commitment: cmt, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() };
         let err1 = crate::stf::process_avail(
             &a, &mut commitments, &mut available, early_h, &mut events, &mut balances
         ).expect_err("early avail must be rejected");

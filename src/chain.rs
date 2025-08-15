@@ -100,6 +100,8 @@ fn apply_block1_advances_tip() {
             sender: "Alice".into(),
             ciphertext_hash: [0u8; 32],
             access_list: al,
+            pubkey: [0; 32], 
+            sig: [0; 64]
         })],
         1,
     );
@@ -196,6 +198,8 @@ fn applying_2_blocks_works_correctly() {
             sender: "Alice".into(),
             ciphertext_hash: [0u8; 32],
             access_list: al,
+            pubkey: [0; 32], 
+            sig: [0; 64]
         })],
         1,
     );
@@ -225,7 +229,7 @@ fn applying_2_blocks_works_correctly() {
         RevealTx { tx: tx.clone(), salt, sender: "Alice".into() }
     ];
     let b2 = Block::new_with_reveals(
-        vec![ Tx::Avail(AvailTx { commitment: cmt }) ],
+        vec![ Tx::Avail(AvailTx { commitment: cmt, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }) ],
         reveals,
         ready_at,
     );
@@ -264,6 +268,7 @@ fn tamper_block_no_state_change() {
             sender: "Alice".into(),
             ciphertext_hash: [0u8; 32],
             access_list: al,
+            pubkey: [0; 32], sig: [0; 64]
         })],
         1,
     );
@@ -349,6 +354,8 @@ fn inclusion_list_due_must_be_included() {
             sender: "Alice".into(),
             ciphertext_hash: [2u8;32],
             access_list: al.clone(),
+            pubkey: [0; 32], 
+            sig: [0; 64]
         })
     ], 1);
     chain.apply_block(&b1, &mut balances, &mut nonces, &mut comm, &mut avail)
@@ -361,7 +368,7 @@ fn inclusion_list_due_must_be_included() {
     // If ready_at < due, post availability earlier; otherwise, include it in the due block.
     if ready_at < due {
         advance_to(&mut chain, &mut balances, &mut nonces, &mut comm, &mut avail, ready_at);
-        let b_ready = Block::new(vec![ Tx::Avail(AvailTx { commitment: cmt }) ], ready_at);
+        let b_ready = Block::new(vec![ Tx::Avail(AvailTx { commitment: cmt, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }) ], ready_at);
         chain.apply_block(&b_ready, &mut balances, &mut nonces, &mut comm, &mut avail)
              .expect("availability block applies");
     }
@@ -372,7 +379,7 @@ fn inclusion_list_due_must_be_included() {
     // txs for due block (may contain Avail if ready_at == due)
     let mut due_txs = Vec::new();
     if ready_at == due {
-        due_txs.push(Tx::Avail(AvailTx { commitment: cmt }));
+        due_txs.push(Tx::Avail(AvailTx { commitment: cmt, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }));
     }
 
     // No reveals included → invalid (missing required reveal)
@@ -448,8 +455,8 @@ fn reveal_bundle_executes_multiple_reveals_and_satisfies_il() {
 
     // block 1: commits (two)
     let b1 = Block::new(vec![
-        Tx::Commit(CommitTx { commitment: c1, sender:"Alice".into(), ciphertext_hash:[0u8;32], access_list: al.clone() }),
-        Tx::Commit(CommitTx { commitment: c2, sender:"Alice".into(), ciphertext_hash:[0u8;32], access_list: al.clone() }),
+        Tx::Commit(CommitTx { commitment: c1, sender:"Alice".into(), ciphertext_hash:[0u8;32], access_list: al.clone(), pubkey: [0; 32], sig: [0; 64] }),
+        Tx::Commit(CommitTx { commitment: c2, sender:"Alice".into(), ciphertext_hash:[0u8;32], access_list: al.clone(), pubkey: [0; 32], sig: [0; 64] }),
     ], 1);
     chain.apply_block(&b1, &mut balances, &mut nonces, &mut comms, &mut avail).expect("b1");
 
@@ -461,8 +468,8 @@ fn reveal_bundle_executes_multiple_reveals_and_satisfies_il() {
     if ready_at < due {
         advance_to(&mut chain, &mut balances, &mut nonces, &mut comms, &mut avail, ready_at);
         let b_ready = Block::new(vec![
-            Tx::Avail(AvailTx { commitment: c1 }),
-            Tx::Avail(AvailTx { commitment: c2 }),
+            Tx::Avail(AvailTx { commitment: c1, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }),
+            Tx::Avail(AvailTx { commitment: c2, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }),
         ], ready_at);
         chain.apply_block(&b_ready, &mut balances, &mut nonces, &mut comms, &mut avail).expect("b_ready");
     }
@@ -477,8 +484,8 @@ fn reveal_bundle_executes_multiple_reveals_and_satisfies_il() {
     ];
     let txs = if ready_at == due {
         vec![
-            Tx::Avail(AvailTx { commitment: c1 }),
-            Tx::Avail(AvailTx { commitment: c2 }),
+            Tx::Avail(AvailTx { commitment: c1, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }),
+            Tx::Avail(AvailTx { commitment: c2, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }),
         ]
     } else {
         Vec::new()
@@ -515,7 +522,7 @@ fn too_many_avails_in_block_is_invalid() {
     for i in 0..(MAX_AVAILS_PER_BLOCK + 1) {
         let mut c: Hash = [0u8; 32];
         c[0] = (i & 0xFF) as u8;
-        txs.push(Tx::Avail(AvailTx { commitment: c }));
+        txs.push(Tx::Avail(AvailTx { commitment: c, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }));
     }
 
     let b = Block::new(txs, 1);
@@ -562,6 +569,8 @@ fn too_many_pending_commits_for_owner_is_rejected() {
             sender: "Alice".into(),
             ciphertext_hash: [0u8; 32],
             access_list: al.clone(),
+            pubkey: [0; 32], 
+            sig: [0; 64]
         }));
     }
 
@@ -595,8 +604,8 @@ fn duplicate_commit_in_same_block_is_rejected() {
 
     let commitment = [7u8; 32];
     let txs = vec![
-        Tx::Commit(CommitTx { commitment, sender: "Alice".into(), ciphertext_hash: [0;32], access_list: al.clone() }),
-        Tx::Commit(CommitTx { commitment, sender: "Alice".into(), ciphertext_hash: [0;32], access_list: al }),
+        Tx::Commit(CommitTx { commitment, sender: "Alice".into(), ciphertext_hash: [0;32], access_list: al.clone(), pubkey: [0; 32], sig: [0; 64] }),
+        Tx::Commit(CommitTx { commitment, sender: "Alice".into(), ciphertext_hash: [0;32], access_list: al, pubkey: [0; 32], sig: [0; 64] }),
     ];
 
     let b = Block::new(txs, 1);
@@ -658,6 +667,8 @@ fn inclusion_list_due_but_missing_reveal_rejects_block() {
             sender: "Alice".into(),
             ciphertext_hash: [2u8;32],
             access_list: al.clone(),
+            pubkey: [0; 32], 
+            sig: [0; 64]
         })
     ], 1);
     chain.apply_block(&b1, &mut balances, &mut nonces, &mut comm, &mut avail).expect("b1 applies");
@@ -669,7 +680,7 @@ fn inclusion_list_due_but_missing_reveal_rejects_block() {
     // If ready_at < due, post Avail earlier (so it's eligible and will be in IL)
     if ready_at < due {
         advance_to(&mut chain, &mut balances, &mut nonces, &mut comm, &mut avail, ready_at);
-        let b_ready = Block::new(vec![ Tx::Avail(AvailTx { commitment: cmt }) ], ready_at);
+        let b_ready = Block::new(vec![ Tx::Avail(AvailTx { commitment: cmt, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }) ], ready_at);
         chain.apply_block(&b_ready, &mut balances, &mut nonces, &mut comm, &mut avail).expect("availability block applies");
     }
 
@@ -678,7 +689,7 @@ fn inclusion_list_due_but_missing_reveal_rejects_block() {
 
     // Build due block WITHOUT the reveal → must fail
     let due_txs = if ready_at == due {
-        vec![ Tx::Avail(AvailTx { commitment: cmt }) ]
+        vec![ Tx::Avail(AvailTx { commitment: cmt, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }) ]
     } else {
         Vec::new()
     };
@@ -724,6 +735,8 @@ fn availability_outside_window_rejected() {
             sender: "Alice".into(),
             ciphertext_hash: [0u8; 32],
             access_list: al.clone(),
+            pubkey: [0; 32], 
+            sig: [0; 64]
         }),
     ], 1);
     chain.apply_block(&b1, &mut balances, &mut nonces, &mut comms, &mut avail).expect("commit ok");
@@ -739,7 +752,7 @@ fn availability_outside_window_rejected() {
     }
 
     // Avail too late (deadline + 1)
-    let late_block = Block::new(vec![ Tx::Avail(AvailTx { commitment }) ], deadline + 1); // = 6
+    let late_block = Block::new(vec![ Tx::Avail(AvailTx { commitment, pubkey: [0; 32], sig: [0; 64], sender: "Alice".into() }) ], deadline + 1); // = 6
     let err = chain.apply_block(&late_block, &mut balances, &mut nonces, &mut comms, &mut avail)
         .expect_err("block must be rejected for late availability");
     match err {
