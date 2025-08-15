@@ -11,8 +11,6 @@ const TAG_TRANSFER: u8 = 0;
 const TAG_COMMIT:   u8 = 1;
 const TAG_AVAIL:    u8 = 2;
 
-// --- helpers: write primitives deterministically ---
-
 // append a u64 to a Vec<u8> in little-endian.
 pub fn put_u64(dst: &mut Vec<u8>, x: u64) {
     dst.extend_from_slice(&x.to_le_bytes());
@@ -254,8 +252,6 @@ mod tests {
             writes: vec![StateKey::Balance("Bob".into())],
         }
     }
-
-    // ========== TESTS ==========
 
     #[test]
     fn codec_roundtrip_commit_manual_decode() {
