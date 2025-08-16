@@ -11,7 +11,7 @@ use crate::crypto::{addr_from_pubkey, addr_hex};
 use crate::codec::{tx_enum_bytes, receipt_bytes, header_bytes, tx_bytes};
 use crate::types::AvailTx;
 use crate::types::CommitmentMeta;
-use crate::types::{Block, Receipt, ExecOutcome, Hash, BlockHeader, Transaction, StateKey, Tx, Event, RevealTx, CommitTx};
+use crate::types::{Block, Receipt, ExecOutcome, Hash, BlockHeader, Transaction, StateKey, Tx, Event, RevealTx, CommitTx, AccessList};
 use crate::gas::BASE_FEE_PER_TX;
 use std::collections::HashSet;
 use std::fmt;
@@ -344,6 +344,7 @@ pub fn process_commit(
             expires_at: deadline,
             consumed: false,
             included_at: current_height,
+            access_list: al.clone(),
         },
     );
 
@@ -374,36 +375,46 @@ fn process_reveal(
     }
 
     let cmt = commitment_hash(&tx_bytes(&r.tx), &r.salt, CHAIN_ID);
-    
+
+    // Prepare executable transaction with access list from commitment metadata
+    let mut exec_tx = Transaction {
+        from: r.tx.from.clone(),
+        to: r.tx.to.clone(),
+        amount: r.tx.amount,
+        nonce: r.tx.nonce,
+        access_list: AccessList { reads: vec![], writes: vec![] },
+    };
+
     {
         let meta = commitments.get_mut(&cmt)
             .ok_or_else(|| TxError::IntrinsicInvalid("no such commitment".to_string()))?;
-    
+
         if meta.owner != r.sender {
             return Err(TxError::IntrinsicInvalid("owner mismatch".to_string()));
         }
         if meta.consumed {
             return Err(TxError::IntrinsicInvalid("commit already consumed".to_string()));
         }
-    
+
         // -----  delay + window -----
         let ready_at = meta.included_at + DECRYPTION_DELAY;
         if current_height < ready_at {
             return Err(TxError::IntrinsicInvalid("reveal too early".to_string()));
         }
-    
+
         let deadline = ready_at + REVEAL_WINDOW;
         if current_height > deadline {
             return Err(TxError::IntrinsicInvalid("reveal outside window".to_string()));
         }
         // --------------------------------
-    
-        meta.consumed = true; // borrow consumed now
+
+        exec_tx.access_list = meta.access_list.clone();
+        meta.consumed = true; // mark as used
     }
 
     events.push(Event::CommitConsumed { commitment: cmt });
 
-    process_transaction(&r.tx, balances, nonces)
+    process_transaction(&exec_tx, balances, nonces)
 }
 
 pub fn process_block(
@@ -529,13 +540,16 @@ mod tests {
     use crate::types::{Transaction};
     use std::collections::HashMap;
 
+    const ALICE: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const BOB: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
     #[test]
     fn transfer_via_commit_reveal_success() {
         use std::collections::HashMap;
         use ed25519_dalek::{SigningKey, VerifyingKey, Signer as _};
         use crate::chain::Chain;
         use crate::codec::{tx_bytes, string_bytes, access_list_bytes};
-        use crate::crypto::{commitment_hash, commit_signing_preimage, avail_signing_preimage};
+        use crate::crypto::{commitment_hash, commit_signing_preimage, avail_signing_preimage, addr_from_pubkey, addr_hex};
         use crate::state::{
             Balances, Nonces, Commitments, Available, COMMIT_FEE, DECRYPTION_DELAY, REVEAL_WINDOW,
             CHAIN_ID, AVAIL_FEE
@@ -558,32 +572,31 @@ mod tests {
             }
         }
     
+        // Deterministic keypair for signing
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let vk = VerifyingKey::from(&sk);
+        let pk_bytes = vk.to_bytes();
+
+        let sender = addr_hex(&addr_from_pubkey(&pk_bytes));
+        let bob = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+
         // Initial state
         let mut balances: Balances = HashMap::from([
-            ("Alice".to_string(), 100),
-            ("Bob".to_string(), 50),
+            (sender.clone(), 100),
+            (bob.clone(), 50),
         ]);
         let mut nonces: Nonces = Default::default();
         let mut commitments: Commitments = Default::default();
         let mut available:   Available   = Default::default();
         let mut chain = Chain::new();
-    
-        // Deterministic keypair for signing
-        let sk = SigningKey::from_bytes(&[7u8; 32]);
-        let vk = VerifyingKey::from(&sk);
-        let pk_bytes = vk.to_bytes();
-    
-        // Access list for commit (touches Alice’s balance to pay commit fee)
-        let sender = "Alice".to_string();
-        let al = AccessList {
-            reads:  vec![ StateKey::Balance(sender.clone()) ],
-            writes: vec![ StateKey::Balance(sender.clone()) ],
-        };
+
+        // Access list for commit matches the transfer's requirements
+        let al = AccessList::for_transfer(&sender, &bob);
         let sender_bytes = string_bytes(&sender);
         let al_bytes     = access_list_bytes(&al);
     
         // Inner plaintext transfer (to be revealed later)
-        let tx = Transaction::transfer(&sender, "Bob", 30, 0);
+        let tx = Transaction::transfer(&sender, &bob, 30, 0);
     
         // Salt and commitment
         let salt: Hash = [7u8; 32];
@@ -610,9 +623,9 @@ mod tests {
             .expect("block 1 (commit) should apply");
     
         // After commit: only commit fee is burned, nonce unchanged
-        assert_eq!(balances["Alice"], 100 - COMMIT_FEE);
-        assert_eq!(balances["Bob"], 50);
-        assert_eq!(*nonces.get("Alice").unwrap_or(&0), 0);
+        assert_eq!(balances[&sender], 100 - COMMIT_FEE);
+        assert_eq!(balances[&bob], 50);
+        assert_eq!(*nonces.get(&sender).unwrap_or(&0), 0);
     
         // Compute ready/due heights
         let ready_at = 1 + DECRYPTION_DELAY;
@@ -625,8 +638,17 @@ mod tests {
         let pre_avail = avail_signing_preimage(&cmt, &sender_bytes, CHAIN_ID);
         let sig_avail = sk.sign(&pre_avail).to_bytes();
     
+        // Reveal need not resend access list
+        let tx_no_al = Transaction::new(
+            sender.clone(),
+            bob.clone(),
+            30,
+            0,
+            AccessList { reads: vec![], writes: vec![] },
+        );
+
         let reveals = vec![
-            RevealTx { tx: tx.clone(), salt, sender: sender.clone() }
+            RevealTx { tx: tx_no_al, salt, sender: sender.clone() }
         ];
         let b_ready = Block::new_with_reveals(
             vec![ Tx::Avail(AvailTx {
@@ -652,11 +674,11 @@ mod tests {
         // Final balances:
         // Alice: 100 - COMMIT_FEE - BASE_FEE - 30 - AVAIL_FEE
         // Bob:   50 + 30
-        assert_eq!(balances["Alice"], 100 - COMMIT_FEE - BASE_FEE_PER_TX - 30 - AVAIL_FEE);
-        assert_eq!(balances["Bob"], 80);
+        assert_eq!(balances[&sender], 100 - COMMIT_FEE - BASE_FEE_PER_TX - 30 - AVAIL_FEE);
+        assert_eq!(balances[&bob], 80);
     
         // Nonce consumed on reveal (not on commit)
-        assert_eq!(*nonces.get("Alice").unwrap(), 1);
+        assert_eq!(*nonces.get(&sender).unwrap(), 1);
     
         // Optionally advance to deadline and apply an empty block (no dues remain)
         if deadline > ready_at {
@@ -671,29 +693,29 @@ mod tests {
     #[test]
     fn transfer_gas_paid_no_balance_revert() {
         let mut balances = HashMap::from([
-            ("Alice".to_string(), 20),
-            ("Bob".to_string(), 50),
+            (ALICE.to_string(), 20),
+            (BOB.to_string(), 50),
         ]);
         let mut nonces = Default::default();
 
-        let tx = Transaction::transfer("Alice","Bob", 30,0);
+        let tx = Transaction::transfer(ALICE, BOB, 30,0);
         let rcpt = process_transaction(&tx, &mut balances, &mut nonces).expect("valid but reverts");
         assert_eq!(rcpt.outcome, ExecOutcome::Revert);
         assert!(rcpt.error.is_some());
-        assert_eq!(balances["Alice"], 19);
-        assert_eq!(balances["Bob"], 50);
-        assert_eq!(*nonces.get("Alice").unwrap(), 1);
+        assert_eq!(balances[ALICE], 19);
+        assert_eq!(balances[BOB], 50);
+        assert_eq!(*nonces.get(ALICE).unwrap(), 1);
     }
 
     #[test]
     fn intrinsic_invalid_when_cannot_pay_fee() {
         let mut balances = HashMap::from([
-            ("Alice".to_string(), 0),
-            ("Bob".to_string(), 50),
+            (ALICE.to_string(), 0),
+            (BOB.to_string(), 50),
         ]);
         let mut nonces: HashMap<String, u64> = Default::default();
-    
-        let tx = Transaction::transfer("Alice", "Bob", 1, 0);
+
+        let tx = Transaction::transfer(ALICE, BOB, 1, 0);
     
         match process_transaction(&tx, &mut balances, &mut nonces) {
             Err(TxError::IntrinsicInvalid(msg)) => {
@@ -703,11 +725,11 @@ mod tests {
         }
     
         // Balances unchanged
-        assert_eq!(balances["Alice"], 0);
-        assert_eq!(balances["Bob"], 50);
+        assert_eq!(balances[ALICE], 0);
+        assert_eq!(balances[BOB], 50);
     
         // Nonces unchanged
-        assert_eq!(nonces.get("Alice"), None);
+        assert_eq!(nonces.get(ALICE), None);
     }
 
     #[test]
@@ -715,30 +737,30 @@ mod tests {
         use crate::types::AccessList;
 
         let mut balances = HashMap::from([
-            ("Alice".to_string(), 100),
-            ("Bob".to_string(), 50),
+            (ALICE.to_string(), 100),
+            (BOB.to_string(), 50),
         ]);
         let mut nonces: HashMap<String, u64> = Default::default();
         let al = AccessList {
-            reads: vec![ StateKey::Balance("Alice".into()), StateKey::Nonce("Alice".into()) ],
-            writes: vec![ StateKey::Balance("Alice".into()), StateKey::Nonce("Alice".into()) ],
+            reads: vec![ StateKey::Balance(ALICE.into()), StateKey::Nonce(ALICE.into()) ],
+            writes: vec![ StateKey::Balance(ALICE.into()), StateKey::Nonce(ALICE.into()) ],
         };
 
-        let tx = Transaction::new("Alice", "Bob", 1, 0, al);
+        let tx = Transaction::new(ALICE, BOB, 1, 0, al);
 
         match process_transaction(&tx, &mut balances, &mut nonces) {
             Err(TxError::IntrinsicInvalid(msg)) => {
-                assert!(msg.contains("missing required key"));
+                assert!(msg.contains("recipient balance write"));
             }
             _ => panic!("Expected intrinsic invalid error"),
         }
 
            // Balances unchanged
-           assert_eq!(balances["Alice"], 100);
-           assert_eq!(balances["Bob"], 50);
+           assert_eq!(balances[ALICE], 100);
+           assert_eq!(balances[BOB], 50);
        
            // Nonces unchanged
-           assert_eq!(nonces.get("Alice"), None);
+           assert_eq!(nonces.get(ALICE), None);
     }
 
     #[test]
@@ -746,16 +768,16 @@ mod tests {
         use crate::types::AccessList;
 
         let mut balances = HashMap::from([
-            ("Alice".to_string(), 100),
-            ("Bob".to_string(), 50),
+            (ALICE.to_string(), 100),
+            (BOB.to_string(), 50),
         ]);
         let mut nonces: HashMap<String, u64> = Default::default();
         let al = AccessList {
-            reads: vec![ StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into()), StateKey::Nonce("Bob".into()) ],
-            writes: vec![ StateKey::Balance("Alice".into()), StateKey::Balance("Bob".into()), StateKey::Nonce("Alice".into()), StateKey::Nonce("Bob".into()) ],
+            reads: vec![ StateKey::Balance(ALICE.into()), StateKey::Balance(BOB.into()), StateKey::Nonce(ALICE.into()), StateKey::Nonce(BOB.into()) ],
+            writes: vec![ StateKey::Balance(ALICE.into()), StateKey::Balance(BOB.into()), StateKey::Nonce(ALICE.into()), StateKey::Nonce(BOB.into()) ],
         };
 
-        let tx = Transaction::new("Alice", "Bob", 1, 0, al);
+        let tx = Transaction::new(ALICE, BOB, 1, 0, al);
 
         match process_transaction(&tx, &mut balances, &mut nonces) {
             Err(_) => {
@@ -767,11 +789,11 @@ mod tests {
         }
 
            // Balances unchanged
-           assert_eq!(balances["Alice"], 98);
-           assert_eq!(balances["Bob"], 51);
+           assert_eq!(balances[ALICE], 98);
+           assert_eq!(balances[BOB], 51);
        
            // Nonces unchanged
-           assert_eq!(nonces.get("Alice"), Some(1).as_ref());
+           assert_eq!(nonces.get(ALICE), Some(1).as_ref());
     }
     
     #[test]
@@ -783,41 +805,45 @@ mod tests {
         };
         use crate::types::{Transaction, Hash, AvailTx};
         use crate::codec::{tx_bytes, string_bytes};
-        use crate::crypto::{commitment_hash, avail_signing_preimage};
-    
-        // Minimal state
-        let mut balances: Balances = HashMap::from([("Alice".into(), 10_000)]);
-        let mut commitments: Commitments = Default::default();
-        let mut available:   Available   = HashSet::new();
-        let mut events: Vec<crate::types::Event> = Vec::new();
-    
-        // Create a commitment by simulating a commit included at height=5
-        let inner = Transaction::transfer("Alice", "Bob", 1, 0);
-        let salt: Hash = [2u8; 32];
-        let cmt  = commitment_hash(&tx_bytes(&inner), &salt, CHAIN_ID);
-    
-        let ready_at = 5 + DECRYPTION_DELAY;
-        let deadline = ready_at + REVEAL_WINDOW;
-    
-        // Insert commitment meta as if process_commit ran at height 5
-        commitments.insert(cmt, CommitmentMeta {
-            owner: "Alice".into(),
-            expires_at: deadline,
-            included_at: 5,
-            consumed: false,
-        });
-    
-        // Deterministic keypair and signed Avail for Alice
+        use crate::crypto::{commitment_hash, avail_signing_preimage, addr_from_pubkey, addr_hex};
+
+        // Deterministic keypair and sender address
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let vk = VerifyingKey::from(&sk);
         let pk_bytes = vk.to_bytes();
-        let sender_bytes = string_bytes("Alice");
+        let sender = addr_hex(&addr_from_pubkey(&pk_bytes));
+
+        // Minimal state
+        let mut balances: Balances = HashMap::from([(sender.clone(), 10_000)]);
+        let mut commitments: Commitments = Default::default();
+        let mut available:   Available   = HashSet::new();
+        let mut events: Vec<crate::types::Event> = Vec::new();
+
+        // Create a commitment by simulating a commit included at height=5
+        let inner = Transaction::transfer(&sender, BOB, 1, 0);
+        let salt: Hash = [2u8; 32];
+        let cmt  = commitment_hash(&tx_bytes(&inner), &salt, CHAIN_ID);
+
+        let ready_at = 5 + DECRYPTION_DELAY;
+        let deadline = ready_at + REVEAL_WINDOW;
+
+        // Insert commitment meta as if process_commit ran at height 5
+        commitments.insert(cmt, CommitmentMeta {
+            owner: sender.clone(),
+            expires_at: deadline,
+            included_at: 5,
+            consumed: false,
+            access_list: inner.access_list.clone(),
+        });
+
+        // Signed Avail for sender
+        let sender_bytes = string_bytes(&sender);
         let pre = avail_signing_preimage(&cmt, &sender_bytes, CHAIN_ID);
         let sig = sk.sign(&pre).to_bytes();
-    
+
         let a = AvailTx {
             commitment: cmt,
-            sender: "Alice".into(),
+            sender: sender.clone(),
             pubkey: pk_bytes,
             sig,
         };

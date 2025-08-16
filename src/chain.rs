@@ -312,8 +312,14 @@ fn tamper_block_no_state_change() {
     let sender = addr_hex(&addr_from_pubkey(&pk_bytes));
 
     let al = AccessList {
-        reads:  vec![StateKey::Balance(sender.clone())],
-        writes: vec![StateKey::Balance(sender.clone())],
+        reads:  vec![
+            StateKey::Balance(sender.clone()),
+            StateKey::Nonce(sender.clone()),
+        ],
+        writes: vec![
+            StateKey::Balance(sender.clone()),
+            StateKey::Nonce(sender.clone()),
+        ],
     };
 
     // Canonical bytes for signing
@@ -346,7 +352,7 @@ fn tamper_block_no_state_change() {
     );
 
     // Local state
-    let mut balances: Balances = HashMap::from([("Alice".to_string(), 100)]);
+    let mut balances: Balances = HashMap::from([(sender.clone(), 100)]);
     let mut nonces: Nonces = Default::default();
     let mut commitments: Commitments = Default::default();
     let mut available:   Available   = Default::default();
@@ -362,8 +368,8 @@ fn tamper_block_no_state_change() {
     ).expect("ok");
 
     // Sanity: commit fee burned, nonce unchanged
-    assert_eq!(balances["Alice"], 100 - COMMIT_FEE);
-    assert_eq!(*nonces.get("Alice").unwrap_or(&0), 0);
+    assert_eq!(balances[&sender], 100 - COMMIT_FEE);
+    assert_eq!(*nonces.get(&sender).unwrap_or(&0), 0);
 
     // Tamper header
     let mut bad_header = res.header.clone();
@@ -736,8 +742,14 @@ fn too_many_pending_commits_for_owner_is_rejected() {
     let mut chain = Chain::new();
 
     let al = AccessList {
-        reads:  vec![ StateKey::Balance(sender.clone()) ],
-        writes: vec![ StateKey::Balance(sender.clone()) ],
+        reads:  vec![
+            StateKey::Balance(sender.clone()),
+            StateKey::Nonce(sender.clone()),
+        ],
+        writes: vec![
+            StateKey::Balance(sender.clone()),
+            StateKey::Nonce(sender.clone()),
+        ],
     };
 
     let sender_bytes = string_bytes(&sender);
