@@ -61,32 +61,47 @@ pub fn verify_block_roots(header: &BlockHeader, block: &Block, receipts: &[Recei
 #[test]
 fn verify_block_roots_catches_tamper() {
     use std::collections::HashMap;
-    use crate::state::{Balances, Nonces, Commitments, Available};
+    use ed25519_dalek::{SigningKey, VerifyingKey, Signer as _};
+    use crate::state::{Balances, Nonces, Commitments, Available, CHAIN_ID};
     use crate::stf::process_block;
     use crate::types::{Block, Tx, CommitTx, Hash, AccessList, StateKey};
     use crate::verify::verify_block_roots;
+    use crate::codec::{string_bytes, access_list_bytes};
+    use crate::crypto::{commit_signing_preimage, addr_from_pubkey, addr_hex};
+
+    // Keypair and sender address
+    let sk = SigningKey::from_bytes(&[7u8; 32]);
+    let vk = VerifyingKey::from(&sk);
+    let pk_bytes = vk.to_bytes();
+    let sender = addr_hex(&addr_from_pubkey(&pk_bytes));
 
     // State
-    let mut balances: Balances = HashMap::from([("Alice".into(), 100_u64)]);
+    let mut balances: Balances = HashMap::from([(sender.clone(), 100_u64)]);
     let mut nonces: Nonces = Default::default();
     let mut comm: Commitments = Default::default();
     let mut avail: Available  = Default::default();
 
     let al = AccessList {
-        reads:  vec![StateKey::Balance("Alice".into())],
-        writes: vec![StateKey::Balance("Alice".into())],
+        reads:  vec![StateKey::Balance(sender.clone()), StateKey::Nonce(sender.clone())],
+        writes: vec![StateKey::Balance(sender.clone()), StateKey::Nonce(sender.clone())],
     };
 
-    // Block 1 with a single Commit (opaque commitment is fine here)
+    // Sign the commit
+    let sender_bytes = string_bytes(&sender);
+    let al_bytes     = access_list_bytes(&al);
     let commitment: Hash = [42u8; 32];
+    let ciphertext_hash: Hash = [0u8; 32];
+    let pre = commit_signing_preimage(&commitment, &ciphertext_hash, &sender_bytes, &al_bytes, CHAIN_ID);
+    let sig = sk.sign(&pre).to_bytes();
+
     let block = Block::new(
         vec![Tx::Commit(CommitTx {
             commitment,
-            sender: "Alice".into(),
-            ciphertext_hash: [0u8; 32],
+            sender: sender.clone(),
+            ciphertext_hash,
             access_list: al,
-            pubkey: [0; 32], 
-            sig: [0; 64]
+            pubkey: pk_bytes,
+            sig,
         })],
         1,
     );

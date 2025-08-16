@@ -193,6 +193,7 @@ pub struct CommitmentMeta {
     pub expires_at: u64,
     pub consumed: bool,
     pub included_at: u64,
+    pub access_list: AccessList,
 }
 
 #[derive(Debug, Clone)]
