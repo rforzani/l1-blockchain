@@ -13,6 +13,9 @@ pub const MAX_AVAILS_PER_BLOCK: usize = 50_000;
 pub const MAX_REVEALS_PER_BLOCK: usize = 50_000;
 pub const MAX_PENDING_COMMITS_PER_ACCOUNT: usize = 1_000;
 
+pub const MAX_AL_READS: usize = 256;
+pub const MAX_AL_WRITES: usize = 256;
+
 pub type Balances = HashMap<String, u64>;
 pub type Nonces = HashMap<String, u64>;
 pub type Commitments = HashMap<Hash, CommitmentMeta>; 

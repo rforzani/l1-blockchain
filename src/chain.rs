@@ -73,10 +73,20 @@ fn apply_block1_advances_tip() {
     use crate::chain::Chain;
     use crate::state::{Balances, Nonces, Commitments, Available};
     use crate::types::{Block, Tx, CommitTx, Hash, AccessList, StateKey};
+    use crate::crypto::{addr_from_pubkey, addr_hex};
+    use ed25519_dalek::{SigningKey, VerifyingKey, Signer as _};
+    use crate::codec::{string_bytes, access_list_bytes};
+    use crate::crypto::{commit_signing_preimage};
+    
+    let sk = SigningKey::from_bytes(&[7u8; 32]);
+    let vk = VerifyingKey::from(&sk);
+    let pk_bytes = vk.to_bytes();
+
+    let sender = addr_hex(&addr_from_pubkey(&pk_bytes));
 
     // 1) state
     let mut balances: Balances = HashMap::from([
-        ("Alice".to_string(), 100), // enough to pay COMMIT_FEE
+        (sender.clone().into(), 100), // enough to pay COMMIT_FEE
     ]);
     let mut nonces: Nonces = Default::default();
     let mut comm: Commitments = Default::default();
@@ -88,20 +98,28 @@ fn apply_block1_advances_tip() {
     assert_eq!(chain.tip_hash, [0u8; 32]);
 
     let al = AccessList {
-        reads:  vec![ StateKey::Balance("Alice".into()) ],
-        writes: vec![ StateKey::Balance("Alice".into()) ],
+        reads:  vec![ StateKey::Balance(sender.clone().into()), StateKey::Nonce(sender.clone().into()) ],
+        writes: vec![ StateKey::Balance(sender.clone().into()), StateKey::Nonce(sender.clone().into()) ],
     };
 
     // 3) block #1 with a single Commit
     let commitment: Hash = [1u8; 32];
+
+    let sender_bytes = string_bytes(&sender.clone());
+    let al_bytes     = access_list_bytes(&al);
+    let pre_c = commit_signing_preimage(
+        &commitment, &[0u8; 32], &sender_bytes, &al_bytes, CHAIN_ID
+    );
+    let sig_c = sk.sign(&pre_c).to_bytes();
+
     let b1 = Block::new(
         vec![Tx::Commit(CommitTx {
             commitment,
-            sender: "Alice".into(),
+            sender: sender,
             ciphertext_hash: [0u8; 32],
             access_list: al,
-            pubkey: [0; 32], 
-            sig: [0; 64]
+            pubkey: pk_bytes,
+            sig: sig_c
         })],
         1,
     );
@@ -163,6 +181,7 @@ fn applying_2_blocks_works_correctly() {
     use crate::types::{
         Block, Transaction, Tx, CommitTx, RevealTx, Hash, StateKey, AccessList, AvailTx
     };
+    use crate::crypto::{addr_from_pubkey, addr_hex};
     use crate::codec::tx_bytes;
     use crate::crypto::commitment_hash;
     use ed25519_dalek::{SigningKey, VerifyingKey, Signer as _};
@@ -172,6 +191,13 @@ fn applying_2_blocks_works_correctly() {
     let sk = SigningKey::from_bytes(&[3u8; 32]);
     let vk = VerifyingKey::from(&sk);
     let pk_bytes = vk.to_bytes();
+
+    let sk2 = SigningKey::from_bytes(&[3u8; 32]);
+    let vk2 = VerifyingKey::from(&sk2);
+    let pk_bytes2 = vk2.to_bytes();
+
+    let sender = addr_hex(&addr_from_pubkey(&pk_bytes));
+    let receiver = addr_hex(&addr_from_pubkey(&pk_bytes2));
 
     // helper: advance chain to `target` (exclusive) with empty blocks
     fn advance_to(
@@ -189,16 +215,16 @@ fn applying_2_blocks_works_correctly() {
     }
 
     // Inner tx to be revealed
-    let tx = Transaction::transfer("Alice", "Bob", 10, 0);
+    let tx = Transaction::transfer(sender.clone(), receiver.clone(), 10, 0);
     let salt: Hash = [3u8; 32];
     let cmt = commitment_hash(&tx_bytes(&tx), &salt, CHAIN_ID);
 
     let al = AccessList {
-        reads:  vec![ StateKey::Balance("Alice".into()) ],
-        writes: vec![ StateKey::Balance("Alice".into()) ],
+        reads:  vec![ StateKey::Balance(sender.clone().into()), StateKey::Nonce(sender.clone().into()), StateKey::Balance(receiver.clone().into()) ],
+        writes: vec![ StateKey::Balance(sender.clone().into()), StateKey::Nonce(sender.clone().into()), StateKey::Balance(receiver.clone().into()) ],
     };
 
-    let sender_bytes = string_bytes("Alice");
+    let sender_bytes = string_bytes(&sender.clone());
     let al_bytes     = access_list_bytes(&al);
     let pre_c = commit_signing_preimage(
         &cmt, &[0u8; 32], &sender_bytes, &al_bytes, CHAIN_ID
@@ -209,7 +235,7 @@ fn applying_2_blocks_works_correctly() {
     let b1 = Block::new(
         vec![Tx::Commit(CommitTx {
             commitment: cmt,
-            sender: "Alice".into(),
+            sender: sender.clone().into(),
             ciphertext_hash: [0u8; 32],
             access_list: al,
             pubkey: pk_bytes, 
@@ -221,8 +247,8 @@ fn applying_2_blocks_works_correctly() {
     // Chain/state
     let mut chain = Chain::new();
     let mut balances: Balances = HashMap::from([
-        ("Alice".to_string(), 100),
-        ("Bob".to_string(), 50),
+        (sender.clone(), 100),
+        (receiver.clone(), 50),
     ]);
     let mut nonces: Nonces = Default::default();
     let mut comm: Commitments = Default::default();
@@ -240,14 +266,14 @@ fn applying_2_blocks_works_correctly() {
 
     // Block ready_at: Avail in transactions + Reveal in the block body
     let reveals = vec![
-        RevealTx { tx: tx.clone(), salt, sender: "Alice".into() }
+        RevealTx { tx: tx.clone(), salt, sender: sender.clone().into() }
     ];
 
     let pre_a = avail_signing_preimage(&cmt, &sender_bytes, CHAIN_ID);
     let sig_a = sk.sign(&pre_a).to_bytes();
 
     let b2 = Block::new_with_reveals(
-        vec![ Tx::Avail(AvailTx { commitment: cmt, pubkey: pk_bytes, sig: sig_a, sender: "Alice".into() }) ],
+        vec![ Tx::Avail(AvailTx { commitment: cmt, pubkey: pk_bytes, sig: sig_a, sender: sender.clone().into() }) ],
         reveals,
         ready_at,
     );
@@ -272,6 +298,7 @@ fn tamper_block_no_state_change() {
     use crate::verify::verify_block_roots;
     use crate::codec::{string_bytes, access_list_bytes};
     use crate::crypto::commit_signing_preimage;
+    use crate::crypto::{addr_from_pubkey, addr_hex};
 
     // Genesis parent
     let parent: Hash = [0u8; 32];
@@ -281,7 +308,8 @@ fn tamper_block_no_state_change() {
     let vk = VerifyingKey::from(&sk);
     let pk_bytes = vk.to_bytes();
 
-    let sender = "Alice".to_string();
+    
+    let sender = addr_hex(&addr_from_pubkey(&pk_bytes));
 
     let al = AccessList {
         reads:  vec![StateKey::Balance(sender.clone())],
@@ -361,6 +389,19 @@ fn inclusion_list_due_must_be_included() {
     use crate::codec::{tx_bytes, string_bytes, access_list_bytes};
     use crate::crypto::{commitment_hash, commit_signing_preimage, avail_signing_preimage};
     use crate::stf::BlockError;
+    use crate::crypto::{addr_from_pubkey, addr_hex};
+
+    // deterministic test keypair
+    let sk = SigningKey::from_bytes(&[7u8; 32]);
+    let vk = VerifyingKey::from(&sk);
+    let pk_bytes = vk.to_bytes();
+
+    let sk2 = SigningKey::from_bytes(&[7u8; 32]);
+    let vk2 = VerifyingKey::from(&sk2);
+    let pk_bytes2 = vk2.to_bytes();
+
+    let sender: String = addr_hex(&addr_from_pubkey(&pk_bytes));
+    let recipient = addr_hex(&addr_from_pubkey(&pk_bytes2));
 
     // helper: fill chain with empty blocks up to (but not including) `target`
     fn advance_to(
@@ -378,7 +419,7 @@ fn inclusion_list_due_must_be_included() {
     }
 
     // --- State ---
-    let mut balances: Balances = HashMap::from([("Alice".into(), 100)]);
+    let mut balances: Balances = HashMap::from([(sender.clone().into(), 100)]);
     let mut nonces: Nonces = Default::default();
     let mut comm: Commitments = Default::default();
     let mut avail: Available  = Default::default();
@@ -386,16 +427,9 @@ fn inclusion_list_due_must_be_included() {
     // --- Chain ---
     let mut chain = Chain::new();
 
-    // deterministic test keypair
-    let sk = SigningKey::from_bytes(&[7u8; 32]);
-    let vk = VerifyingKey::from(&sk);
-    let pk_bytes = vk.to_bytes();
-
-    let sender = "Alice".to_string();
-
     let al = AccessList {
-        reads:  vec![ StateKey::Balance(sender.clone()) ],
-        writes: vec![ StateKey::Balance(sender.clone()) ],
+        reads:  vec![ StateKey::Balance(sender.clone()), StateKey::Nonce(sender.clone()), StateKey::Balance(recipient.clone()) ],
+        writes: vec![ StateKey::Balance(sender.clone()), StateKey::Nonce(sender.clone()), StateKey::Balance(recipient.clone()) ],
     };
 
     // canonical bytes for signing
@@ -403,7 +437,7 @@ fn inclusion_list_due_must_be_included() {
     let al_bytes     = access_list_bytes(&al);
 
     // Build inner tx + salt so we can compute the matching commitment
-    let inner = Transaction::transfer(&sender, "Bob", 10, 0);
+    let inner = Transaction::transfer(&sender, recipient.clone(), 10, 0);
     let salt: Hash = [9u8; 32];
     let cmt  = commitment_hash(&tx_bytes(&inner), &salt, CHAIN_ID);
 
@@ -504,6 +538,7 @@ fn reveal_bundle_executes_multiple_reveals_and_satisfies_il() {
     use crate::codec::{tx_bytes, string_bytes, access_list_bytes};
     use crate::crypto::{commitment_hash, commit_signing_preimage, avail_signing_preimage};
     use crate::gas::BASE_FEE_PER_TX;
+    use crate::crypto::{addr_from_pubkey, addr_hex};
 
     // helper: advance chain with empty blocks up to (but not including) `target`
     fn advance_to(
@@ -520,31 +555,37 @@ fn reveal_bundle_executes_multiple_reveals_and_satisfies_il() {
         }
     }
 
-    let mut balances: Balances = HashMap::from([("Alice".into(), 1_000)]);
-    let mut nonces: Nonces = Default::default();
-    let mut comms: Commitments = Default::default();
-    let mut avail: Available   = Default::default();
-    let mut chain = Chain::new();
-
     // deterministic keypair for tests
     let sk = SigningKey::from_bytes(&[7u8; 32]);
     let vk = VerifyingKey::from(&sk);
     let pk_bytes = vk.to_bytes();
 
-    let sender = "Alice".to_string();
+    let sk2 = SigningKey::from_bytes(&[8u8; 32]);
+    let vk2 = VerifyingKey::from(&sk2);
+    let pk_bytes2 = vk2.to_bytes();
+
+    let sender = addr_hex(&addr_from_pubkey(&pk_bytes));
+    let recipient = addr_hex(&addr_from_pubkey(&pk_bytes2));
+
+    let mut balances: Balances = HashMap::from([(sender.clone().into(), 1_000)]);
+    let mut nonces: Nonces = Default::default();
+    let mut comms: Commitments = Default::default();
+    let mut avail: Available   = Default::default();
+    let mut chain = Chain::new();
+
     let al = AccessList {
-        reads:  vec![ StateKey::Balance(sender.clone()) ],
-        writes: vec![ StateKey::Balance(sender.clone()) ],
+        reads:  vec![ StateKey::Balance(sender.clone()), StateKey::Balance(recipient.clone()), StateKey::Nonce(sender.clone()) ],
+        writes: vec![ StateKey::Balance(sender.clone()), StateKey::Balance(recipient.clone()), StateKey::Nonce(sender.clone()) ],
     };
     let sender_bytes = string_bytes(&sender);
     let al_bytes     = access_list_bytes(&al);
 
     // two inner transfers (use sequential nonces per sender)
-    let t1 = Transaction::transfer(&sender, "Bob", 10, 0);
+    let t1 = Transaction::transfer(&sender, &recipient, 10, 0);
     let s1: Hash = [1u8; 32];
     let c1 = commitment_hash(&tx_bytes(&t1), &s1, CHAIN_ID);
 
-    let t2 = Transaction::transfer(&sender, "Bob", 20, 1);
+    let t2 = Transaction::transfer(&sender, &recipient, 20, 1);
     let s2: Hash = [2u8; 32];
     let c2 = commitment_hash(&tx_bytes(&t2), &s2, CHAIN_ID);
 
@@ -626,11 +667,12 @@ fn reveal_bundle_executes_multiple_reveals_and_satisfies_il() {
 
     // receipts: two reveals
     assert_eq!(res.receipts.len(), 2);
+    println!("{:?}", res.receipts[0]);
 
     // balances: commit fees + reveal gas + transfers + avail fees
     // Alice started 1000; paid 2*COMMIT_FEE at b1; then pays 2*BASE_FEE and transfers 30 total; plus 2 * AVAIL_FEE
-    let expected_alice = 1_000 - 2*COMMIT_FEE - 2*BASE_FEE_PER_TX - (10 + 20) - 2*AVAIL_FEE;
-    assert_eq!(balances["Alice"], expected_alice);
+    let expected_alice = 1_000 - 2*COMMIT_FEE - 2*BASE_FEE_PER_TX - 10 - 20 - 2*AVAIL_FEE;
+    assert_eq!(balances[&sender], expected_alice);
 }
 
 #[test]
@@ -677,26 +719,26 @@ fn too_many_pending_commits_for_owner_is_rejected() {
     use crate::stf::BlockError;
     use crate::codec::{string_bytes, access_list_bytes};
     use crate::crypto::commit_signing_preimage;
+    use crate::crypto::{addr_from_pubkey, addr_hex};
+
+    // deterministic keypair + canonical bytes used for every Commit
+    let sk = SigningKey::from_bytes(&[7u8; 32]);
+    let vk = VerifyingKey::from(&sk);
+    let pk_bytes = vk.to_bytes();
+    let sender = addr_hex(&addr_from_pubkey(&pk_bytes));
 
     let mut balances: Balances = std::collections::HashMap::from([
-        ("Alice".into(), (MAX_PENDING_COMMITS_PER_ACCOUNT as u64 + 10) * COMMIT_FEE),
+        (sender.clone().into(), (MAX_PENDING_COMMITS_PER_ACCOUNT as u64 + 10) * COMMIT_FEE),
     ]);
     let mut nonces: Nonces = Default::default();
     let mut comms: Commitments = Default::default();
     let mut avail: Available   = Default::default();
     let mut chain = Chain::new();
 
-    let sender = "Alice".to_string();
-
     let al = AccessList {
         reads:  vec![ StateKey::Balance(sender.clone()) ],
         writes: vec![ StateKey::Balance(sender.clone()) ],
     };
-
-    // deterministic keypair + canonical bytes used for every Commit
-    let sk = SigningKey::from_bytes(&[7u8; 32]);
-    let vk = VerifyingKey::from(&sk);
-    let pk_bytes = vk.to_bytes();
 
     let sender_bytes = string_bytes(&sender);
     let al_bytes     = access_list_bytes(&al);
@@ -740,22 +782,41 @@ fn too_many_pending_commits_for_owner_is_rejected() {
 fn duplicate_commit_in_same_block_is_rejected() {
     use crate::{chain::Chain, state::{Balances, Nonces, Commitments, Available, COMMIT_FEE},
         types::{Block, Tx, CommitTx, AccessList, StateKey}, stf::BlockError};
+    use crate::crypto::{addr_from_pubkey, addr_hex};
+    use crate::crypto::commit_signing_preimage;
+    use ed25519_dalek::{SigningKey, VerifyingKey, Signer as _};
+    use crate::codec::{string_bytes, access_list_bytes};
 
-    let mut balances: Balances = [("Alice".into(), 2 * COMMIT_FEE)].into_iter().collect();
+    let sk = SigningKey::from_bytes(&[7u8; 32]);
+    let vk = VerifyingKey::from(&sk);
+    let pk_bytes = vk.to_bytes();
+    let sender = addr_hex(&addr_from_pubkey(&pk_bytes));
+
+    let mut balances: Balances = [(sender.clone().into(), 2 * COMMIT_FEE)].into_iter().collect();
     let mut nonces: Nonces = Default::default();
     let mut comms: Commitments = Default::default();
     let mut avail: Available   = Default::default();
     let mut chain = Chain::new();
 
+    // deterministic keypair + canonical bytes used for every Commit
+
     let al = AccessList {
-        reads:  vec![ StateKey::Balance("Alice".into()) ],
-        writes: vec![ StateKey::Balance("Alice".into()) ],
+        reads:  vec![ StateKey::Balance(sender.clone().into()), StateKey::Nonce(sender.clone().into()) ],
+        writes: vec![ StateKey::Balance(sender.clone().into()), StateKey::Nonce(sender.clone().into()) ],
     };
 
     let commitment = [7u8; 32];
+
+    let sender_bytes = string_bytes(&sender);
+    let al_bytes     = access_list_bytes(&al);
+    let ciphertext_hash = [0u8; 32];
+
+    let pre = commit_signing_preimage(&commitment, &ciphertext_hash, &sender_bytes, &al_bytes, CHAIN_ID);
+    let sig = sk.sign(&pre).to_bytes();
+
     let txs = vec![
-        Tx::Commit(CommitTx { commitment, sender: "Alice".into(), ciphertext_hash: [0;32], access_list: al.clone(), pubkey: [0; 32], sig: [0; 64] }),
-        Tx::Commit(CommitTx { commitment, sender: "Alice".into(), ciphertext_hash: [0;32], access_list: al, pubkey: [0; 32], sig: [0; 64] }),
+        Tx::Commit(CommitTx { commitment, sender: sender.clone().into(), ciphertext_hash: ciphertext_hash.clone(), access_list: al.clone(), pubkey: pk_bytes.clone(), sig: sig.clone() }),
+        Tx::Commit(CommitTx { commitment, sender: sender.clone().into(), ciphertext_hash: ciphertext_hash, access_list: al, pubkey: pk_bytes, sig: sig }),
     ];
 
     let b = Block::new(txs, 1);
@@ -782,6 +843,20 @@ fn inclusion_list_due_but_missing_reveal_rejects_block() {
     use crate::codec::{tx_bytes, string_bytes, access_list_bytes};
     use crate::crypto::{commitment_hash, commit_signing_preimage, avail_signing_preimage};
     use crate::stf::BlockError;
+    use crate::crypto::{addr_from_pubkey, addr_hex};
+
+    // --- deterministic test keypair ---
+    let sk = SigningKey::from_bytes(&[7u8; 32]);
+    let vk = VerifyingKey::from(&sk);
+    let pk_bytes = vk.to_bytes();
+
+    let sk2 = SigningKey::from_bytes(&[7u8; 32]);
+    let vk2 = VerifyingKey::from(&sk2);
+    let pk_bytes2 = vk2.to_bytes();
+
+
+    let sender = addr_hex(&addr_from_pubkey(&pk_bytes));
+    let recipient = addr_hex(&addr_from_pubkey(&pk_bytes2));
 
     // helper: advance chain with empty blocks up to (but not including) `target`
     fn advance_to(
@@ -799,22 +874,15 @@ fn inclusion_list_due_but_missing_reveal_rejects_block() {
     }
 
     // --- State/chain ---
-    let mut balances: Balances = HashMap::from([("Alice".into(), 100)]);
+    let mut balances: Balances = HashMap::from([(sender.clone().into(), 100)]);
     let mut nonces: Nonces = Default::default();
     let mut comm: Commitments = Default::default();
     let mut avail: Available  = Default::default();
     let mut chain = Chain::new();
 
-    // --- deterministic test keypair ---
-    let sk = SigningKey::from_bytes(&[7u8; 32]);
-    let vk = VerifyingKey::from(&sk);
-    let pk_bytes = vk.to_bytes();
-
-    let sender = "Alice".to_string();
-
     let al = AccessList {
-        reads:  vec![ StateKey::Balance(sender.clone()) ],
-        writes: vec![ StateKey::Balance(sender.clone()) ],
+        reads:  vec![ StateKey::Balance(sender.clone()), StateKey::Balance(recipient.clone()), StateKey::Nonce(sender.clone()) ],
+        writes: vec![ StateKey::Balance(sender.clone()), StateKey::Balance(recipient.clone()), StateKey::Nonce(sender.clone()) ],
     };
 
     // canonical bytes for signing
@@ -822,7 +890,7 @@ fn inclusion_list_due_but_missing_reveal_rejects_block() {
     let al_bytes     = access_list_bytes(&al);
 
     // Build inner tx + salt → commitment
-    let inner = Transaction::transfer(&sender, "Bob", 10, 0);
+    let inner = Transaction::transfer(&sender, &recipient, 10, 0);
     let salt: Hash = [9u8; 32];
     let cmt  = commitment_hash(&tx_bytes(&inner), &salt, CHAIN_ID);
 
@@ -913,24 +981,26 @@ fn availability_outside_window_rejected() {
     use crate::stf::BlockError;
     use crate::codec::{string_bytes, access_list_bytes};
     use crate::crypto::{commit_signing_preimage, avail_signing_preimage};
-
-    // --- state ---
-    let mut balances: Balances = [("Alice".into(), 2 * COMMIT_FEE)].into_iter().collect();
-    let mut nonces: Nonces = Default::default();
-    let mut comms: Commitments = Default::default();
-    let mut avail: Available   = Default::default();
-    let mut chain = Chain::new();
+    use crate::crypto::{addr_from_pubkey, addr_hex};
 
     // --- deterministic keypair for tests ---
     let sk = SigningKey::from_bytes(&[7u8; 32]);
     let vk = VerifyingKey::from(&sk);
     let pk_bytes = vk.to_bytes();
 
+    let sender = addr_hex(&addr_from_pubkey(&pk_bytes));
+
+    // --- state ---
+    let mut balances: Balances = [(sender.clone().into(), 2 * COMMIT_FEE)].into_iter().collect();
+    let mut nonces: Nonces = Default::default();
+    let mut comms: Commitments = Default::default();
+    let mut avail: Available   = Default::default();
+    let mut chain = Chain::new();
+
     // --- access list + canonical bytes for signing ---
-    let sender = "Alice".to_string();
     let al = AccessList {
-        reads:  vec![StateKey::Balance(sender.clone())],
-        writes: vec![StateKey::Balance(sender.clone())],
+        reads:  vec![StateKey::Balance(sender.clone()), StateKey::Nonce(sender.clone())],
+        writes: vec![StateKey::Balance(sender.clone()), StateKey::Nonce(sender.clone())],
     };
     let sender_bytes = string_bytes(&sender);
     let al_bytes     = access_list_bytes(&al);

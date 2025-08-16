@@ -5,15 +5,9 @@ use crate::crypto::merkle_root;
 use crate::crypto::hash_bytes_sha256;
 use crate::state::Available;
 use crate::state::Commitments;
-use crate::state::AVAIL_FEE;
-use crate::state::CHAIN_ID;
-use crate::state::COMMIT_FEE;
-use crate::state::DECRYPTION_DELAY;
-use crate::state::MAX_AVAILS_PER_BLOCK;
-use crate::state::MAX_PENDING_COMMITS_PER_ACCOUNT;
-use crate::state::MAX_REVEALS_PER_BLOCK;
-use crate::state::REVEAL_WINDOW;
+use crate::state::{AVAIL_FEE, CHAIN_ID, COMMIT_FEE, DECRYPTION_DELAY, MAX_AVAILS_PER_BLOCK, MAX_PENDING_COMMITS_PER_ACCOUNT, MAX_REVEALS_PER_BLOCK, REVEAL_WINDOW};
 use crate::state::{Balances, Nonces};
+use crate::crypto::{addr_from_pubkey, addr_hex};
 use crate::codec::{tx_enum_bytes, receipt_bytes, header_bytes, tx_bytes};
 use crate::types::AvailTx;
 use crate::types::CommitmentMeta;
@@ -68,63 +62,118 @@ pub struct BlockResult {
     pub events: Vec<Event>
 }
 
-/// Process a single transaction against the balances map.
 pub fn process_transaction(
     tx: &Transaction,
     balances: &mut Balances,
-    nonces: &mut Nonces,
+    nonces:   &mut Nonces,
 ) -> Result<Receipt, TxError>
 {
-    let sender: String = tx.from.clone();
+    use crate::gas::BASE_FEE_PER_TX;
+    use crate::types::{ExecOutcome, Receipt, StateKey};
+    use crate::crypto::is_hex_addr;
+    use crate::state::{MAX_AL_READS, MAX_AL_WRITES};
 
-    let expected: u64 = *nonces.get(&sender).unwrap_or(&0);
-
-    if tx.nonce != expected {
-        return Err(TxError::IntrinsicInvalid(
-            format!("bad nonce: expected {}, got {}", expected, tx.nonce)
-        ));
+    // 0) Address format checks
+    if !is_hex_addr(&tx.from) || !is_hex_addr(&tx.to) {
+        return Err(TxError::IntrinsicInvalid("sender/recipient not a valid address".into()));
     }
 
-    let required = [
-        StateKey::Nonce(tx.from.clone()),
-        StateKey::Balance(tx.from.clone()),
-        StateKey::Balance(tx.to.clone()),
-    ];
-
-    if !tx.access_list.covers(&required) {
-        return Err(TxError::IntrinsicInvalid("access list missing required key".to_string()));
+    // 1) Nonce must match exactly
+    let expected_nonce = *nonces.get(&tx.from).unwrap_or(&0);
+    if tx.nonce != expected_nonce {
+        return Err(TxError::IntrinsicInvalid(format!(
+            "bad nonce: expected {}, got {}", expected_nonce, tx.nonce
+        )));
     }
 
-    let receiver: String = tx.to.clone();
+    // 2) Access list (assumed canonical already)
+    let al = &tx.access_list;
 
-    let sender_bal= balances.entry(sender).or_insert(0);
-    
-    if *sender_bal < BASE_FEE_PER_TX {
-        return Err(TxError::IntrinsicInvalid(
-            "insufficient funds to pay gas fee".to_string()
-        ));
+    // Cheap caps (DoS guard)
+    if al.reads.len()  > MAX_AL_READS || al.writes.len() > MAX_AL_WRITES {
+        return Err(TxError::IntrinsicInvalid("access list too large".into()));
     }
-    
-    *sender_bal -= BASE_FEE_PER_TX;
 
-    let error: Option<String>;
-    let outcome: ExecOutcome;
+    // Keys must be addresses (defense-in-depth)
+    for k in al.reads.iter().chain(al.writes.iter()) {
+        match k {
+            StateKey::Balance(a) | StateKey::Nonce(a) => {
+                if !is_hex_addr(a) {
+                    return Err(TxError::IntrinsicInvalid("access list contains non-address key".into()));
+                }
+            }
+        }
+    }
 
-    if *sender_bal >= tx.amount {
-        // Success path
-        *sender_bal -= tx.amount;
-        *balances.entry(receiver).or_insert(0) += tx.amount;
-        outcome = ExecOutcome::Success;
-        error = None;
+    println!("{:?}", al);
+    println!("{}", &tx.from);
+
+    // Must include: Balance(from) R+W and Nonce(from) R+W
+    if !al.require_sender_balance_rw(&tx.from) {
+        return Err(TxError::IntrinsicInvalid("access list missing sender balance read/write".into()));
+    }
+    if !al.require_sender_nonce_rw(&tx.from) {
+        return Err(TxError::IntrinsicInvalid("access list missing sender nonce read/write".into()));
+    }
+
+    // Must include: Balance(to) WRITE
+    let mut has_bal_to_write = false;
+    for k in &al.writes {
+        if matches!(k, StateKey::Balance(a) if a == &tx.to) { has_bal_to_write = true; break; }
+    }
+    if !has_bal_to_write {
+        return Err(TxError::IntrinsicInvalid("access list missing recipient balance write".into()));
+    }
+
+    // 3) Charge gas up front (fail early)
+    {
+        let sb = balances.entry(tx.from.clone()).or_insert(0);
+        if *sb < BASE_FEE_PER_TX {
+            return Err(TxError::IntrinsicInvalid("insufficient funds to pay gas fee".into()));
+        }
+        *sb -= BASE_FEE_PER_TX;
+    } // sender borrow ends
+
+    // 4) Execute transfer (no overlapping &mut borrows)
+    let mut outcome = ExecOutcome::Success;
+    let mut error: Option<String> = None;
+
+    // Debit sender
+    let debited = {
+        let sb = balances.get_mut(&tx.from).unwrap(); // exists after gas charge
+        if *sb >= tx.amount {
+            *sb -= tx.amount;
+            true
+        } else {
+            false
+        }
+    }; // sender borrow ends
+
+    if debited {
+        // Credit receiver, guard overflow
+        let cur_to = *balances.get(&tx.to).unwrap_or(&0);
+        if let Some(new_to) = cur_to.checked_add(tx.amount) {
+            balances.insert(tx.to.clone(), new_to);
+        } else {
+            // overflow → rollback amount (gas stays burned)
+            let sb = balances.get_mut(&tx.from).unwrap();
+            *sb += tx.amount;
+            outcome = ExecOutcome::Revert;
+            error = Some("balance overflow on recipient".into());
+        }
     } else {
-        // Revert path
         outcome = ExecOutcome::Revert;
-        error = Some("insufficient funds for transfer".to_string());
+        error = Some("insufficient funds for transfer".into());
     }
 
-    *nonces.entry(tx.from.clone()).or_insert(0) = expected + 1;
+    // 5) Bump nonce with overflow guard
+    if expected_nonce == u64::MAX {
+        return Err(TxError::IntrinsicInvalid("nonce overflow".into()));
+    }
+    nonces.insert(tx.from.clone(), expected_nonce + 1);
 
-    Ok(Receipt { outcome, gas_used: BASE_FEE_PER_TX, error: error })
+    // 6) Receipt
+    Ok(Receipt { outcome, gas_used: BASE_FEE_PER_TX, error })
 }
 
 fn process_avail(
@@ -159,7 +208,13 @@ fn process_avail(
 
     if !verify_ed25519(&a.pubkey, &a.sig, &preimage) {
         return Err(TxError::IntrinsicInvalid("bad avail signature".into()));
-}
+    }
+
+    let derived = addr_hex(&addr_from_pubkey(&a.pubkey));
+    if a.sender != derived {
+        return Err(TxError::IntrinsicInvalid("sender/pubkey mismatch".into()));
+    }
+
 
     // owner-only Avail (v1)   ------ TO BE CHANGED LATER: It now avoids griefing where a third party could force you to pay an Avail fee. Later, when we move to TE, “Avail” becomes a committee root and this logic naturally disappears.
     let owner = meta.owner.clone();
@@ -195,7 +250,7 @@ fn pending_for_owner(commitments: &Commitments, owner: &str) -> usize {
         .count()
 }
 
-fn process_commit(
+pub fn process_commit(
     c: &CommitTx,
     balances: &mut Balances,
     commitments: &mut Commitments,
@@ -203,53 +258,85 @@ fn process_commit(
     events: &mut Vec<Event>,
 ) -> Result<Receipt, TxError> {
     use crate::codec::{string_bytes, access_list_bytes};
-    use crate::crypto::{commit_signing_preimage, verify_ed25519};
+    use crate::crypto::{commit_signing_preimage, verify_ed25519, addr_from_pubkey, addr_hex, is_hex_addr};
+    use crate::types::{AccessList, StateKey};
+    use crate::state::{MAX_AL_READS, MAX_AL_WRITES};
 
+    // --- 1) Signature + identity ---
     let sender_bytes = string_bytes(&c.sender);
-    let al_bytes     = access_list_bytes(&c.access_list);
-    let preimage     = commit_signing_preimage(
+    let al_bytes_for_sig = access_list_bytes(&c.access_list); // canonical bytes for signing
+    let preimage = commit_signing_preimage(
         &c.commitment,
         &c.ciphertext_hash,
         &sender_bytes,
-        &al_bytes,
+        &al_bytes_for_sig,
         CHAIN_ID,
     );
-
     if !verify_ed25519(&c.pubkey, &c.sig, &preimage) {
         return Err(TxError::IntrinsicInvalid("bad commit signature".into()));
     }
 
-    let required = [
-        StateKey::Balance(c.sender.clone())
-    ];
-
-    if !c.access_list.covers(&required) {
-        return Err(TxError::IntrinsicInvalid("access list missing required key".to_string()));
+    let derived = addr_hex(&addr_from_pubkey(&c.pubkey));
+    if c.sender != derived {
+        return Err(TxError::IntrinsicInvalid("sender/pubkey mismatch".into()));
+    }
+    if !is_hex_addr(&c.sender) {
+        return Err(TxError::IntrinsicInvalid("sender not a valid address".into()));
     }
 
-    let sender = c.sender.clone();
-    let bal = balances.entry(sender.clone()).or_insert(0);
-    if *bal < COMMIT_FEE {
-        return Err(TxError::IntrinsicInvalid("insufficient funds to pay commit fee".to_string()));
+    // --- 2) AccessList sanity (complete but safe) ---
+    // 2a) size caps
+    if c.access_list.reads.len()  > MAX_AL_READS
+        || c.access_list.writes.len() > MAX_AL_WRITES
+    {
+        return Err(TxError::IntrinsicInvalid("access list too large".into()));
     }
 
-    if pending_for_owner(commitments, &c.sender) >= MAX_PENDING_COMMITS_PER_ACCOUNT {
-        return Err(TxError::IntrinsicInvalid("too many pending commits for owner".into()));
-    }
-
-    *bal -= COMMIT_FEE;
-
-    // 2) reject duplicate active commitment
-    if let Some(meta) = commitments.get(&c.commitment) {
-        if !meta.consumed {
-            return Err(TxError::IntrinsicInvalid("duplicate commitment".to_string()));
+    // 2b) all keys must be addresses (reject human names)
+    for k in c.access_list.reads.iter().chain(c.access_list.writes.iter()) {
+        match k {
+            StateKey::Balance(a) | StateKey::Nonce(a) => {
+                if !is_hex_addr(a) {
+                    return Err(TxError::IntrinsicInvalid("access list contains non-address key".into()));
+                }
+            }
         }
     }
 
-    let ready_at   = current_height + DECRYPTION_DELAY;
-    let deadline   = ready_at + REVEAL_WINDOW; 
+    // 2c) canonicalize (sort + dedup) for deterministic membership checks
+    let mut al = c.access_list.clone();
+    al.canonicalize();
 
-    // 3) store commitment metadata
+    // 2d) must include sender Balance R+W (commit fee burn)
+    if !al.require_sender_balance_rw(&c.sender) {
+        return Err(TxError::IntrinsicInvalid("access list must include Balance(sender) read+write".into()));
+    }
+
+    // 2e) (recommended) include sender Nonce R+W (reveal path will need it)
+    if !al.require_sender_nonce_rw(&c.sender) {
+        return Err(TxError::IntrinsicInvalid("access list must include Nonce(sender) read+write".into()));
+    }
+
+    // --- 3) Economics / anti-abuse ---
+    let sender = c.sender.clone();
+    let bal = balances.entry(sender.clone()).or_insert(0);
+    if *bal < COMMIT_FEE {
+        return Err(TxError::IntrinsicInvalid("insufficient funds to pay commit fee".into()));
+    }
+    if pending_for_owner(commitments, &c.sender) >= MAX_PENDING_COMMITS_PER_ACCOUNT {
+        return Err(TxError::IntrinsicInvalid("too many pending commits for owner".into()));
+    }
+    if let Some(meta) = commitments.get(&c.commitment) {
+        if !meta.consumed {
+            return Err(TxError::IntrinsicInvalid("duplicate commitment".into()));
+        }
+    }
+    *bal = bal.saturating_sub(COMMIT_FEE);
+
+    // --- 4) Time bounds & record ---
+    let ready_at = current_height + DECRYPTION_DELAY;
+    let deadline = ready_at + REVEAL_WINDOW;
+
     commitments.insert(
         c.commitment,
         CommitmentMeta {
@@ -260,15 +347,17 @@ fn process_commit(
         },
     );
 
-    // 4) event
     events.push(Event::CommitStored {
         commitment: c.commitment,
         owner: sender,
         expires_at: deadline,
     });
 
-    // 5) receipt
-    Ok(Receipt { outcome: ExecOutcome::Success, gas_used: BASE_FEE_PER_TX, error: None })
+    Ok(Receipt {
+        outcome: ExecOutcome::Success,
+        gas_used: BASE_FEE_PER_TX,
+        error: None,
+    })
 }
 
 fn process_reveal(
@@ -279,15 +368,6 @@ fn process_reveal(
     commitments: &mut Commitments,
     events: &mut Vec<Event>,
 ) -> Result<Receipt, TxError> {
-    let required = [
-        StateKey::Nonce(r.tx.from.clone()),
-        StateKey::Balance(r.tx.from.clone()),
-        StateKey::Balance(r.tx.to.clone()),
-    ];
-    
-    if !r.tx.access_list.covers(&required) {
-        return Err(TxError::IntrinsicInvalid("access list missing required key".to_string()));
-    }
     // Sender sanity
     if r.sender != r.tx.from {
         return Err(TxError::IntrinsicInvalid("reveal sender != tx.from".to_string()));
@@ -449,7 +529,6 @@ mod tests {
     use crate::types::{Transaction};
     use std::collections::HashMap;
 
-    #[test]
     #[test]
     fn transfer_via_commit_reveal_success() {
         use std::collections::HashMap;

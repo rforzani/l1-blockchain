@@ -92,7 +92,23 @@ pub struct AccessList {
     pub writes: Vec<StateKey>,
 }
 
+#[inline]
+fn key_order<'a>(k: &'a StateKey) -> (u8, &'a str) {
+    match k {
+        StateKey::Balance(a) => (0, a.as_str()),
+        StateKey::Nonce(a)   => (1, a.as_str()),
+    }
+}
+
 impl AccessList {
+    /// Sort + dedup in-place to canonical form.
+    pub fn canonicalize(&mut self) {
+        self.reads.sort_by(|a,b| key_order(a).cmp(&key_order(b)));
+        self.reads.dedup();
+        self.writes.sort_by(|a,b| key_order(a).cmp(&key_order(b)));
+        self.writes.dedup();
+    }
+
     pub fn for_transfer(from: &str, to: &str) -> Self {
         AccessList {
             reads: vec![
@@ -107,11 +123,36 @@ impl AccessList {
             ],
         }
     }
-    pub fn covers(&self, keys: &[StateKey]) -> bool {
-        use std::collections::HashSet;
-        let r: HashSet<_> = self.reads.iter().cloned().collect();
-        let w: HashSet<_> = self.writes.iter().cloned().collect();
-        keys.iter().all(|k| r.contains(k) && w.contains(k))
+
+    #[inline]
+    fn contains_sorted(slice: &[StateKey], key: &StateKey) -> bool {
+        use core::cmp::Ordering;
+        slice.binary_search_by(|k| {
+            let ko = key_order(k);
+            let qo = key_order(key);
+            if ko < qo { Ordering::Less } else if ko > qo { Ordering::Greater } else { Ordering::Equal }
+        }).is_ok()
+    }
+
+    /// Return true if each `required` key appears in **reads and writes**.
+    pub fn covers(&self, required: &[StateKey]) -> bool {
+        required.iter().all(|k| {
+            Self::contains_sorted(&self.reads, k) && Self::contains_sorted(&self.writes, k)
+        })
+    }
+
+    /// Convenience: require sender balance read+write (commit fee).
+    pub fn require_sender_balance_rw(&self, sender: &str) -> bool {
+        let k = StateKey::Balance(sender.to_string());
+        println!("{:?}", k);
+        println!("{}", Self::contains_sorted(&self.reads, &k));
+        Self::contains_sorted(&self.reads, &k) && Self::contains_sorted(&self.writes, &k)
+    }
+
+    /// Convenience: require sender nonce read+write (reveal path).
+    pub fn require_sender_nonce_rw(&self, sender: &str) -> bool {
+        let k = StateKey::Nonce(sender.to_string());
+        Self::contains_sorted(&self.reads, &k) && Self::contains_sorted(&self.writes, &k)
     }
 }
 

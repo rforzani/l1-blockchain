@@ -10,6 +10,34 @@ const REVEAL_PAIR_DOMAIN: &[u8] = b"CAR_REVEAL_PAIR_V1";
 const SIGN_COMMIT_DOMAIN: &[u8] = b"SIGN_COMMIT_V1";
 const SIGN_AVAIL_DOMAIN:  &[u8] = b"SIGN_AVAIL_V1";
 
+pub fn is_hex_addr(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 42 || b[0] != b'0' || (b[1] != b'x' && b[1] != b'X') {
+        return false;
+    }
+    b[2..].iter().all(|&c|
+        (b'0'..=b'9').contains(&c) ||
+        (b'a'..=b'f').contains(&c) ||
+        (b'A'..=b'F').contains(&c)
+    )
+}
+
+/// 20-byte address = first 20 bytes of SHA-256(pubkey)
+pub fn addr_from_pubkey(pubkey: &[u8; 32]) -> [u8; 20] {
+    let h = Sha256::digest(pubkey);
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&h[..20]);
+    out
+}
+
+/// "0x" + lowercase hex encoding of a 20-byte address
+pub fn addr_hex(addr: &[u8; 20]) -> String {
+    let mut s = String::with_capacity(2 + 40);
+    s.push_str("0x");
+    s.push_str(&hex::encode(addr));
+    s
+}
+
 pub fn verify_ed25519(pubkey: &[u8; 32], sig_bytes: &[u8; 64], msg: &[u8]) -> bool {
     // VerifyingKey is fallible
     let pk = match VerifyingKey::from_bytes(pubkey) {
