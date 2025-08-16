@@ -8,7 +8,7 @@ use crate::state::Commitments;
 use crate::state::{AVAIL_FEE, CHAIN_ID, COMMIT_FEE, DECRYPTION_DELAY, MAX_AVAILS_PER_BLOCK, MAX_PENDING_COMMITS_PER_ACCOUNT, MAX_REVEALS_PER_BLOCK, REVEAL_WINDOW};
 use crate::state::{Balances, Nonces};
 use crate::crypto::{addr_from_pubkey, addr_hex};
-use crate::codec::{tx_enum_bytes, receipt_bytes, header_bytes, tx_bytes};
+use crate::codec::{tx_enum_bytes, receipt_bytes, header_bytes, tx_bytes, access_list_bytes};
 use crate::types::AvailTx;
 use crate::types::CommitmentMeta;
 use crate::types::{Block, Receipt, ExecOutcome, Hash, BlockHeader, Transaction, StateKey, Tx, Event, RevealTx, CommitTx, AccessList};
@@ -374,7 +374,9 @@ fn process_reveal(
         return Err(TxError::IntrinsicInvalid("reveal sender != tx.from".to_string()));
     }
 
-    let cmt = commitment_hash(&tx_bytes(&r.tx), &r.salt, CHAIN_ID);
+    let tx_ser = tx_bytes(&r.tx);
+    let reveal_al_bytes = access_list_bytes(&r.tx.access_list);
+    let cmt = commitment_hash(&tx_ser, &reveal_al_bytes, &r.salt, CHAIN_ID);
 
     // Prepare executable transaction with access list from commitment metadata
     let mut exec_tx = Transaction {
@@ -407,6 +409,13 @@ fn process_reveal(
             return Err(TxError::IntrinsicInvalid("reveal outside window".to_string()));
         }
         // --------------------------------
+
+        // verify commitment using stored access list
+        let meta_al_bytes = access_list_bytes(&meta.access_list);
+        let expected = commitment_hash(&tx_ser, &meta_al_bytes, &r.salt, CHAIN_ID);
+        if expected != cmt {
+            return Err(TxError::IntrinsicInvalid("commitment/access list mismatch".to_string()));
+        }
 
         exec_tx.access_list = meta.access_list.clone();
         meta.consumed = true; // mark as used
@@ -490,7 +499,8 @@ pub fn process_block(
 
         // pair for reveal_set_root
         let tx_ser = tx_bytes(&r.tx);
-        let cmt    = commitment_hash(&tx_ser, &r.salt, CHAIN_ID);
+        let al_bytes = access_list_bytes(&r.tx.access_list);
+        let cmt    = commitment_hash(&tx_ser, &al_bytes, &r.salt, CHAIN_ID);
         let txh    = hash_bytes_sha256(&tx_ser);
         revealed_pairs.push((cmt, txh));
         revealed_this_block.insert(cmt);
@@ -594,13 +604,15 @@ mod tests {
         let al = AccessList::for_transfer(&sender, &bob);
         let sender_bytes = string_bytes(&sender);
         let al_bytes     = access_list_bytes(&al);
-    
+
         // Inner plaintext transfer (to be revealed later)
         let tx = Transaction::transfer(&sender, &bob, 30, 0);
-    
+
         // Salt and commitment
         let salt: Hash = [7u8; 32];
-        let cmt = commitment_hash(&tx_bytes(&tx), &salt, CHAIN_ID);
+        let tx_ser = tx_bytes(&tx);
+        let tx_al_bytes = access_list_bytes(&tx.access_list);
+        let cmt = commitment_hash(&tx_ser, &tx_al_bytes, &salt, CHAIN_ID);
     
         // ---- Block 1: Commit (SIGNED) ----
         let ciphertext_hash = [0u8; 32];
@@ -638,17 +650,9 @@ mod tests {
         let pre_avail = avail_signing_preimage(&cmt, &sender_bytes, CHAIN_ID);
         let sig_avail = sk.sign(&pre_avail).to_bytes();
     
-        // Reveal need not resend access list
-        let tx_no_al = Transaction::new(
-            sender.clone(),
-            bob.clone(),
-            30,
-            0,
-            AccessList { reads: vec![], writes: vec![] },
-        );
-
+        // Reveal must provide the same access list so the commitment can be recomputed
         let reveals = vec![
-            RevealTx { tx: tx_no_al, salt, sender: sender.clone() }
+            RevealTx { tx: tx.clone(), salt, sender: sender.clone() }
         ];
         let b_ready = Block::new_with_reveals(
             vec![ Tx::Avail(AvailTx {
@@ -822,7 +826,9 @@ mod tests {
         // Create a commitment by simulating a commit included at height=5
         let inner = Transaction::transfer(&sender, BOB, 1, 0);
         let salt: Hash = [2u8; 32];
-        let cmt  = commitment_hash(&tx_bytes(&inner), &salt, CHAIN_ID);
+        let inner_ser = tx_bytes(&inner);
+        let inner_al_bytes = access_list_bytes(&inner.access_list);
+        let cmt  = commitment_hash(&inner_ser, &inner_al_bytes, &salt, CHAIN_ID);
 
         let ready_at = 5 + DECRYPTION_DELAY;
         let deadline = ready_at + REVEAL_WINDOW;

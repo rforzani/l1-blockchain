@@ -217,7 +217,9 @@ fn applying_2_blocks_works_correctly() {
     // Inner tx to be revealed
     let tx = Transaction::transfer(sender.clone(), receiver.clone(), 10, 0);
     let salt: Hash = [3u8; 32];
-    let cmt = commitment_hash(&tx_bytes(&tx), &salt, CHAIN_ID);
+    let tx_ser = tx_bytes(&tx);
+    let tx_al_bytes = access_list_bytes(&tx.access_list);
+    let cmt = commitment_hash(&tx_ser, &tx_al_bytes, &salt, CHAIN_ID);
 
     let al = AccessList {
         reads:  vec![ StateKey::Balance(sender.clone().into()), StateKey::Nonce(sender.clone().into()), StateKey::Balance(receiver.clone().into()) ],
@@ -445,7 +447,9 @@ fn inclusion_list_due_must_be_included() {
     // Build inner tx + salt so we can compute the matching commitment
     let inner = Transaction::transfer(&sender, recipient.clone(), 10, 0);
     let salt: Hash = [9u8; 32];
-    let cmt  = commitment_hash(&tx_bytes(&inner), &salt, CHAIN_ID);
+    let inner_ser = tx_bytes(&inner);
+    let inner_al_bytes = access_list_bytes(&inner.access_list);
+    let cmt  = commitment_hash(&inner_ser, &inner_al_bytes, &salt, CHAIN_ID);
 
     // ---- Block 1: Commit (signed) ----
     let ciphertext_hash = [2u8; 32];
@@ -589,11 +593,15 @@ fn reveal_bundle_executes_multiple_reveals_and_satisfies_il() {
     // two inner transfers (use sequential nonces per sender)
     let t1 = Transaction::transfer(&sender, &recipient, 10, 0);
     let s1: Hash = [1u8; 32];
-    let c1 = commitment_hash(&tx_bytes(&t1), &s1, CHAIN_ID);
+    let t1_ser = tx_bytes(&t1);
+    let t1_al_bytes = access_list_bytes(&t1.access_list);
+    let c1 = commitment_hash(&t1_ser, &t1_al_bytes, &s1, CHAIN_ID);
 
     let t2 = Transaction::transfer(&sender, &recipient, 20, 1);
     let s2: Hash = [2u8; 32];
-    let c2 = commitment_hash(&tx_bytes(&t2), &s2, CHAIN_ID);
+    let t2_ser = tx_bytes(&t2);
+    let t2_al_bytes = access_list_bytes(&t2.access_list);
+    let c2 = commitment_hash(&t2_ser, &t2_al_bytes, &s2, CHAIN_ID);
 
     // block 1: commits (two) — both signed
     let ciphertext_hash = [0u8; 32];
@@ -904,7 +912,9 @@ fn inclusion_list_due_but_missing_reveal_rejects_block() {
     // Build inner tx + salt → commitment
     let inner = Transaction::transfer(&sender, &recipient, 10, 0);
     let salt: Hash = [9u8; 32];
-    let cmt  = commitment_hash(&tx_bytes(&inner), &salt, CHAIN_ID);
+    let inner_ser = tx_bytes(&inner);
+    let inner_al_bytes = access_list_bytes(&inner.access_list);
+    let cmt  = commitment_hash(&inner_ser, &inner_al_bytes, &salt, CHAIN_ID);
 
     // Block 1: commit (signed)
     let ciphertext_hash = [2u8; 32];
