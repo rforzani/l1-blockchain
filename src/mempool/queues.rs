@@ -2,12 +2,13 @@
 
 use std::collections::{HashMap, BTreeMap};
 
-use crate::types::Hash;             
+use crate::types::Hash;
 use crate::mempool::{TxId, CommitmentId};
 use crate::codec::{tx_enum_bytes, tx_bytes, access_list_bytes};
-use crate::crypto::{hash_bytes_sha256, commitment_hash};
-use crate::state::CHAIN_ID;
-use crate::types::{Tx, CommitTx, AvailTx, RevealTx};
+use crate::crypto::{hash_bytes_sha256, commitment_hash, is_hex_addr};
+use crate::state::{CHAIN_ID, MAX_AL_READS, MAX_AL_WRITES, MAX_PENDING_COMMITS_PER_ACCOUNT};
+use crate::types::{Tx, CommitTx, AvailTx, RevealTx, StateKey};
+use super::AdmissionError;
 
 /// --- Queue item shapes ---
 /// These are small, immutable records we store once a tx passes basic prechecks.
@@ -54,6 +55,8 @@ pub struct CommitQueue {
     pub by_commitment: HashMap<CommitmentId, TxId>,
     /// fee-ordered view for greedy selection (negated fee to sort desc via BTreeMap ascending order)
     pub fee_order: BTreeMap<(i128, String), TxId>, // key: (-fee_bid as i128, sender)
+    /// pending commits per owner
+    pub pending_per_owner: HashMap<String, usize>,
 }
 
 pub struct AvailQueue {
@@ -101,14 +104,72 @@ impl RevealQueueItem {
 }
 
 impl Queues {
-    /// Insert a Commit into the indexes. No validation yet.
-    pub fn insert_commit_minimal(&mut self, c: &CommitTx, current_height: u64, fee_bid: u128) -> TxId {
-        // Stable TxId: hash of the serialized enum form
+    fn precheck_commit(&self, c: &CommitTx) -> Result<(), AdmissionError> {
+        if !is_hex_addr(&c.sender) {
+            return Err(AdmissionError::InvalidSignature);
+        }
+        if c.access_list.reads.len() > MAX_AL_READS || c.access_list.writes.len() > MAX_AL_WRITES {
+            return Err(AdmissionError::BadAccessList);
+        }
+        for k in c.access_list.reads.iter().chain(c.access_list.writes.iter()) {
+            let addr = match k {
+                StateKey::Balance(a) | StateKey::Nonce(a) => a,
+            };
+            if !is_hex_addr(addr) {
+                return Err(AdmissionError::BadAccessList);
+            }
+        }
+        let bal = StateKey::Balance(c.sender.clone());
+        let nonce = StateKey::Nonce(c.sender.clone());
+        let reads = &c.access_list.reads;
+        let writes = &c.access_list.writes;
+        let has_req = reads.contains(&bal) && writes.contains(&bal) && reads.contains(&nonce) && writes.contains(&nonce);
+        if !has_req {
+            return Err(AdmissionError::BadAccessList);
+        }
+        let cnt = self.commits.pending_per_owner.get(&c.sender).copied().unwrap_or(0);
+        if cnt >= MAX_PENDING_COMMITS_PER_ACCOUNT {
+            return Err(AdmissionError::MempoolFullForAccount);
+        }
+        if self.commits.by_commitment.contains_key(&CommitmentId(c.commitment)) {
+            return Err(AdmissionError::Duplicate);
+        }
+        Ok(())
+    }
+
+    fn precheck_avail(&self, a: &AvailTx) -> Result<(), AdmissionError> {
+        if !is_hex_addr(&a.sender) {
+            return Err(AdmissionError::InvalidSignature);
+        }
+        if self.avails.by_commitment.contains_key(&CommitmentId(a.commitment)) {
+            return Err(AdmissionError::Duplicate);
+        }
+        Ok(())
+    }
+
+    fn precheck_reveal(&self, r: &RevealTx, cmt: &Hash) -> Result<(), AdmissionError> {
+        if r.sender != r.tx.from {
+            return Err(AdmissionError::InvalidSignature);
+        }
+        let tx_ser = tx_bytes(&r.tx);
+        let al_bytes = access_list_bytes(&r.tx.access_list);
+        let recomputed = commitment_hash(&tx_ser, &al_bytes, &r.salt, CHAIN_ID);
+        if &recomputed != cmt {
+            return Err(AdmissionError::MismatchedCommitment);
+        }
+        if r.tx.access_list.reads.len() > MAX_AL_READS || r.tx.access_list.writes.len() > MAX_AL_WRITES {
+            return Err(AdmissionError::BadAccessList);
+        }
+        Ok(())
+    }
+
+    /// Insert a Commit into the indexes after prechecking.
+    pub fn insert_commit_minimal(&mut self, c: &CommitTx, current_height: u64, fee_bid: u128) -> Result<TxId, AdmissionError> {
+        self.precheck_commit(c)?;
+
         let enc = tx_enum_bytes(&Tx::Commit(c.clone()));
         let id = txid_from(&enc);
 
-        // Digest the canonical AL bytes (you already canonicalize in codec) 
-        // and store an AL digest for quick checks later.
         let al_bytes = access_list_bytes(&c.access_list);
         let al_digest = hash_bytes_sha256(&al_bytes);
 
@@ -124,11 +185,14 @@ impl Queues {
         self.commits.by_commitment.insert(CommitmentId(c.commitment), id);
         self.commits.fee_order.insert(item.key_for_fee_order(), id);
         self.commits.by_id.insert(id, item);
-        id
+        *self.commits.pending_per_owner.entry(c.sender.clone()).or_insert(0) += 1;
+        Ok(id)
     }
 
     /// Insert an Avail. We don't compute ready_at here (need state); set it to current_height for now.
-    pub fn insert_avail_minimal(&mut self, a: &AvailTx, current_height: u64, fee_bid: u128) -> TxId {
+    pub fn insert_avail_minimal(&mut self, a: &AvailTx, current_height: u64, fee_bid: u128) -> Result<TxId, AdmissionError> {
+        self.precheck_avail(a)?;
+
         let enc = tx_enum_bytes(&Tx::Avail(a.clone()));
         let id = txid_from(&enc);
 
@@ -144,20 +208,20 @@ impl Queues {
         self.avails.by_commitment.insert(CommitmentId(a.commitment), id);
         self.avails.fee_order.insert(item.key_for_fee_order(), id);
         self.avails.by_id.insert(id, item);
-        id
+        Ok(id)
     }
 
     /// Insert a Reveal. We compute the commitment from (tx_bytes, AL bytes, salt) the same way the STF does.
-    pub fn insert_reveal_minimal(&mut self, r: &RevealTx, current_height: u64, fee_bid: u128) -> TxId {
-        // TxId: hash of inner tx bytes || salt (domain-separated by codec version implicitly)
+    pub fn insert_reveal_minimal(&mut self, r: &RevealTx, current_height: u64, fee_bid: u128) -> Result<TxId, AdmissionError> {
         let mut buf = tx_bytes(&r.tx);
         buf.extend_from_slice(&r.salt);
         let id = txid_from(&buf);
 
-        // Compute commitment exactly like in STF: c = H(dom || chain_id || tx_bytes || salt || H(AL_bytes))
         let tx_ser = tx_bytes(&r.tx);
         let al_bytes = access_list_bytes(&r.tx.access_list);
         let cmt = commitment_hash(&tx_ser, &al_bytes, &r.salt, CHAIN_ID);
+
+        self.precheck_reveal(r, &cmt)?;
 
         let al_digest = hash_bytes_sha256(&al_bytes);
 
@@ -171,7 +235,6 @@ impl Queues {
             arrival_height: current_height,
         };
 
-        // Index per commitment ordered by (sender, nonce)
         self.reveals
             .by_commitment
             .entry(CommitmentId(cmt))
@@ -180,7 +243,7 @@ impl Queues {
 
         self.reveals.fee_order.insert(item.key_for_fee_order(), id);
         self.reveals.by_id.insert(id, item);
-        id
+        Ok(id)
     }
 }
 
@@ -190,6 +253,7 @@ impl Default for CommitQueue {
             by_id: HashMap::new(),
             by_commitment: HashMap::new(),
             fee_order: BTreeMap::new(),
+            pending_per_owner: HashMap::new(),
         }
     }
 }
@@ -236,6 +300,7 @@ mod tests {
         assert!(q.commits.by_id.is_empty());
         assert!(q.commits.by_commitment.is_empty());
         assert!(q.commits.fee_order.is_empty());
+        assert!(q.commits.pending_per_owner.is_empty());
 
         // Avails
         assert!(q.avails.by_id.is_empty());
