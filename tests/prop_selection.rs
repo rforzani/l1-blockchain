@@ -5,13 +5,14 @@ use proptest::prelude::*;
 use std::sync::Arc;
 
 // ===== Adjust the crate name if needed (Cargo.toml [package].name; hyphen -> underscore) =====
-use l1_blockchain::mempool::{
-    AdmissionError, BlockSelectionLimits, CommitmentId, Mempool, MempoolConfig, MempoolImpl, StateView,
-};
-use l1_blockchain::types::{RevealTx, Transaction, AccessList, CommitTx, Tx};
 use l1_blockchain::codec::{access_list_bytes, tx_bytes};
 use l1_blockchain::crypto::commitment_hash;
+use l1_blockchain::mempool::{
+    AdmissionError, BlockSelectionLimits, CommitmentId, Mempool, MempoolConfig, MempoolImpl,
+    StateView,
+};
 use l1_blockchain::state::CHAIN_ID;
+use l1_blockchain::types::{AccessList, AvailTx, CommitTx, RevealTx, Transaction, Tx};
 
 // -------------------- Small helpers for this test --------------------
 
@@ -22,23 +23,35 @@ struct SV {
 }
 
 impl StateView for SV {
-    fn current_height(&self) -> u64 { self.height }
+    fn current_height(&self) -> u64 {
+        self.height
+    }
 
     fn commitments_due_and_available(&self, _h: u64) -> Vec<CommitmentId> {
         self.il.clone()
     }
 
-    fn reveal_nonce_required(&self, _sender: &str) -> u64 { 0 }
+    fn reveal_nonce_required(&self, _sender: &str) -> u64 {
+        0
+    }
 
     // Permissive defaults so selection isn't blocked by state checks here
-    fn commit_on_chain(&self, _c: CommitmentId) -> bool { true }
-    fn avail_on_chain(&self, _c: CommitmentId) -> bool { false }
-    fn avail_allowed_at(&self, _height: u64, _c: CommitmentId) -> bool { true }
-    fn pending_commit_room(&self, _sender: &str) -> u32 { u32::MAX }
+    fn commit_on_chain(&self, _c: CommitmentId) -> bool {
+        true
+    }
+    fn avail_on_chain(&self, _c: CommitmentId) -> bool {
+        false
+    }
+    fn avail_allowed_at(&self, _height: u64, _c: CommitmentId) -> bool {
+        true
+    }
+    fn pending_commit_room(&self, _sender: &str) -> u32 {
+        u32::MAX
+    }
 }
 
 /// Build a minimal RevealTx for a given sender, nonce and salt.
-fn make_reveal_tx(sender: String, nonce: u64, salt: [u8;32]) -> RevealTx {
+fn make_reveal_tx(sender: String, nonce: u64, salt: [u8; 32]) -> RevealTx {
     let to = "0x0000000000000000000000000000000000000001".to_string();
     RevealTx {
         sender: sender.clone(),
@@ -53,12 +66,179 @@ fn make_reveal_tx(sender: String, nonce: u64, salt: [u8;32]) -> RevealTx {
     }
 }
 
+proptest! {
+    #[test]
+    fn prop_il_reveal_payload_missing(
+        salt in any::<[u8;32]>(),
+        sender in any::<[u8;20]>().prop_map(|b| format!("0x{}", hex::encode(b))),
+    ) {
+        let height = 42;
+        let mem: Arc<MempoolImpl> = MempoolImpl::new(cfg());
+        let fee_bid: u128 = 1_000;
+
+        let commit_id = insert_commit_and_reveal(&mem, &sender, 0, salt, height, fee_bid)
+            .expect("insert commit+reveal");
+
+        {
+            let (_c, _a, mut reveals) = mem.debug_write();
+            let txid_opt = reveals
+                .by_commitment
+                .get(&commit_id)
+                .and_then(|tree| tree.values().next().copied());
+            if let Some(txid) = txid_opt {
+                reveals.payload_by_id.remove(&txid);
+            }
+        }
+
+        let state = SV { height, il: vec![commit_id] };
+        let limits = BlockSelectionLimits { max_reveals: 10, max_avails: 0, max_commits: 0 };
+        let blk = mem.select_block(&state, limits).expect("selection ok");
+        prop_assert_eq!(blk.reveals.len(), 0);
+    }
+}
+
+proptest! {
+    #[test]
+    fn prop_extra_reveals_nonce_continuity(
+        salts in proptest::collection::vec(any::<[u8;32]>(), 2),
+        sender in any::<[u8;20]>().prop_map(|b| format!("0x{}", hex::encode(b))),
+    ) {
+        let height = 55;
+        let mem: Arc<MempoolImpl> = MempoolImpl::new(cfg());
+        let fee_bid: u128 = 1_000;
+
+        let il_commit = insert_commit_and_reveal(&mem, &sender, 0, salts[0], height, fee_bid)
+            .expect("il insert");
+
+        insert_commit_and_reveal(&mem, &sender, 2, salts[1], height, fee_bid)
+            .expect("extra insert");
+
+        let state = SV { height, il: vec![il_commit] };
+        let limits = BlockSelectionLimits { max_reveals: 5, max_avails: 0, max_commits: 0 };
+        let blk = mem.select_block(&state, limits).expect("selection ok");
+        prop_assert_eq!(blk.reveals.len(), 1);
+        prop_assert_eq!(blk.reveals[0].tx.nonce, 0);
+    }
+}
+
+proptest! {
+    #[test]
+    fn prop_fee_ordering_for_extras(
+        salts in proptest::collection::vec(any::<[u8;32]>(), 3),
+        sender in any::<[u8;20]>().prop_map(|b| format!("0x{}", hex::encode(b))),
+    ) {
+        let height = 60;
+        let mem: Arc<MempoolImpl> = MempoolImpl::new(cfg());
+        let fees = [1u128, 3, 2];
+
+        for i in 0..3 {
+            insert_commit_and_reveal(&mem, &sender, 0, salts[i], height, fees[i])
+                .expect("insert extra");
+        }
+
+        let state = SV { height, il: vec![] };
+        let limits = BlockSelectionLimits { max_reveals: 1, max_avails: 0, max_commits: 0 };
+        let blk = mem.select_block(&state, limits).expect("selection ok");
+        prop_assert_eq!(blk.reveals.len(), 1);
+        prop_assert_eq!(blk.reveals[0].salt, salts[1]);
+    }
+}
+
+proptest! {
+    #[test]
+    fn prop_reveal_cap_enforced(
+        salts in proptest::collection::vec(any::<[u8;32]>(), 4),
+        sender in any::<[u8;20]>().prop_map(|b| format!("0x{}", hex::encode(b))),
+    ) {
+        let height = 77;
+        let mem: Arc<MempoolImpl> = MempoolImpl::new(cfg());
+        let fee_bid: u128 = 1_000;
+
+        let il_commit = insert_commit_and_reveal(&mem, &sender, 0, salts[0], height, fee_bid)
+            .expect("il insert");
+        for (i, salt) in salts[1..].iter().enumerate() {
+            insert_commit_and_reveal(&mem, &sender, (i + 1) as u64, *salt, height, fee_bid)
+                .expect("extra insert");
+        }
+
+        let state = SV { height, il: vec![il_commit] };
+        let limits = BlockSelectionLimits { max_reveals: 2, max_avails: 0, max_commits: 0 };
+        let blk = mem.select_block(&state, limits).expect("selection ok");
+        prop_assert_eq!(blk.reveals.len(), 2);
+        prop_assert_eq!(blk.reveals[0].tx.nonce, 0);
+        prop_assert_eq!(blk.reveals[1].tx.nonce, 1);
+    }
+}
+
+proptest! {
+    #[test]
+    fn prop_avails_ordering(
+        commitments in proptest::collection::vec(any::<[u8;32]>(), 3),
+        sender in any::<[u8;20]>().prop_map(|b| format!("0x{}", hex::encode(b))),
+    ) {
+        let mem: Arc<MempoolImpl> = MempoolImpl::new(cfg());
+        let height = 88;
+        let fees = [5u128, 20, 10];
+
+        let a0 = AvailTx { commitment: commitments[0], sender: sender.clone(), pubkey: [0u8;32], sig: [0u8;64] };
+        let a1 = AvailTx { commitment: commitments[1], sender: sender.clone(), pubkey: [0u8;32], sig: [0u8;64] };
+        let a2 = AvailTx { commitment: commitments[2], sender: sender.clone(), pubkey: [0u8;32], sig: [0u8;64] };
+
+        mem.insert_avail(Tx::Avail(a0.clone()), height, fees[0]).unwrap();
+        mem.insert_avail(Tx::Avail(a1.clone()), height, fees[1]).unwrap();
+        // not ready yet
+        mem.insert_avail(Tx::Avail(a2.clone()), height + 1, fees[2]).unwrap();
+
+        let state = SV { height, il: vec![] };
+        let limits = BlockSelectionLimits { max_reveals: 0, max_avails: 10, max_commits: 0 };
+        let blk = mem.select_block(&state, limits).expect("selection ok");
+        prop_assert_eq!(blk.txs.len(), 2);
+        match (&blk.txs[0], &blk.txs[1]) {
+            (Tx::Avail(x), Tx::Avail(y)) => {
+                prop_assert_eq!(x.commitment, commitments[1]);
+                prop_assert_eq!(y.commitment, commitments[0]);
+            }
+            _ => prop_assert!(false, "expected avail txs"),
+        }
+    }
+}
+
+proptest! {
+    #[test]
+    fn prop_commit_cap_enforced(
+        salts in proptest::collection::vec(any::<[u8;32]>(), 3),
+        sender in any::<[u8;20]>().prop_map(|b| format!("0x{}", hex::encode(b))),
+    ) {
+        let height = 99;
+        let mem: Arc<MempoolImpl> = MempoolImpl::new(cfg());
+        let fees = [1u128, 5, 3];
+        let mut ids = Vec::new();
+
+        for i in 0..3 {
+            let id = insert_commit_only(&mem, &sender, i as u64, salts[i], height, fees[i])
+                .expect("commit insert");
+            ids.push(id);
+        }
+
+        let state = SV { height, il: vec![] };
+        let limits = BlockSelectionLimits { max_reveals: 0, max_avails: 0, max_commits: 1 };
+        let blk = mem.select_block(&state, limits).expect("selection ok");
+        prop_assert_eq!(blk.txs.len(), 1);
+        match &blk.txs[0] {
+            Tx::Commit(c) => {
+                prop_assert_eq!(c.commitment, ids[1].0);
+            }
+            _ => prop_assert!(false, "expected commit tx"),
+        }
+    }
+}
+
 /// Insert a commit + reveal pair into the mempool and return the commitment id.
 fn insert_commit_and_reveal(
     mem: &Arc<MempoolImpl>,
     sender: &str,
     nonce: u64,
-    salt: [u8;32],
+    salt: [u8; 32],
     height: u64,
     fee_bid: u128,
 ) -> Result<CommitmentId, AdmissionError> {
@@ -71,13 +251,40 @@ fn insert_commit_and_reveal(
         commitment: cmt,
         sender: sender.to_owned(),
         access_list: r.tx.access_list.clone(),
-        ciphertext_hash: [0u8;32],
-        pubkey: [0u8;32],
-        sig: [0u8;64],
+        ciphertext_hash: [0u8; 32],
+        pubkey: [0u8; 32],
+        sig: [0u8; 64],
     };
 
     mem.insert_commit(Tx::Commit(commit), height, fee_bid)?;
     mem.insert_reveal(r, height, fee_bid)?;
+    Ok(CommitmentId(cmt))
+}
+
+/// Insert only a commit (no reveal) and return its commitment id.
+fn insert_commit_only(
+    mem: &Arc<MempoolImpl>,
+    sender: &str,
+    nonce: u64,
+    salt: [u8; 32],
+    height: u64,
+    fee_bid: u128,
+) -> Result<CommitmentId, AdmissionError> {
+    let r = make_reveal_tx(sender.to_owned(), nonce, salt);
+    let tx_ser = tx_bytes(&r.tx);
+    let al_bytes = access_list_bytes(&r.tx.access_list);
+    let cmt = commitment_hash(&tx_ser, &al_bytes, &r.salt, CHAIN_ID);
+
+    let commit = CommitTx {
+        commitment: cmt,
+        sender: sender.to_owned(),
+        access_list: r.tx.access_list.clone(),
+        ciphertext_hash: [0u8; 32],
+        pubkey: [0u8; 32],
+        sig: [0u8; 64],
+    };
+
+    mem.insert_commit(Tx::Commit(commit), height, fee_bid)?;
     Ok(CommitmentId(cmt))
 }
 
@@ -143,4 +350,3 @@ proptest! {
         }
     }
 }
-

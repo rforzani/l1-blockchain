@@ -76,15 +76,15 @@ pub trait StateView: Send + Sync {
 
     /// was the Commit for c included already?
     fn commit_on_chain(&self, c: CommitmentId) -> bool;
-    
+
     /// was the Avail for c included already?
-    fn avail_on_chain(&self, c: CommitmentId) -> bool;       
-    
+    fn avail_on_chain(&self, c: CommitmentId) -> bool;
+
     /// inside [start,end] window?
-    fn avail_allowed_at(&self, height: u64, c: CommitmentId) -> bool; 
-    
+    fn avail_allowed_at(&self, height: u64, c: CommitmentId) -> bool;
+
     /// remaining pending-commit slots for sender
-    fn pending_commit_room(&self, sender: &str) -> u32;       
+    fn pending_commit_room(&self, sender: &str) -> u32;
 }
 
 /// Errors that can happen during block selection.
@@ -164,6 +164,20 @@ impl MempoolImpl {
             self.reveals.read().unwrap(),
         )
     }
+
+    pub fn debug_write(
+        &self,
+    ) -> (
+        std::sync::RwLockWriteGuard<'_, CommitQueue>,
+        std::sync::RwLockWriteGuard<'_, AvailQueue>,
+        std::sync::RwLockWriteGuard<'_, RevealQueue>,
+    ) {
+        (
+            self.commits.write().unwrap(),
+            self.avails.write().unwrap(),
+            self.reveals.write().unwrap(),
+        )
+    }
 }
 
 impl Mempool for MempoolImpl {
@@ -231,7 +245,8 @@ impl Mempool for MempoolImpl {
         let height = state.current_height();
         let il = state.commitments_due_and_available(height);
 
-        let commits: std::sync::RwLockReadGuard<'_, CommitQueue> = self.commits.read().expect("commit queue poisoned");
+        let commits: std::sync::RwLockReadGuard<'_, CommitQueue> =
+            self.commits.read().expect("commit queue poisoned");
         let avails = self.avails.read().expect("avail queue poisoned");
         let reveals = self.reveals.read().expect("reveal queue poisoned");
 
@@ -272,9 +287,9 @@ impl Mempool for MempoolImpl {
             let ((sender0, _nonce0), _txid0) = map.iter().next().expect("non-empty");
 
             // Pull (or fetch) this sender's required nonce
-            let req = *next_required.entry(sender0.clone()).or_insert_with(|| {
-                state.reveal_nonce_required(&sender0)
-            });
+            let req = *next_required
+                .entry(sender0.clone())
+                .or_insert_with(|| state.reveal_nonce_required(&sender0));
 
             // We must include the reveal whose (sender == sender0) AND (nonce == req).
             // (Because pre-admission enforces that reveals for a commitment come from the true owner,
@@ -287,7 +302,10 @@ impl Mempool for MempoolImpl {
                         *next_required.get_mut(sender0.as_str()).unwrap() = req + 1;
                     }
                     None => {
-                        tracing::warn!("mempool: missing payload for IL reveal txid={:?}; skipping", txid);
+                        tracing::warn!(
+                            "mempool: missing payload for IL reveal txid={:?}; skipping",
+                            txid
+                        );
                         continue;
                     }
                 }
@@ -298,7 +316,9 @@ impl Mempool for MempoolImpl {
 
         // If any IL commitment couldn't be satisfied at the required nonce, selection must fail.
         if !missing_due_to_nonce.is_empty() {
-            return Err(SelectError::InclusionListUnmet { missing: missing_due_to_nonce });
+            return Err(SelectError::InclusionListUnmet {
+                missing: missing_due_to_nonce,
+            });
         }
 
         // Enforce reveal cap: IL must fit entirely.
@@ -306,7 +326,7 @@ impl Mempool for MempoolImpl {
             return Err(SelectError::InclusionListUnmet { missing: il });
         }
 
-       // --- Extra (non-IL) reveals with nonce continuity and fee order ---
+        // --- Extra (non-IL) reveals with nonce continuity and fee order ---
 
         let mut remaining = limits
             .max_reveals
@@ -320,21 +340,29 @@ impl Mempool for MempoolImpl {
 
             // Walk global fee_order (highest fee first, deterministic tie-breakers).
             for (_fee_key, txid) in reveals.fee_order.iter() {
-                if remaining == 0 { break; }
-                if selected_ids.contains(txid) { continue; }
+                if remaining == 0 {
+                    break;
+                }
+                if selected_ids.contains(txid) {
+                    continue;
+                }
 
                 let meta = match reveals.by_id.get(txid) {
                     Some(m) => m,
                     None => continue,
                 };
 
-                if il_set.contains(&meta.commitment) { continue; }
+                if il_set.contains(&meta.commitment) {
+                    continue;
+                }
 
-                let req = *next_required.entry(meta.sender.clone()).or_insert_with(|| {
-                    state.reveal_nonce_required(&meta.sender)
-                });
+                let req = *next_required
+                    .entry(meta.sender.clone())
+                    .or_insert_with(|| state.reveal_nonce_required(&meta.sender));
 
-                if meta.nonce != req { continue; }
+                if meta.nonce != req {
+                    continue;
+                }
 
                 if let Some((reveal, _cmt)) = reveals.payload_by_id.get(txid) {
                     selected_reveals.push(reveal.clone());
@@ -406,7 +434,6 @@ impl Mempool for MempoolImpl {
 
                 // Fetch payload; skip if any index inconsistency.
                 if let Some(commit_tx) = commits.payload_by_id.get(txid) {
-                    
                     // STATEVIEW CHECK BEFORE PUSHING A COMMIT TX
                     if state.pending_commit_room(&commit_tx.sender) == 0 {
                         continue; // sender at pending-capacity, skip
