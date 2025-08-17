@@ -36,8 +36,10 @@ pub fn string_bytes(s: &str) -> Vec<u8> {
 // Returns canonical bytes for AccessList (sorted + length-prefixed lists)
 // Reuse the same logic as put_access_list, but write into a fresh Vec and return it.
 pub fn access_list_bytes(al: &AccessList) -> Vec<u8> {
+    let mut canon = al.clone();
+    canon.canonicalize();
     let mut v = Vec::new();
-    put_access_list(&mut v, al);
+    put_access_list(&mut v, &canon);
     v
 }
 
