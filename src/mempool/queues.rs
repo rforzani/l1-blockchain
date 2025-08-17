@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::AdmissionError;
 use crate::codec::{access_list_bytes, tx_bytes, tx_enum_bytes};
-use crate::crypto::{commitment_hash, hash_bytes_sha256, is_hex_addr};
+use crate::crypto::{hash_bytes_sha256, is_hex_addr};
 use crate::mempool::{CommitmentId, TxId};
-use crate::state::{CHAIN_ID, MAX_AL_READS, MAX_AL_WRITES};
+use crate::state::{MAX_AL_READS, MAX_AL_WRITES};
 use crate::types::Hash;
 use crate::types::{AvailTx, CommitTx, RevealTx, StateKey, Tx};
 
@@ -237,11 +237,10 @@ impl AvailQueue {
 }
 
 impl RevealQueue {
-    fn precheck_reveal(
-        &self,
+    pub fn precheck_reveal_locked(
+        commits: &CommitQueue,
         r: &RevealTx,
         cmt: &Hash,
-        commits: &CommitQueue,
     ) -> Result<(), AdmissionError> {
         if r.sender != r.tx.from {
             return Err(AdmissionError::InvalidSignature);
@@ -257,29 +256,24 @@ impl RevealQueue {
         Ok(())
     }
 
-    /// Insert a Reveal. We compute the commitment from (tx_bytes, AL bytes, salt) the same way the STF does.
+    /// Insert a Reveal, assuming precheck has already been performed.
     pub fn insert_reveal_minimal(
         &mut self,
         r: &RevealTx,
-        commits: &CommitQueue,
+        cmt: &Hash,
         current_height: u64,
         fee_bid: u128,
-    ) -> Result<TxId, AdmissionError> {
+    ) -> TxId {
         let mut buf = tx_bytes(&r.tx);
         buf.extend_from_slice(&r.salt);
         let id = txid_from(&buf);
 
-        let tx_ser = tx_bytes(&r.tx);
         let al_bytes = access_list_bytes(&r.tx.access_list);
-        let cmt = commitment_hash(&tx_ser, &al_bytes, &r.salt, CHAIN_ID);
-
-        self.precheck_reveal(r, &cmt, commits)?;
-
         let al_digest = hash_bytes_sha256(&al_bytes);
 
         let item = RevealQueueItem {
             id,
-            commitment: CommitmentId(cmt),
+            commitment: CommitmentId(*cmt),
             sender: r.sender.clone(),
             nonce: r.tx.nonce,
             access_list_digest: al_digest,
@@ -288,14 +282,14 @@ impl RevealQueue {
         };
 
         self.by_commitment
-            .entry(CommitmentId(cmt))
+            .entry(CommitmentId(*cmt))
             .or_insert_with(BTreeMap::new)
             .insert((item.sender.clone(), item.nonce), id);
 
         self.fee_order.insert(item.key_for_fee_order(), id);
         self.by_id.insert(id, item);
         self.payload_by_id.insert(id, r.clone());
-        Ok(id)
+        id
     }
 }
 

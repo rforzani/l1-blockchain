@@ -7,6 +7,9 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use crate::codec::{access_list_bytes, tx_bytes};
+use crate::crypto::commitment_hash;
+use crate::state::CHAIN_ID;
 use crate::types::{RevealTx, Tx};
 pub mod queues;
 use queues::{AvailQueue, CommitQueue, RevealQueue};
@@ -193,9 +196,18 @@ impl Mempool for MempoolImpl {
         current_height: u64,
         fee_bid: u128,
     ) -> Result<TxId, AdmissionError> {
-        let commits = self.commits.read().unwrap();
+        let tx_ser = tx_bytes(&r.tx);
+        let al_bytes = access_list_bytes(&r.tx.access_list);
+        let cmt = commitment_hash(&tx_ser, &al_bytes, &r.salt, CHAIN_ID);
+
+        {
+            let commits = self.commits.read().unwrap();
+            RevealQueue::precheck_reveal_locked(&commits, &r, &cmt)?;
+        }
+
         let mut reveals = self.reveals.write().unwrap();
-        reveals.insert_reveal_minimal(&r, &commits, current_height, fee_bid)
+        let id = reveals.insert_reveal_minimal(&r, &cmt, current_height, fee_bid);
+        Ok(id)
     }
 
     fn select_block(
@@ -234,9 +246,14 @@ impl Mempool for MempoolImpl {
         for c in &il {
             let map = reveals.by_commitment.get(c).expect("exists and non-empty");
             let (_, txid) = map.iter().next().expect("non-empty map");
-            match reveals.payload_by_id.get(txid) {
-                Some(reveal) => selected_reveals.push(reveal.clone()),
-                None => return Err(SelectError::InclusionListUnmet { missing: vec![*c] }),
+            if let Some(reveal) = reveals.payload_by_id.get(txid) {
+                selected_reveals.push(reveal.clone());
+            } else {
+                tracing::error!(
+                    "Mempool inconsistency: payload missing for txid {:?}",
+                    txid
+                );
+                continue;
             }
         }
 
