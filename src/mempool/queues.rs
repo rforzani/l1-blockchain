@@ -6,7 +6,7 @@ use crate::types::Hash;
 use crate::mempool::{TxId, CommitmentId};
 use crate::codec::{tx_enum_bytes, tx_bytes, access_list_bytes};
 use crate::crypto::{hash_bytes_sha256, commitment_hash, is_hex_addr};
-use crate::state::{CHAIN_ID, MAX_AL_READS, MAX_AL_WRITES, MAX_PENDING_COMMITS_PER_ACCOUNT};
+use crate::state::{CHAIN_ID, MAX_AL_READS, MAX_AL_WRITES};
 use crate::types::{Tx, CommitTx, AvailTx, RevealTx, StateKey};
 use super::AdmissionError;
 
@@ -104,7 +104,7 @@ impl RevealQueueItem {
 }
 
 impl Queues {
-    fn precheck_commit(&self, c: &CommitTx) -> Result<(), AdmissionError> {
+    fn precheck_commit(&self, c: &CommitTx, max_pending: u32) -> Result<(), AdmissionError> {
         if !is_hex_addr(&c.sender) {
             return Err(AdmissionError::InvalidSignature);
         }
@@ -128,7 +128,7 @@ impl Queues {
             return Err(AdmissionError::BadAccessList);
         }
         let cnt = self.commits.pending_per_owner.get(&c.sender).copied().unwrap_or(0);
-        if cnt >= MAX_PENDING_COMMITS_PER_ACCOUNT {
+        if cnt >= max_pending as usize {
             return Err(AdmissionError::MempoolFullForAccount);
         }
         if self.commits.by_commitment.contains_key(&CommitmentId(c.commitment)) {
@@ -151,21 +151,24 @@ impl Queues {
         if r.sender != r.tx.from {
             return Err(AdmissionError::InvalidSignature);
         }
-        let tx_ser = tx_bytes(&r.tx);
-        let al_bytes = access_list_bytes(&r.tx.access_list);
-        let recomputed = commitment_hash(&tx_ser, &al_bytes, &r.salt, CHAIN_ID);
-        if &recomputed != cmt {
+        if !self
+            .commits
+            .by_commitment
+            .contains_key(&CommitmentId(*cmt))
+        {
             return Err(AdmissionError::MismatchedCommitment);
         }
-        if r.tx.access_list.reads.len() > MAX_AL_READS || r.tx.access_list.writes.len() > MAX_AL_WRITES {
+        if r.tx.access_list.reads.len() > MAX_AL_READS
+            || r.tx.access_list.writes.len() > MAX_AL_WRITES
+        {
             return Err(AdmissionError::BadAccessList);
         }
         Ok(())
     }
 
     /// Insert a Commit into the indexes after prechecking.
-    pub fn insert_commit_minimal(&mut self, c: &CommitTx, current_height: u64, fee_bid: u128) -> Result<TxId, AdmissionError> {
-        self.precheck_commit(c)?;
+    pub fn insert_commit_minimal(&mut self, c: &CommitTx, current_height: u64, fee_bid: u128, max_pending: u32) -> Result<TxId, AdmissionError> {
+        self.precheck_commit(c, max_pending)?;
 
         let enc = tx_enum_bytes(&Tx::Commit(c.clone()));
         let id = txid_from(&enc);
