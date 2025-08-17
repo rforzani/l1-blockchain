@@ -2,11 +2,14 @@
 
 #![allow(dead_code)]
 
-use std::{collections::HashSet, sync::{Arc, RwLock}};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::{Arc, RwLock},
+};
 
-use crate::types::{Tx, RevealTx};
+use crate::types::{RevealTx, Tx};
 pub mod queues;
-use queues::{CommitQueue, AvailQueue, RevealQueue};
+use queues::{AvailQueue, CommitQueue, RevealQueue};
 pub mod select;
 mod tests;
 
@@ -81,9 +84,24 @@ pub enum SelectError {
 /// Public mempool interface. Implementations live behind this trait.
 pub trait Mempool: Send + Sync {
     /// Typed inserts with admission context.
-    fn insert_commit(&self, tx: Tx, current_height: u64, fee_bid: u128) -> Result<TxId, AdmissionError>;
-    fn insert_avail(&self,  tx: Tx, current_height: u64, fee_bid: u128) -> Result<TxId, AdmissionError>;
-    fn insert_reveal(&self, tx: RevealTx, current_height: u64, fee_bid: u128) -> Result<TxId, AdmissionError>;
+    fn insert_commit(
+        &self,
+        tx: Tx,
+        current_height: u64,
+        fee_bid: u128,
+    ) -> Result<TxId, AdmissionError>;
+    fn insert_avail(
+        &self,
+        tx: Tx,
+        current_height: u64,
+        fee_bid: u128,
+    ) -> Result<TxId, AdmissionError>;
+    fn insert_reveal(
+        &self,
+        tx: RevealTx,
+        current_height: u64,
+        fee_bid: u128,
+    ) -> Result<TxId, AdmissionError>;
 
     fn select_block(
         &self,
@@ -118,7 +136,9 @@ impl MempoolImpl {
     }
 
     #[cfg(test)]
-    pub fn debug_read(&self) -> (
+    pub fn debug_read(
+        &self,
+    ) -> (
         std::sync::RwLockReadGuard<'_, CommitQueue>,
         std::sync::RwLockReadGuard<'_, AvailQueue>,
         std::sync::RwLockReadGuard<'_, RevealQueue>,
@@ -132,17 +152,32 @@ impl MempoolImpl {
 }
 
 impl Mempool for MempoolImpl {
-    fn insert_commit(&self, tx: Tx, current_height: u64, fee_bid: u128) -> Result<TxId, AdmissionError> {
+    fn insert_commit(
+        &self,
+        tx: Tx,
+        current_height: u64,
+        fee_bid: u128,
+    ) -> Result<TxId, AdmissionError> {
         match tx {
             Tx::Commit(c) => {
                 let mut commits = self.commits.write().unwrap();
-                commits.insert_commit_minimal(&c, current_height, fee_bid, self.config.max_pending_commits_per_account)
+                commits.insert_commit_minimal(
+                    &c,
+                    current_height,
+                    fee_bid,
+                    self.config.max_pending_commits_per_account,
+                )
             }
             _ => Err(AdmissionError::WrongTxType),
         }
     }
 
-    fn insert_avail(&self, tx: Tx, current_height: u64, fee_bid: u128) -> Result<TxId, AdmissionError> {
+    fn insert_avail(
+        &self,
+        tx: Tx,
+        current_height: u64,
+        fee_bid: u128,
+    ) -> Result<TxId, AdmissionError> {
         match tx {
             Tx::Avail(a) => {
                 let mut avails = self.avails.write().unwrap();
@@ -152,7 +187,12 @@ impl Mempool for MempoolImpl {
         }
     }
 
-    fn insert_reveal(&self, r: RevealTx, current_height: u64, fee_bid: u128) -> Result<TxId, AdmissionError> {
+    fn insert_reveal(
+        &self,
+        r: RevealTx,
+        current_height: u64,
+        fee_bid: u128,
+    ) -> Result<TxId, AdmissionError> {
         let commits = self.commits.read().unwrap();
         let mut reveals = self.reveals.write().unwrap();
         reveals.insert_reveal_minimal(&r, &commits, current_height, fee_bid)
@@ -166,17 +206,21 @@ impl Mempool for MempoolImpl {
         // Assumption: StateView returns IL in canonical, deterministic order.
         let height = state.current_height();
         let il = state.commitments_due_and_available(height);
-    
+
         let commits = self.commits.read().expect("commit queue poisoned");
-        let avails = self.avails.read().expect("avail queue poisoned");
+        let mut avails = self.avails.write().expect("avail queue poisoned");
         let reveals = self.reveals.read().expect("reveal queue poisoned");
-    
+
         // --- Mandatory reveals for IL ---
-    
+
         // Early fail if any IL commitment lacks a reveal.
         let mut missing = Vec::new();
         for c in &il {
-            let have_any = reveals.by_commitment.get(c).map(|m| !m.is_empty()).unwrap_or(false);
+            let have_any = reveals
+                .by_commitment
+                .get(c)
+                .map(|m| !m.is_empty())
+                .unwrap_or(false);
             if !have_any {
                 missing.push(*c);
             }
@@ -184,7 +228,7 @@ impl Mempool for MempoolImpl {
         if !missing.is_empty() {
             return Err(SelectError::InclusionListUnmet { missing });
         }
-    
+
         // Pick the *respective* reveal for each IL commitment deterministically.
         let mut selected_reveals = Vec::with_capacity(il.len());
         for c in &il {
@@ -200,34 +244,59 @@ impl Mempool for MempoolImpl {
         if (selected_reveals.len() as u32) > limits.max_reveals {
             return Err(SelectError::InclusionListUnmet { missing: il });
         }
-    
+
         // --- Avails: ready_at <= height, fee-desc order, skip IL commitments ---
-    
+
         // Build a small skip set of IL commitments.
         let il_set: HashSet<_> = il.iter().copied().collect();
-    
+
         let mut txs: Vec<Tx> = Vec::new();
         let mut avails_added: u32 = 0;
-    
-        if limits.max_avails > 0 {
-            // fee_order key = (neg_fee, sender). Iteration is highest-fee-first by construction.
-            for (_, txid) in avails.fee_order.iter() {
+
+        // Gather all avails whose ready_at is <= height.
+        let not_ready = avails.ready_index.split_off(&(height + 1));
+        let ready_entries = std::mem::replace(&mut avails.ready_index, not_ready);
+        let mut ready_ids = Vec::new();
+        for (_h, id) in ready_entries {
+            ready_ids.push(id);
+        }
+
+        if limits.max_avails > 0 && !ready_ids.is_empty() {
+            // Build fee-ordered view of just-ready avails.
+            let mut fee_ready: BTreeMap<(i128, String), TxId> = BTreeMap::new();
+            for txid in &ready_ids {
+                if let Some(meta) = avails.by_id.get(txid) {
+                    let key = (-(meta.fee_bid as i128), meta.sender.clone());
+                    fee_ready.insert(key, *txid);
+                }
+            }
+
+            let mut included: HashSet<TxId> = HashSet::new();
+            for (_, txid) in fee_ready.iter() {
                 if avails_added >= limits.max_avails {
                     break;
                 }
-                // Peek metadata to check eligibility.
                 let meta = match avails.by_id.get(txid) {
                     Some(m) => m,
-                    None => continue, // inconsistent index; skip defensively
+                    None => continue,
                 };
-                // Skip if this commitment is already due/available (IL), or not yet ready.
-                if il_set.contains(&meta.commitment) || meta.ready_at > height {
+                if il_set.contains(&meta.commitment) {
                     continue;
                 }
-                // Fetch payload and push.
                 if let Some(avail) = avails.payload_by_id.get(txid) {
                     txs.push(Tx::Avail(avail.clone()));
                     avails_added += 1;
+                    included.insert(*txid);
+                }
+            }
+
+            // Reinsert any not-included ready ids for future blocks.
+            for txid in ready_ids {
+                if included.contains(&txid) {
+                    continue;
+                }
+                if let Some(ready_at) = avails.by_id.get(&txid).map(|m| m.ready_at) {
+                    avails.ready_index.insert(ready_at, txid);
                 }
             }
         }
@@ -250,10 +319,12 @@ impl Mempool for MempoolImpl {
                 }
             }
         }
-    
-        Ok(BlockCandidate { txs, reveals: selected_reveals })
+
+        Ok(BlockCandidate {
+            txs,
+            reveals: selected_reveals,
+        })
     }
-    
 
     fn mark_included(&self, txs: &[TxId], _height: u64) {
         let mut commits = self.commits.write().expect("commit queue poisoned");
