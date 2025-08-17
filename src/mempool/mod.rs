@@ -234,11 +234,24 @@ impl Mempool for MempoolImpl {
     }
     
 
-    fn mark_included(&self, _txs: &[TxId], _height: u64) {
-        // no-op for now
+    fn mark_included(&self, txs: &[TxId], _height: u64) {
+        let mut q = self.queues.write().expect("mempool queues poisoned");
+        for id in txs {
+            let _kind = q.evict_any(id);
+        }
     }
 
-    fn evict_stale(&self, _current_height: u64) {
-        // no-op for now
+    fn evict_stale(&self, current_height: u64) {
+        let mut q = self.queues.write().expect("mempool queues poisoned");
+        // For now we reuse commit_ttl_blocks for Avails too; can be split later.
+        let commit_ttl = self.config.commit_ttl_blocks;
+        let reveal_win = self.config.reveal_window_blocks;
+    
+        let purged_commits = q.commits.purge_older_than(current_height, commit_ttl);
+        let purged_avails  = q.avails.purge_older_than(current_height, commit_ttl);
+        let purged_reveals = q.reveals.purge_older_than(current_height, reveal_win);
+    
+        // (Optional) log or trace these counts.
+        let _ = (purged_commits, purged_avails, purged_reveals);
     }
 }

@@ -211,6 +211,37 @@ fn reveal_commitment_mismatch_rejected() {
 }
 
 #[test]
+fn mark_included_evicts_and_decrements() {
+    let mp = MempoolImpl::new(cfg());
+    let sender = addr(42);
+
+    // insert 2 commits for same sender
+    let (c1, _, _, _) = make_commit(&sender, 0);
+    let (c2, _, _, _) = make_commit(&sender, 1);
+    let id1 = mp.insert_commit(Tx::Commit(c1), 100, 10).unwrap();
+    let id2 = mp.insert_commit(Tx::Commit(c2), 100, 20).unwrap();
+
+    // before: pending count should be 2
+    {
+        let q = mp.queues.read().unwrap();
+        let cnt = q.commits.pending_per_owner.get(&sender).copied().unwrap_or(0);
+        assert_eq!(cnt, 2);
+    }
+
+    // mark the first included
+    mp.mark_included(&[id1], 101);
+
+    // after: 1 left; id1 gone; id2 remains
+    {
+        let q = mp.queues.read().unwrap();
+        assert!(q.commits.by_id.get(&id1).is_none());
+        assert!(q.commits.by_id.get(&id2).is_some());
+        let cnt = q.commits.pending_per_owner.get(&sender).copied().unwrap_or(0);
+        assert_eq!(cnt, 1);
+    }
+}
+
+#[test]
 fn queues_index_coherence() {
     let mp = MempoolImpl::new(cfg());
     let sender = addr(9);
@@ -242,6 +273,60 @@ fn selection_inclusion_list_missing() {
         _ => panic!("expected InclusionListUnmet"),
     }
 }
+
+#[test]
+fn evict_stale_drops_old_entries_and_updates_pending_count() {
+    // Tight TTLs so we can see evictions clearly.
+    let mut cfg = cfg();
+    cfg.commit_ttl_blocks = 5;
+    cfg.reveal_window_blocks = 3;
+
+    let mp = MempoolImpl::new(cfg);
+    let sender = addr(55);
+
+    // Two commits from the same sender:
+    // - c1 at height 100 (age at purge=2) => remains
+    // - c2 at height 96  (age at purge=6) => evicted
+    let (c1, _tx1, _salt1, _cm1) = make_commit(&sender, 0);
+    let (c2,  tx2,  salt2, _cm2) = make_commit(&sender, 1);
+
+    let id1 = mp.insert_commit(Tx::Commit(c1), 100, 1).unwrap();
+    let id2 = mp.insert_commit(Tx::Commit(c2),  96, 1).unwrap();
+
+    // Matching reveal for c2 (uses the same tx2 + salt2), and make it old enough to purge.
+    let r2 = make_reveal(&sender, tx2, salt2);
+    let _rid2 = mp.insert_reveal(r2, 95, 1).unwrap();
+
+    // Before purge: pending commits = 2, one reveal present
+    {
+        let q = mp.queues.read().unwrap();
+        let cnt = q.commits.pending_per_owner.get(&sender).copied().unwrap_or(0);
+        assert_eq!(cnt, 2, "expected two pending commits before purge");
+        assert_eq!(q.reveals.by_id.len(), 1, "expected one reveal before purge");
+    }
+
+    // Purge at height 102:
+    // - commit at 96 (age 6) should drop (ttl=5)
+    // - reveal at 95 (age 7) should drop (window=3)
+    mp.evict_stale(102);
+
+    // After purge:
+    {
+        let q = mp.queues.read().unwrap();
+
+        // c1 remains, c2 evicted
+        assert!(q.commits.by_id.get(&id1).is_some(), "c1 should remain");
+        assert!(q.commits.by_id.get(&id2).is_none(), "c2 should be evicted");
+
+        // pending count decremented to 1
+        let cnt = q.commits.pending_per_owner.get(&sender).copied().unwrap_or(0);
+        assert_eq!(cnt, 1, "pending count should decrement after eviction");
+
+        // reveal queue emptied by TTL
+        assert_eq!(q.reveals.by_id.len(), 0, "reveals should be purged");
+    }
+}
+
 
 // ------------------------------ tiny assertions ------------------------------
 

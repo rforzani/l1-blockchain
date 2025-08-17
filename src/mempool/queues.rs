@@ -1,5 +1,6 @@
 // src/mempool/queues.rs
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, BTreeMap};
 
 use crate::types::Hash;
@@ -44,6 +45,10 @@ pub struct RevealQueueItem {
     pub fee_bid: u128,
     pub arrival_height: u64,
 }
+
+/// Enum to introspect what was evicted
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictKind { Commit, Avail, Reveal, None }
 
 /// --- Minimal indices (no behavior yet) ---
 /// We'll flesh these out later; for now they make types visible and compile.
@@ -256,6 +261,113 @@ impl Queues {
         self.reveals.by_id.insert(id, item);
         self.reveals.payload_by_id.insert(id, r.clone());
         Ok(id)
+    }
+
+    pub fn evict_any(&mut self, id: &crate::mempool::TxId) -> EvictKind {
+        if self.commits.evict_by_id(id) {
+            EvictKind::Commit
+        } else if self.avails.evict_by_id(id) {
+            EvictKind::Avail
+        } else if self.reveals.evict_by_id(id) {
+            EvictKind::Reveal
+        } else {
+            EvictKind::None
+        }
+    }
+}
+
+impl CommitQueue {
+    pub fn purge_older_than(&mut self, current_height: u64, ttl_blocks: u32) -> usize {
+        let cutoff = current_height.saturating_sub(ttl_blocks as u64);
+        let ids: Vec<_> = self
+            .by_id
+            .iter()
+            .filter_map(|(id, item)| (item.arrival_height <= cutoff).then_some(*id))
+            .collect();
+        for id in &ids {
+            let _ = self.evict_by_id(id);
+        }
+        ids.len()
+    }
+
+    /// Remove a commit by TxId from all indices; decrement pending counter.
+    pub fn evict_by_id(&mut self, id: &crate::mempool::TxId) -> bool {
+        if let Some(item) = self.by_id.remove(id) {
+            // secondary indices
+            self.by_commitment.remove(&item.commitment);
+            self.fee_order.remove(&item.key_for_fee_order());
+            self.payload_by_id.remove(id);
+
+            // decrement per-owner pending counter (never underflow)
+            if let Entry::Occupied(mut e) = self.pending_per_owner.entry(item.sender) {
+                let v = e.get_mut();
+                if *v > 0 { *v -= 1; }
+                if *v == 0 { e.remove_entry(); }
+            }
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl AvailQueue {
+    pub fn purge_older_than(&mut self, current_height: u64, ttl_blocks: u32) -> usize {
+        let cutoff = current_height.saturating_sub(ttl_blocks as u64);
+        let ids: Vec<_> = self
+            .by_id
+            .iter()
+            .filter_map(|(id, item)| (item.arrival_height <= cutoff).then_some(*id))
+            .collect();
+        for id in &ids {
+            let _ = self.evict_by_id(id);
+        }
+        ids.len()
+    }
+
+    /// Remove an avail by TxId from all indices.
+    pub fn evict_by_id(&mut self, id: &crate::mempool::TxId) -> bool {
+        if let Some(item) = self.by_id.remove(id) {
+            self.by_commitment.remove(&item.commitment);
+            self.fee_order.remove(&item.key_for_fee_order());
+            self.payload_by_id.remove(id);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl RevealQueue {
+    /// Remove a reveal by TxId from all indices.
+    pub fn evict_by_id(&mut self, id: &crate::mempool::TxId) -> bool {
+        if let Some(item) = self.by_id.remove(id) {
+            if let Some(tree) = self.by_commitment.get_mut(&item.commitment) {
+                tree.remove(&(item.sender.clone(), item.nonce));
+                if tree.is_empty() {
+                    // Optional: free empty bucket
+                    self.by_commitment.remove(&item.commitment);
+                }
+            }
+            self.fee_order.remove(&item.key_for_fee_order());
+            self.payload_by_id.remove(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn purge_older_than(&mut self, current_height: u64, window_blocks: u32) -> usize {
+        let cutoff = current_height.saturating_sub(window_blocks as u64);
+        let ids: Vec<_> = self
+            .by_id
+            .iter()
+            .filter_map(|(id, item)| (item.arrival_height <= cutoff).then_some(*id))
+            .collect();
+        for id in &ids {
+            let _ = self.evict_by_id(id);
+        }
+        ids.len()
     }
 }
 
