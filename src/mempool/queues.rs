@@ -183,3 +183,68 @@ impl Queues {
         id
     }
 }
+
+impl Default for CommitQueue {
+    fn default() -> Self {
+        Self {
+            by_id: HashMap::new(),
+            by_commitment: HashMap::new(),
+            fee_order: BTreeMap::new(),
+        }
+    }
+}
+
+impl Default for AvailQueue {
+    fn default() -> Self {
+        Self {
+            by_id: HashMap::new(),
+            by_commitment: HashMap::new(),
+            fee_order: BTreeMap::new(),
+        }
+    }
+}
+
+impl Default for RevealQueue {
+    fn default() -> Self {
+        Self {
+            by_id: HashMap::new(),
+            by_commitment: HashMap::new(),
+            fee_order: BTreeMap::new(),
+        }
+    }
+}
+
+impl Default for Queues {
+    fn default() -> Self {
+        Self {
+            commits: CommitQueue::default(),
+            avails: AvailQueue::default(),
+            reveals: RevealQueue::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_queues_are_empty() {
+        let q = Queues::default();
+
+        // Commits
+        assert!(q.commits.by_id.is_empty());
+        assert!(q.commits.by_commitment.is_empty());
+        assert!(q.commits.fee_order.is_empty());
+
+        // Avails
+        assert!(q.avails.by_id.is_empty());
+        assert!(q.avails.by_commitment.is_empty());
+        assert!(q.avails.fee_order.is_empty());
+
+        // Reveals
+        assert!(q.reveals.by_id.is_empty());
+        assert!(q.reveals.by_commitment.is_empty());
+        assert!(q.reveals.fee_order.is_empty());
+    }
+}
