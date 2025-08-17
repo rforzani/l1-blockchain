@@ -57,12 +57,16 @@ pub struct CommitQueue {
     pub fee_order: BTreeMap<(i128, String), TxId>, // key: (-fee_bid as i128, sender)
     /// pending commits per owner
     pub pending_per_owner: HashMap<String, usize>,
+    /// transaction payload mapped to its id
+    pub payload_by_id: HashMap<TxId, CommitTx>,
+
 }
 
 pub struct AvailQueue {
     pub by_id: HashMap<TxId, AvailQueueItem>,
     pub by_commitment: HashMap<CommitmentId, TxId>,
     pub fee_order: BTreeMap<(i128, String), TxId>,
+    pub payload_by_id: HashMap<TxId, AvailTx>,
 }
 
 pub struct RevealQueue {
@@ -71,6 +75,8 @@ pub struct RevealQueue {
     pub by_commitment: HashMap<CommitmentId, BTreeMap<(String, u64), TxId>>,
     /// fee-ordered view for extra (non-mandatory) reveals
     pub fee_order: BTreeMap<(i128, String, u64), TxId>, // (-fee, sender, nonce)
+    /// transaction payload mapped to its id
+    pub payload_by_id: HashMap<TxId, RevealTx>,
 }
 
 /// A tiny helper to build TxId from any bytes (stable 32-byte hash).
@@ -189,6 +195,7 @@ impl Queues {
         self.commits.fee_order.insert(item.key_for_fee_order(), id);
         self.commits.by_id.insert(id, item);
         *self.commits.pending_per_owner.entry(c.sender.clone()).or_insert(0) += 1;
+        self.commits.payload_by_id.insert(id, c.clone());
         Ok(id)
     }
 
@@ -211,6 +218,7 @@ impl Queues {
         self.avails.by_commitment.insert(CommitmentId(a.commitment), id);
         self.avails.fee_order.insert(item.key_for_fee_order(), id);
         self.avails.by_id.insert(id, item);
+        self.avails.payload_by_id.insert(id, a.clone());
         Ok(id)
     }
 
@@ -246,6 +254,7 @@ impl Queues {
 
         self.reveals.fee_order.insert(item.key_for_fee_order(), id);
         self.reveals.by_id.insert(id, item);
+        self.reveals.payload_by_id.insert(id, r.clone());
         Ok(id)
     }
 }
@@ -257,6 +266,7 @@ impl Default for CommitQueue {
             by_commitment: HashMap::new(),
             fee_order: BTreeMap::new(),
             pending_per_owner: HashMap::new(),
+            payload_by_id: HashMap::new()
         }
     }
 }
@@ -267,6 +277,7 @@ impl Default for AvailQueue {
             by_id: HashMap::new(),
             by_commitment: HashMap::new(),
             fee_order: BTreeMap::new(),
+            payload_by_id: HashMap::new()
         }
     }
 }
@@ -277,6 +288,7 @@ impl Default for RevealQueue {
             by_id: HashMap::new(),
             by_commitment: HashMap::new(),
             fee_order: BTreeMap::new(),
+            payload_by_id: HashMap::new()
         }
     }
 }
@@ -304,15 +316,18 @@ mod tests {
         assert!(q.commits.by_commitment.is_empty());
         assert!(q.commits.fee_order.is_empty());
         assert!(q.commits.pending_per_owner.is_empty());
+        assert!(q.commits.payload_by_id.is_empty());
 
         // Avails
         assert!(q.avails.by_id.is_empty());
         assert!(q.avails.by_commitment.is_empty());
         assert!(q.avails.fee_order.is_empty());
+        assert!(q.avails.payload_by_id.is_empty());
 
         // Reveals
         assert!(q.reveals.by_id.is_empty());
         assert!(q.reveals.by_commitment.is_empty());
         assert!(q.reveals.fee_order.is_empty());
+        assert!(q.reveals.payload_by_id.is_empty());
     }
 }
