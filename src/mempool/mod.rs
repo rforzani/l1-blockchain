@@ -6,6 +6,7 @@ use std::{collections::HashSet, sync::{Arc, RwLock}};
 
 use crate::types::{Tx, RevealTx};
 pub mod queues;
+use queues::{CommitQueue, AvailQueue, RevealQueue};
 pub mod select;
 mod tests;
 
@@ -101,15 +102,32 @@ pub trait Mempool: Send + Sync {
 
 pub struct MempoolImpl {
     config: MempoolConfig,
-    queues: RwLock<queues::Queues>,
+    commits: RwLock<CommitQueue>,
+    avails: RwLock<AvailQueue>,
+    reveals: RwLock<RevealQueue>,
 }
 
 impl MempoolImpl {
     pub fn new(config: MempoolConfig) -> Arc<Self> {
         Arc::new(Self {
             config,
-            queues: RwLock::new(queues::Queues::default()),
+            commits: RwLock::new(CommitQueue::default()),
+            avails: RwLock::new(AvailQueue::default()),
+            reveals: RwLock::new(RevealQueue::default()),
         })
+    }
+
+    #[cfg(test)]
+    pub fn debug_read(&self) -> (
+        std::sync::RwLockReadGuard<'_, CommitQueue>,
+        std::sync::RwLockReadGuard<'_, AvailQueue>,
+        std::sync::RwLockReadGuard<'_, RevealQueue>,
+    ) {
+        (
+            self.commits.read().unwrap(),
+            self.avails.read().unwrap(),
+            self.reveals.read().unwrap(),
+        )
     }
 }
 
@@ -117,8 +135,8 @@ impl Mempool for MempoolImpl {
     fn insert_commit(&self, tx: Tx, current_height: u64, fee_bid: u128) -> Result<TxId, AdmissionError> {
         match tx {
             Tx::Commit(c) => {
-                let mut q = self.queues.write().unwrap();
-                q.insert_commit_minimal(&c, current_height, fee_bid, self.config.max_pending_commits_per_account)
+                let mut commits = self.commits.write().unwrap();
+                commits.insert_commit_minimal(&c, current_height, fee_bid, self.config.max_pending_commits_per_account)
             }
             _ => Err(AdmissionError::WrongTxType),
         }
@@ -127,16 +145,17 @@ impl Mempool for MempoolImpl {
     fn insert_avail(&self, tx: Tx, current_height: u64, fee_bid: u128) -> Result<TxId, AdmissionError> {
         match tx {
             Tx::Avail(a) => {
-                let mut q = self.queues.write().unwrap();
-                q.insert_avail_minimal(&a, current_height, fee_bid)
+                let mut avails = self.avails.write().unwrap();
+                avails.insert_avail_minimal(&a, current_height, fee_bid)
             }
             _ => Err(AdmissionError::WrongTxType),
         }
     }
 
     fn insert_reveal(&self, r: RevealTx, current_height: u64, fee_bid: u128) -> Result<TxId, AdmissionError> {
-        let mut q = self.queues.write().unwrap();
-        q.insert_reveal_minimal(&r, current_height, fee_bid)
+        let commits = self.commits.read().unwrap();
+        let mut reveals = self.reveals.write().unwrap();
+        reveals.insert_reveal_minimal(&r, &commits, current_height, fee_bid)
     }
 
     fn select_block(
@@ -148,14 +167,16 @@ impl Mempool for MempoolImpl {
         let height = state.current_height();
         let il = state.commitments_due_and_available(height);
     
-        let q = self.queues.read().expect("mempool queues poisoned");
+        let commits = self.commits.read().expect("commit queue poisoned");
+        let avails = self.avails.read().expect("avail queue poisoned");
+        let reveals = self.reveals.read().expect("reveal queue poisoned");
     
         // --- Mandatory reveals for IL ---
     
         // Early fail if any IL commitment lacks a reveal.
         let mut missing = Vec::new();
         for c in &il {
-            let have_any = q.reveals.by_commitment.get(c).map(|m| !m.is_empty()).unwrap_or(false);
+            let have_any = reveals.by_commitment.get(c).map(|m| !m.is_empty()).unwrap_or(false);
             if !have_any {
                 missing.push(*c);
             }
@@ -165,18 +186,18 @@ impl Mempool for MempoolImpl {
         }
     
         // Pick the *respective* reveal for each IL commitment deterministically.
-        let mut reveals = Vec::with_capacity(il.len());
+        let mut selected_reveals = Vec::with_capacity(il.len());
         for c in &il {
-            let map = q.reveals.by_commitment.get(c).expect("exists and non-empty");
+            let map = reveals.by_commitment.get(c).expect("exists and non-empty");
             let (_, txid) = map.iter().next().expect("non-empty map");
-            match q.reveals.payload_by_id.get(txid) {
-                Some(reveal) => reveals.push(reveal.clone()),
+            match reveals.payload_by_id.get(txid) {
+                Some(reveal) => selected_reveals.push(reveal.clone()),
                 None => return Err(SelectError::InclusionListUnmet { missing: vec![*c] }),
             }
         }
-    
+
         // Enforce reveal cap: IL must fit entirely.
-        if (reveals.len() as u32) > limits.max_reveals {
+        if (selected_reveals.len() as u32) > limits.max_reveals {
             return Err(SelectError::InclusionListUnmet { missing: il });
         }
     
@@ -190,12 +211,12 @@ impl Mempool for MempoolImpl {
     
         if limits.max_avails > 0 {
             // fee_order key = (neg_fee, sender). Iteration is highest-fee-first by construction.
-            for (_, txid) in q.avails.fee_order.iter() {
+            for (_, txid) in avails.fee_order.iter() {
                 if avails_added >= limits.max_avails {
                     break;
                 }
                 // Peek metadata to check eligibility.
-                let meta = match q.avails.by_id.get(txid) {
+                let meta = match avails.by_id.get(txid) {
                     Some(m) => m,
                     None => continue, // inconsistent index; skip defensively
                 };
@@ -204,7 +225,7 @@ impl Mempool for MempoolImpl {
                     continue;
                 }
                 // Fetch payload and push.
-                if let Some(avail) = q.avails.payload_by_id.get(txid) {
+                if let Some(avail) = avails.payload_by_id.get(txid) {
                     txs.push(Tx::Avail(avail.clone()));
                     avails_added += 1;
                 }
@@ -217,12 +238,12 @@ impl Mempool for MempoolImpl {
 
         if limits.max_commits > 0 {
             // fee_order key = (neg_fee, sender). Iteration is highest-fee-first by construction.
-            for (_, txid) in q.commits.fee_order.iter() {
+            for (_, txid) in commits.fee_order.iter() {
                 if commits_added >= limits.max_commits {
                     break;
                 }
                 // Fetch payload; skip if any index inconsistency.
-                if let Some(commit_tx) = q.commits.payload_by_id.get(txid) {
+                if let Some(commit_tx) = commits.payload_by_id.get(txid) {
                     // (Optional future: consult StateView for per-account pending limit)
                     txs.push(Tx::Commit(commit_tx.clone()));
                     commits_added += 1;
@@ -230,27 +251,43 @@ impl Mempool for MempoolImpl {
             }
         }
     
-        Ok(BlockCandidate { txs, reveals })
+        Ok(BlockCandidate { txs, reveals: selected_reveals })
     }
     
 
     fn mark_included(&self, txs: &[TxId], _height: u64) {
-        let mut q = self.queues.write().expect("mempool queues poisoned");
+        let mut commits = self.commits.write().expect("commit queue poisoned");
+        let mut avails = self.avails.write().expect("avail queue poisoned");
+        let mut reveals = self.reveals.write().expect("reveal queue poisoned");
         for id in txs {
-            let _kind = q.evict_any(id);
+            if commits.evict_by_id(id) {
+                continue;
+            }
+            if avails.evict_by_id(id) {
+                continue;
+            }
+            let _ = reveals.evict_by_id(id);
         }
     }
 
     fn evict_stale(&self, current_height: u64) {
-        let mut q = self.queues.write().expect("mempool queues poisoned");
         // For now we reuse commit_ttl_blocks for Avails too; can be split later.
         let commit_ttl = self.config.commit_ttl_blocks;
         let reveal_win = self.config.reveal_window_blocks;
-    
-        let purged_commits = q.commits.purge_older_than(current_height, commit_ttl);
-        let purged_avails  = q.avails.purge_older_than(current_height, commit_ttl);
-        let purged_reveals = q.reveals.purge_older_than(current_height, reveal_win);
-    
+
+        let purged_commits = {
+            let mut commits = self.commits.write().expect("commit queue poisoned");
+            commits.purge_older_than(current_height, commit_ttl)
+        };
+        let purged_avails = {
+            let mut avails = self.avails.write().expect("avail queue poisoned");
+            avails.purge_older_than(current_height, commit_ttl)
+        };
+        let purged_reveals = {
+            let mut reveals = self.reveals.write().expect("reveal queue poisoned");
+            reveals.purge_older_than(current_height, reveal_win)
+        };
+
         // (Optional) log or trace these counts.
         let _ = (purged_commits, purged_avails, purged_reveals);
     }

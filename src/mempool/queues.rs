@@ -113,8 +113,7 @@ impl RevealQueueItem {
         (-(self.fee_bid as i128), self.sender.clone(), self.nonce)
     }
 }
-
-impl Queues {
+impl CommitQueue {
     fn precheck_commit(&self, c: &CommitTx, max_pending: u32) -> Result<(), AdmissionError> {
         if !is_hex_addr(&c.sender) {
             return Err(AdmissionError::InvalidSignature);
@@ -138,41 +137,12 @@ impl Queues {
         if !has_req {
             return Err(AdmissionError::BadAccessList);
         }
-        let cnt = self.commits.pending_per_owner.get(&c.sender).copied().unwrap_or(0);
+        let cnt = self.pending_per_owner.get(&c.sender).copied().unwrap_or(0);
         if cnt >= max_pending as usize {
             return Err(AdmissionError::MempoolFullForAccount);
         }
-        if self.commits.by_commitment.contains_key(&CommitmentId(c.commitment)) {
+        if self.by_commitment.contains_key(&CommitmentId(c.commitment)) {
             return Err(AdmissionError::Duplicate);
-        }
-        Ok(())
-    }
-
-    fn precheck_avail(&self, a: &AvailTx) -> Result<(), AdmissionError> {
-        if !is_hex_addr(&a.sender) {
-            return Err(AdmissionError::InvalidSignature);
-        }
-        if self.avails.by_commitment.contains_key(&CommitmentId(a.commitment)) {
-            return Err(AdmissionError::Duplicate);
-        }
-        Ok(())
-    }
-
-    fn precheck_reveal(&self, r: &RevealTx, cmt: &Hash) -> Result<(), AdmissionError> {
-        if r.sender != r.tx.from {
-            return Err(AdmissionError::InvalidSignature);
-        }
-        if !self
-            .commits
-            .by_commitment
-            .contains_key(&CommitmentId(*cmt))
-        {
-            return Err(AdmissionError::MismatchedCommitment);
-        }
-        if r.tx.access_list.reads.len() > MAX_AL_READS
-            || r.tx.access_list.writes.len() > MAX_AL_WRITES
-        {
-            return Err(AdmissionError::BadAccessList);
         }
         Ok(())
     }
@@ -196,12 +166,24 @@ impl Queues {
             arrival_height: current_height,
         };
 
-        self.commits.by_commitment.insert(CommitmentId(c.commitment), id);
-        self.commits.fee_order.insert(item.key_for_fee_order(), id);
-        self.commits.by_id.insert(id, item);
-        *self.commits.pending_per_owner.entry(c.sender.clone()).or_insert(0) += 1;
-        self.commits.payload_by_id.insert(id, c.clone());
+        self.by_commitment.insert(CommitmentId(c.commitment), id);
+        self.fee_order.insert(item.key_for_fee_order(), id);
+        self.by_id.insert(id, item);
+        *self.pending_per_owner.entry(c.sender.clone()).or_insert(0) += 1;
+        self.payload_by_id.insert(id, c.clone());
         Ok(id)
+    }
+}
+
+impl AvailQueue {
+    fn precheck_avail(&self, a: &AvailTx) -> Result<(), AdmissionError> {
+        if !is_hex_addr(&a.sender) {
+            return Err(AdmissionError::InvalidSignature);
+        }
+        if self.by_commitment.contains_key(&CommitmentId(a.commitment)) {
+            return Err(AdmissionError::Duplicate);
+        }
+        Ok(())
     }
 
     /// Insert an Avail. We don't compute ready_at here (need state); set it to current_height for now.
@@ -220,15 +202,30 @@ impl Queues {
             arrival_height: current_height,
         };
 
-        self.avails.by_commitment.insert(CommitmentId(a.commitment), id);
-        self.avails.fee_order.insert(item.key_for_fee_order(), id);
-        self.avails.by_id.insert(id, item);
-        self.avails.payload_by_id.insert(id, a.clone());
+        self.by_commitment.insert(CommitmentId(a.commitment), id);
+        self.fee_order.insert(item.key_for_fee_order(), id);
+        self.by_id.insert(id, item);
+        self.payload_by_id.insert(id, a.clone());
         Ok(id)
+    }
+}
+
+impl RevealQueue {
+    fn precheck_reveal(&self, r: &RevealTx, cmt: &Hash, commits: &CommitQueue) -> Result<(), AdmissionError> {
+        if r.sender != r.tx.from {
+            return Err(AdmissionError::InvalidSignature);
+        }
+        if !commits.by_commitment.contains_key(&CommitmentId(*cmt)) {
+            return Err(AdmissionError::MismatchedCommitment);
+        }
+        if r.tx.access_list.reads.len() > MAX_AL_READS || r.tx.access_list.writes.len() > MAX_AL_WRITES {
+            return Err(AdmissionError::BadAccessList);
+        }
+        Ok(())
     }
 
     /// Insert a Reveal. We compute the commitment from (tx_bytes, AL bytes, salt) the same way the STF does.
-    pub fn insert_reveal_minimal(&mut self, r: &RevealTx, current_height: u64, fee_bid: u128) -> Result<TxId, AdmissionError> {
+    pub fn insert_reveal_minimal(&mut self, r: &RevealTx, commits: &CommitQueue, current_height: u64, fee_bid: u128) -> Result<TxId, AdmissionError> {
         let mut buf = tx_bytes(&r.tx);
         buf.extend_from_slice(&r.salt);
         let id = txid_from(&buf);
@@ -237,7 +234,7 @@ impl Queues {
         let al_bytes = access_list_bytes(&r.tx.access_list);
         let cmt = commitment_hash(&tx_ser, &al_bytes, &r.salt, CHAIN_ID);
 
-        self.precheck_reveal(r, &cmt)?;
+        self.precheck_reveal(r, &cmt, commits)?;
 
         let al_digest = hash_bytes_sha256(&al_bytes);
 
@@ -251,18 +248,19 @@ impl Queues {
             arrival_height: current_height,
         };
 
-        self.reveals
-            .by_commitment
+        self.by_commitment
             .entry(CommitmentId(cmt))
             .or_insert_with(BTreeMap::new)
             .insert((item.sender.clone(), item.nonce), id);
 
-        self.reveals.fee_order.insert(item.key_for_fee_order(), id);
-        self.reveals.by_id.insert(id, item);
-        self.reveals.payload_by_id.insert(id, r.clone());
+        self.fee_order.insert(item.key_for_fee_order(), id);
+        self.by_id.insert(id, item);
+        self.payload_by_id.insert(id, r.clone());
         Ok(id)
     }
+}
 
+impl Queues {
     pub fn evict_any(&mut self, id: &crate::mempool::TxId) -> EvictKind {
         if self.commits.evict_by_id(id) {
             EvictKind::Commit
