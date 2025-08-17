@@ -6,16 +6,14 @@ use std::sync::Arc;
 
 // ===== Adjust the crate name if needed (Cargo.toml [package].name; hyphen -> underscore) =====
 use l1_blockchain::mempool::{
-    AdmissionError, BlockSelectionLimits, CommitmentId, Mempool, MempoolConfig, MempoolImpl, StateView, TxId
+    AdmissionError, BlockSelectionLimits, CommitmentId, Mempool, MempoolConfig, MempoolImpl, StateView,
 };
-use l1_blockchain::types::{RevealTx, Transaction, AccessList};
+use l1_blockchain::types::{RevealTx, Transaction, AccessList, CommitTx, Tx};
+use l1_blockchain::codec::{access_list_bytes, tx_bytes};
+use l1_blockchain::crypto::commitment_hash;
+use l1_blockchain::state::CHAIN_ID;
 
 // -------------------- Small helpers for this test --------------------
-
-/// Strategy to generate arbitrary CommitmentId (wrapper over [u8; 32]).
-fn arb_commitment_id() -> impl Strategy<Value = CommitmentId> {
-    any::<[u8; 32]>().prop_map(CommitmentId)
-}
 
 /// Dummy StateView used only in this property test.
 struct SV {
@@ -39,36 +37,48 @@ impl StateView for SV {
     fn pending_commit_room(&self, _sender: &str) -> u32 { u32::MAX }
 }
 
-/// Build a minimal RevealTx for a given sender & nonce.
-/// NOTE: Your `Transaction` requires {from, to, amount, nonce, access_list}.
-fn make_reveal_tx(sender: String, nonce: u64) -> RevealTx {
+/// Build a minimal RevealTx for a given sender, nonce and salt.
+fn make_reveal_tx(sender: String, nonce: u64, salt: [u8;32]) -> RevealTx {
+    let to = "0x0000000000000000000000000000000000000001".to_string();
     RevealTx {
         sender: sender.clone(),
-        salt: [0u8; 32],
+        salt,
         tx: Transaction {
-            // Use sender as `from`, a fixed dummy as `to`
             from: sender.clone(),
-            to: "to_dummy".to_string(),
-            amount: 1u64, // adjust if your `amount` is a different type
+            to: to.clone(),
+            amount: 1u64,
             nonce,
-            access_list: AccessList::for_transfer(&sender, "to_dummy"),
+            access_list: AccessList::for_transfer(&sender, &to),
         },
     }
 }
 
-/// Insert a reveal for a specific commitment, using the mempool API.
-/// Returns Ok(TxId) if admission succeeded; Err(_) if it failed prechecks.
-fn insert_reveal_for_commitment(
+/// Insert a commit + reveal pair into the mempool and return the commitment id.
+fn insert_commit_and_reveal(
     mem: &Arc<MempoolImpl>,
-    _commit: CommitmentId, // not needed directly; commit is re-derived in your mempool from the reveal
     sender: &str,
     nonce: u64,
+    salt: [u8;32],
     height: u64,
     fee_bid: u128,
-) -> Result<TxId, AdmissionError> {
-    let r = make_reveal_tx(sender.to_owned(), nonce);
-    // Your mempool has `insert_reveal(&RevealTx, height, fee_bid)`
-    mem.insert_reveal(r, height, fee_bid)
+) -> Result<CommitmentId, AdmissionError> {
+    let r = make_reveal_tx(sender.to_owned(), nonce, salt);
+    let tx_ser = tx_bytes(&r.tx);
+    let al_bytes = access_list_bytes(&r.tx.access_list);
+    let cmt = commitment_hash(&tx_ser, &al_bytes, &r.salt, CHAIN_ID);
+
+    let commit = CommitTx {
+        commitment: cmt,
+        sender: sender.to_owned(),
+        access_list: r.tx.access_list.clone(),
+        ciphertext_hash: [0u8;32],
+        pubkey: [0u8;32],
+        sig: [0u8;64],
+    };
+
+    mem.insert_commit(Tx::Commit(commit), height, fee_bid)?;
+    mem.insert_reveal(r, height, fee_bid)?;
+    Ok(CommitmentId(cmt))
 }
 
 fn cfg() -> MempoolConfig {
@@ -76,7 +86,7 @@ fn cfg() -> MempoolConfig {
         max_avails_per_block: 1024,
         max_reveals_per_block: 2048,
         max_commits_per_block: 4096,
-        max_pending_commits_per_account: 2, // small for tests
+        max_pending_commits_per_account: 10, // allow multiple commits per account in tests
         commit_ttl_blocks: 100,
         reveal_window_blocks: 50,
     }
@@ -88,31 +98,29 @@ proptest! {
     /// IL must succeed iff each IL commitment has a reveal at the required nonce (0 in this SV).
     #[test]
     fn prop_il_reveals_nonce_correctness(
-        // keep IL smallish for speed; your selection logic is O(k) in IL size
-        il in proptest::collection::vec(arb_commitment_id(), 1..5),
-        // a single short sender is sufficient to stress nonce behavior
-        sender in "[a-z]{1,6}",
+        // Random salts to derive distinct commitments
+        salts in proptest::collection::vec(any::<[u8;32]>(), 1..5),
+        // generate a valid hex sender address
+        sender in any::<[u8;20]>().prop_map(|b| format!("0x{}", hex::encode(b))),
         // if true: include correct nonce=0 for *every* IL commitment; otherwise insert wrong nonce=1 for all
         include_required in any::<bool>(),
     ) {
         let height = 123;
-        let state = SV { height, il: il.clone() };
-
-        // MempoolImpl::new requires a MempoolConfig and returns Arc<MempoolImpl>
-        // If MempoolConfig::default() doesn't exist, construct the fields explicitly.
         let mem: Arc<MempoolImpl> = MempoolImpl::new(cfg());
         let fee_bid: u128 = 1_000;
 
-        // Insert reveals for each IL commitment:
-        for &c in &il {
-            if include_required {
-                // Correct nonce that matches SV.reveal_nonce_required() == 0
-                let _ = insert_reveal_for_commitment(&mem, c, &sender, 0, height, fee_bid);
-            } else {
-                // Only wrong nonce present → selection must fail with InclusionListUnmet
-                let _ = insert_reveal_for_commitment(&mem, c, &sender, 1, height, fee_bid);
+        // Insert commit+reveal for each salt and collect the resulting commitments for the IL
+        let mut il: Vec<CommitmentId> = Vec::new();
+        for (i, salt) in salts.into_iter().enumerate() {
+            let n = if include_required { i as u64 } else { i as u64 + 1 };
+            match insert_commit_and_reveal(&mem, &sender, n, salt, height, fee_bid) {
+                Ok(c) => il.push(c),
+                Err(AdmissionError::Duplicate) => continue,
+                Err(e) => panic!("insert: {:?}", e),
             }
         }
+
+        let state = SV { height, il: il.clone() };
 
         // Select a block with enough capacity to include all IL reveals
         let limits = BlockSelectionLimits {
@@ -126,7 +134,6 @@ proptest! {
         if include_required {
             prop_assert!(out.is_ok(), "selection should succeed when every IL commitment has a reveal at required nonce=0");
             let blk = out.unwrap();
-            // In this SV, payload-missing isn’t simulated, so count should match IL size
             prop_assert_eq!(blk.reveals.len(), il.len(), "all IL reveals should be included");
         } else {
             // Missing required nonce for at least one IL → must fail
@@ -136,3 +143,4 @@ proptest! {
         }
     }
 }
+
