@@ -1,7 +1,7 @@
 // src/mempool/tests.rs
 #![allow(unused)]
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::mempool::{
     BlockSelectionLimits, CommitmentId, Mempool, MempoolConfig, MempoolImpl, SelectError, TxId,
@@ -110,9 +110,12 @@ fn make_reveal(from: &str, tx: Transaction, salt: Hash) -> RevealTx {
 }
 
 // ------------- a tiny fake StateView for selection tests -------------
+#[derive(Default)]
 struct SV {
     height: u64,
     il: Vec<CommitmentId>,
+    reveal_nonces: HashMap<String, u64>,
+    pending_room: HashMap<String, u32>,
 }
 
 impl crate::mempool::StateView for SV {
@@ -124,10 +127,10 @@ impl crate::mempool::StateView for SV {
         self.il.clone()
     }
 
-    fn reveal_nonce_required(&self, _sender: &str) -> u64 {
-        0
+    fn reveal_nonce_required(&self, sender: &str) -> u64 {
+        self.reveal_nonces.get(sender).copied().unwrap_or(0)
     }
-    
+
     fn commit_on_chain(&self, _c: CommitmentId) -> bool {
         true
     }
@@ -140,8 +143,8 @@ impl crate::mempool::StateView for SV {
         true
     }
 
-    fn pending_commit_room(&self, _sender: &str) -> u32 {
-        u32::MAX
+    fn pending_commit_room(&self, sender: &str) -> u32 {
+        self.pending_room.get(sender).copied().unwrap_or(u32::MAX)
     }
 }
 
@@ -289,7 +292,7 @@ fn queues_index_coherence() {
 fn selection_inclusion_list_missing() {
     let mp = MempoolImpl::new(cfg());
     let fake_commitment = CommitmentId([1u8; 32]);
-    let sv = SV { height: 123, il: vec![fake_commitment] };
+    let sv = SV { height: 123, il: vec![fake_commitment], ..Default::default() };
     let err = mp.select_block(&sv, limits()).unwrap_err();
     match err {
         SelectError::InclusionListUnmet { missing } => {
@@ -313,7 +316,7 @@ fn selection_missing_reveal_payload_logged_and_skipped() {
         reveals.payload_by_id.remove(&rid);
     }
 
-    let sv = SV { height: 101, il: vec![CommitmentId(cm)] };
+    let sv = SV { height: 101, il: vec![CommitmentId(cm)], ..Default::default() };
     let block = mp
         .select_block(&sv, limits())
         .expect("selection should succeed despite missing payload");
@@ -367,7 +370,7 @@ fn avail_selection_deterministic_and_non_destructive() {
     mp.insert_avail(Tx::Avail(a_high.clone()), 0, 10).unwrap();
     mp.insert_avail(Tx::Avail(a_low.clone()), 0, 5).unwrap();
 
-    let state = SV { height: 0, il: vec![] };
+    let state = SV { height: 0, il: vec![], ..Default::default() };
     let lim = limits();
 
     let block1 = mp.select_block(&state, lim).expect("first selection");
@@ -430,6 +433,97 @@ fn evict_stale_drops_old_entries_and_updates_pending_count() {
     }
 }
 
+// ---------------------- StateView-check specific tests ----------------------
+
+#[test]
+fn il_reveal_at_wrong_nonce_fails() {
+    let mp = MempoolImpl::new(cfg());
+    let sender = addr(70);
+    let (c, tx, salt, cm) = make_commit(&sender, 0);
+    mp.insert_commit(Tx::Commit(c), 0, 1).unwrap();
+    let r = make_reveal(&sender, tx, salt);
+    mp.insert_reveal(r, 0, 1).unwrap();
+
+    let mut reveal_nonces = HashMap::new();
+    reveal_nonces.insert(sender.clone(), 1);
+    let sv = SV {
+        height: 0,
+        il: vec![CommitmentId(cm)],
+        reveal_nonces,
+        ..Default::default()
+    };
+
+    let err = mp.select_block(&sv, limits()).unwrap_err();
+    assert!(matches!(err, SelectError::InclusionListUnmet { .. }));
+}
+
+#[test]
+fn avail_outside_window_skipped() {
+    let mp = MempoolImpl::new(cfg());
+    let sender = addr(71);
+    let (_c, _tx, _salt, cm) = make_commit(&sender, 0);
+    let a = make_avail(&sender, cm);
+    mp.insert_avail(Tx::Avail(a), 20, 1).unwrap();
+
+    let sv = SV { height: 10, il: vec![], ..Default::default() };
+    let block = mp.select_block(&sv, limits()).unwrap();
+    assert!(block.txs.is_empty(), "avail not ready should be skipped");
+}
+
+#[test]
+fn avail_duplicate_skipped_when_reveal_forced() {
+    let mp = MempoolImpl::new(cfg());
+    let sender = addr(72);
+    let (c, tx, salt, cm) = make_commit(&sender, 0);
+    let commit_id = mp.insert_commit(Tx::Commit(c), 0, 1).unwrap();
+    let a = make_avail(&sender, cm);
+    mp.insert_avail(Tx::Avail(a.clone()), 0, 1).unwrap();
+    let r = make_reveal(&sender, tx, salt);
+    mp.insert_reveal(r.clone(), 0, 1).unwrap();
+    mp.mark_included(&[commit_id], 1);
+
+    let sv = SV { height: 0, il: vec![CommitmentId(cm)], ..Default::default() };
+    let block = mp.select_block(&sv, limits()).unwrap();
+    assert!(block.txs.is_empty(), "avail with IL commitment should be skipped");
+    assert_eq!(block.reveals, vec![r]);
+}
+
+#[test]
+fn commit_skipped_when_sender_at_pending_cap() {
+    let mp = MempoolImpl::new(cfg());
+    let sender = addr(73);
+    let (c, _tx, _salt, _cm) = make_commit(&sender, 0);
+    mp.insert_commit(Tx::Commit(c), 0, 1).unwrap();
+    let mut pending_room = HashMap::new();
+    pending_room.insert(sender.clone(), 0);
+    let sv = SV { height: 0, il: vec![], pending_room, ..Default::default() };
+    let block = mp.select_block(&sv, limits()).unwrap();
+    assert!(block.txs.is_empty(), "commit should be skipped when sender at cap");
+}
+
+#[test]
+fn extra_reveal_nonce_continuity_enforced() {
+    let mp = MempoolImpl::new(cfg());
+    let sender = addr(74);
+    let (c0, tx0, salt0, _cm0) = make_commit(&sender, 0);
+    let (c1, tx1, salt1, _cm1) = make_commit(&sender, 1);
+    let id0 = mp.insert_commit(Tx::Commit(c0), 0, 1).unwrap();
+    let id1 = mp.insert_commit(Tx::Commit(c1), 0, 1).unwrap();
+    let r1 = make_reveal(&sender, tx1, salt1);
+    mp.insert_reveal(r1, 0, 10).unwrap();
+    let r0 = make_reveal(&sender, tx0, salt0);
+    mp.insert_reveal(r0.clone(), 0, 1).unwrap();
+    mp.mark_included(&[id0, id1], 1);
+
+    let mut reveal_nonces = HashMap::new();
+    reveal_nonces.insert(sender.clone(), 0);
+    let sv = SV { height: 0, il: vec![], reveal_nonces, ..Default::default() };
+    let block = mp.select_block(&sv, limits()).unwrap();
+    assert_eq!(block.reveals.len(), 1);
+    assert_eq!(block.reveals[0].tx.nonce, 0);
+    assert!(block.txs.is_empty());
+}
+
 
 // ------------------------------ tiny assertions ------------------------------
 
@@ -463,7 +557,7 @@ fn concurrent_insert_select_benchmark() {
 
     let select_mp = mp.clone();
     let selector = thread::spawn(move || {
-        let state = SV { height: 0, il: vec![] };
+        let state = SV { height: 0, il: vec![], ..Default::default() };
         let lim = limits();
         for _ in 0..200 {
             let _ = select_mp.select_block(&state, lim);
