@@ -223,8 +223,8 @@ fn mark_included_evicts_and_decrements() {
 
     // before: pending count should be 2
     {
-        let q = mp.queues.read().unwrap();
-        let cnt = q.commits.pending_per_owner.get(&sender).copied().unwrap_or(0);
+        let (commits, _avails, _reveals) = mp.debug_read();
+        let cnt = commits.pending_per_owner.get(&sender).copied().unwrap_or(0);
         assert_eq!(cnt, 2);
     }
 
@@ -233,10 +233,10 @@ fn mark_included_evicts_and_decrements() {
 
     // after: 1 left; id1 gone; id2 remains
     {
-        let q = mp.queues.read().unwrap();
-        assert!(q.commits.by_id.get(&id1).is_none());
-        assert!(q.commits.by_id.get(&id2).is_some());
-        let cnt = q.commits.pending_per_owner.get(&sender).copied().unwrap_or(0);
+        let (commits, _avails, _reveals) = mp.debug_read();
+        assert!(commits.by_id.get(&id1).is_none());
+        assert!(commits.by_id.get(&id2).is_some());
+        let cnt = commits.pending_per_owner.get(&sender).copied().unwrap_or(0);
         assert_eq!(cnt, 1);
     }
 }
@@ -251,13 +251,13 @@ fn queues_index_coherence() {
     mp.insert_commit(Tx::Commit(c1), 100, 10).unwrap();
     mp.insert_commit(Tx::Commit(c2), 100, 20).unwrap();
 
-    // If you kept MempoolImpl.queues private, expose a small debug accessor instead.
-    let q = mp.queues.read().unwrap();
-    assert_eq!(q.commits.by_id.len(), 2);
-    assert_eq!(q.commits.by_commitment.len(), 2);
-    assert_eq!(q.commits.fee_order.len(), 2);
-    assert!(q.commits.by_commitment.contains_key(&CommitmentId(cm1)));
-    assert!(q.commits.by_commitment.contains_key(&CommitmentId(cm2)));
+    // Use debug accessor to inspect internal queues.
+    let (commits, _avails, _reveals) = mp.debug_read();
+    assert_eq!(commits.by_id.len(), 2);
+    assert_eq!(commits.by_commitment.len(), 2);
+    assert_eq!(commits.fee_order.len(), 2);
+    assert!(commits.by_commitment.contains_key(&CommitmentId(cm1)));
+    assert!(commits.by_commitment.contains_key(&CommitmentId(cm2)));
 }
 
 #[test]
@@ -299,10 +299,10 @@ fn evict_stale_drops_old_entries_and_updates_pending_count() {
 
     // Before purge: pending commits = 2, one reveal present
     {
-        let q = mp.queues.read().unwrap();
-        let cnt = q.commits.pending_per_owner.get(&sender).copied().unwrap_or(0);
+        let (commits, _avails, reveals) = mp.debug_read();
+        let cnt = commits.pending_per_owner.get(&sender).copied().unwrap_or(0);
         assert_eq!(cnt, 2, "expected two pending commits before purge");
-        assert_eq!(q.reveals.by_id.len(), 1, "expected one reveal before purge");
+        assert_eq!(reveals.by_id.len(), 1, "expected one reveal before purge");
     }
 
     // Purge at height 102:
@@ -312,18 +312,18 @@ fn evict_stale_drops_old_entries_and_updates_pending_count() {
 
     // After purge:
     {
-        let q = mp.queues.read().unwrap();
+        let (commits, _avails, reveals) = mp.debug_read();
 
         // c1 remains, c2 evicted
-        assert!(q.commits.by_id.get(&id1).is_some(), "c1 should remain");
-        assert!(q.commits.by_id.get(&id2).is_none(), "c2 should be evicted");
+        assert!(commits.by_id.get(&id1).is_some(), "c1 should remain");
+        assert!(commits.by_id.get(&id2).is_none(), "c2 should be evicted");
 
         // pending count decremented to 1
-        let cnt = q.commits.pending_per_owner.get(&sender).copied().unwrap_or(0);
+        let cnt = commits.pending_per_owner.get(&sender).copied().unwrap_or(0);
         assert_eq!(cnt, 1, "pending count should decrement after eviction");
 
         // reveal queue emptied by TTL
-        assert_eq!(q.reveals.by_id.len(), 0, "reveals should be purged");
+        assert_eq!(reveals.by_id.len(), 0, "reveals should be purged");
     }
 }
 
@@ -335,4 +335,40 @@ fn matches_bad_access_list(err: crate::mempool::AdmissionError) {
         crate::mempool::AdmissionError::BadAccessList => {}
         other => panic!("expected BadAccessList, got {:?}", other),
     }
+}
+
+#[test]
+fn concurrent_insert_select_benchmark() {
+    use std::thread;
+    use std::time::Instant;
+
+    let mp = MempoolImpl::new(cfg());
+    let start = Instant::now();
+
+    let insert_mp = mp.clone();
+    let inserter = thread::spawn(move || {
+        for i in 0..200 {
+            let sender = addr((i % 10) as u8);
+            let (c, tx, salt, cm) = make_commit(&sender, i as u64);
+            let _ = insert_mp.insert_commit(Tx::Commit(c), 0, 1);
+            let a = make_avail(&sender, cm);
+            let _ = insert_mp.insert_avail(Tx::Avail(a), 0, 1);
+            let r = make_reveal(&sender, tx, salt);
+            let _ = insert_mp.insert_reveal(r, 0, 1);
+        }
+    });
+
+    let select_mp = mp.clone();
+    let selector = thread::spawn(move || {
+        let state = SV { height: 0, il: vec![] };
+        let lim = limits();
+        for _ in 0..200 {
+            let _ = select_mp.select_block(&state, lim);
+        }
+    });
+
+    inserter.join().unwrap();
+    selector.join().unwrap();
+
+    println!("concurrent insert/select took {:?}", start.elapsed());
 }
