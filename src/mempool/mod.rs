@@ -73,6 +73,18 @@ pub trait StateView: Send + Sync {
 
     /// For a sender address (hex "0x…"), what's the next required nonce for reveals?
     fn reveal_nonce_required(&self, sender: &str) -> u64;
+
+    /// was the Commit for c included already?
+    fn commit_on_chain(&self, c: CommitmentId) -> bool;
+    
+    /// was the Avail for c included already?
+    fn avail_on_chain(&self, c: CommitmentId) -> bool;       
+    
+    /// inside [start,end] window?
+    fn avail_allowed_at(&self, height: u64, c: CommitmentId) -> bool; 
+    
+    /// remaining pending-commit slots for sender
+    fn pending_commit_room(&self, sender: &str) -> u32;       
 }
 
 /// Errors that can happen during block selection.
@@ -219,7 +231,7 @@ impl Mempool for MempoolImpl {
         let height = state.current_height();
         let il = state.commitments_due_and_available(height);
 
-        let commits = self.commits.read().expect("commit queue poisoned");
+        let commits: std::sync::RwLockReadGuard<'_, CommitQueue> = self.commits.read().expect("commit queue poisoned");
         let avails = self.avails.read().expect("avail queue poisoned");
         let reveals = self.reveals.read().expect("reveal queue poisoned");
 
@@ -241,25 +253,96 @@ impl Mempool for MempoolImpl {
             return Err(SelectError::InclusionListUnmet { missing });
         }
 
-        // Pick the *respective* reveal for each IL commitment deterministically.
-        let mut selected_reveals = Vec::with_capacity(il.len());
+        use std::collections::{HashMap, HashSet};
+
+        let mut next_required: HashMap<String, u64> = HashMap::new();
+        let mut selected_ids: HashSet<crate::mempool::TxId> = HashSet::new(); // NEW
+        let mut selected_reveals: Vec<crate::types::RevealTx> = Vec::with_capacity(il.len());
+        let mut missing_due_to_nonce: Vec<crate::mempool::CommitmentId> = Vec::new();
+
         for c in &il {
-            let map = reveals.by_commitment.get(c).expect("exists and non-empty");
-            let (_, txid) = map.iter().next().expect("non-empty map");
-            if let Some(reveal) = reveals.payload_by_id.get(txid) {
-                selected_reveals.push(reveal.clone());
+            // Deterministically inspect the candidate reveals for this commitment.
+            // Map: BTreeMap<(sender, nonce), TxId>
+            let map = reveals
+                .by_commitment
+                .get(c)
+                .expect("exists and non-empty checked earlier");
+
+            // Choose a sender deterministically: the lexicographically-smallest (sender, nonce) pair.
+            let ((sender0, _nonce0), _txid0) = map.iter().next().expect("non-empty");
+
+            // Pull (or fetch) this sender's required nonce
+            let req = *next_required.entry(sender0.clone()).or_insert_with(|| {
+                state.reveal_nonce_required(&sender0)
+            });
+
+            // We must include the reveal whose (sender == sender0) AND (nonce == req).
+            // (Because pre-admission enforces that reveals for a commitment come from the true owner,
+            //  all valid entries should share the same sender; this lookup is O(log n) in the BTreeMap.)
+            if let Some(txid) = map.get(&(sender0.clone(), req)) {
+                match reveals.payload_by_id.get(txid) {
+                    Some((r, _cmt)) => {
+                        selected_reveals.push(r.clone());
+                        selected_ids.insert(*txid);
+                        *next_required.get_mut(sender0.as_str()).unwrap() = req + 1;
+                    }
+                    None => {
+                        tracing::warn!("mempool: missing payload for IL reveal txid={:?}; skipping", txid);
+                        continue;
+                    }
+                }
             } else {
-                tracing::error!(
-                    "Mempool inconsistency: payload missing for txid {:?}",
-                    txid
-                );
-                continue;
+                missing_due_to_nonce.push(*c);
             }
+        }
+
+        // If any IL commitment couldn't be satisfied at the required nonce, selection must fail.
+        if !missing_due_to_nonce.is_empty() {
+            return Err(SelectError::InclusionListUnmet { missing: missing_due_to_nonce });
         }
 
         // Enforce reveal cap: IL must fit entirely.
         if (selected_reveals.len() as u32) > limits.max_reveals {
             return Err(SelectError::InclusionListUnmet { missing: il });
+        }
+
+       // --- Extra (non-IL) reveals with nonce continuity and fee order ---
+
+        let mut remaining = limits
+            .max_reveals
+            .saturating_sub(selected_reveals.len() as u32);
+
+        if remaining > 0 {
+            use std::collections::HashSet;
+            let il_set: HashSet<_> = il.iter().copied().collect();
+
+            // selected_ids is already seeded from the IL loop — no extra seeding needed here.
+
+            // Walk global fee_order (highest fee first, deterministic tie-breakers).
+            for (_fee_key, txid) in reveals.fee_order.iter() {
+                if remaining == 0 { break; }
+                if selected_ids.contains(txid) { continue; }
+
+                let meta = match reveals.by_id.get(txid) {
+                    Some(m) => m,
+                    None => continue,
+                };
+
+                if il_set.contains(&meta.commitment) { continue; }
+
+                let req = *next_required.entry(meta.sender.clone()).or_insert_with(|| {
+                    state.reveal_nonce_required(&meta.sender)
+                });
+
+                if meta.nonce != req { continue; }
+
+                if let Some((reveal, _cmt)) = reveals.payload_by_id.get(txid) {
+                    selected_reveals.push(reveal.clone());
+                    selected_ids.insert(*txid);
+                    *next_required.get_mut(&meta.sender).unwrap() = req + 1;
+                    remaining -= 1;
+                }
+            }
         }
 
         // --- Avails: ready_at <= height, fee-desc order, skip IL commitments ---

@@ -87,7 +87,7 @@ pub struct RevealQueue {
     /// fee-ordered view for extra (non-mandatory) reveals
     pub fee_order: BTreeMap<(i128, String, u64), TxId>, // (-fee, sender, nonce)
     /// transaction payload mapped to its id
-    pub payload_by_id: HashMap<TxId, RevealTx>,
+    pub payload_by_id: HashMap<TxId, (RevealTx, CommitmentId)>,
 }
 
 /// A tiny helper to build TxId from any bytes (stable 32-byte hash).
@@ -288,7 +288,7 @@ impl RevealQueue {
 
         self.fee_order.insert(item.key_for_fee_order(), id);
         self.by_id.insert(id, item);
-        self.payload_by_id.insert(id, r.clone());
+        self.payload_by_id.insert(id, (r.clone(), CommitmentId(*cmt)));
         id
     }
 }

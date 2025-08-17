@@ -114,10 +114,35 @@ struct SV {
     height: u64,
     il: Vec<CommitmentId>,
 }
+
 impl crate::mempool::StateView for SV {
-    fn current_height(&self) -> u64 { self.height }
-    fn commitments_due_and_available(&self, _h: u64) -> Vec<CommitmentId> { self.il.clone() }
-    fn reveal_nonce_required(&self, _sender: &str) -> u64 { 0 }
+    fn current_height(&self) -> u64 {
+        self.height
+    }
+
+    fn commitments_due_and_available(&self, _h: u64) -> Vec<CommitmentId> {
+        self.il.clone()
+    }
+
+    fn reveal_nonce_required(&self, _sender: &str) -> u64 {
+        0
+    }
+    
+    fn commit_on_chain(&self, _c: CommitmentId) -> bool {
+        true
+    }
+
+    fn avail_on_chain(&self, _c: CommitmentId) -> bool {
+        false
+    }
+
+    fn avail_allowed_at(&self, _height: u64, _c: CommitmentId) -> bool {
+        true
+    }
+
+    fn pending_commit_room(&self, _sender: &str) -> u32 {
+        u32::MAX
+    }
 }
 
 // ---------------------------------- TESTS ----------------------------------
