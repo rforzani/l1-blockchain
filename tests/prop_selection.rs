@@ -293,7 +293,7 @@ fn cfg() -> MempoolConfig {
         max_avails_per_block: 1024,
         max_reveals_per_block: 2048,
         max_commits_per_block: 4096,
-        max_pending_commits_per_account: 10, // allow multiple commits per account in tests
+        max_pending_commits_per_account: 20, // allow multiple commits per account in tests
         commit_ttl_blocks: 100,
         reveal_window_blocks: 50,
     }
@@ -347,6 +347,85 @@ proptest! {
             use l1_blockchain::mempool::SelectError;
             prop_assert!(matches!(out, Err(SelectError::InclusionListUnmet{..})),
                 "selection must fail with InclusionListUnmet when required nonce is missing");
+        }
+    }
+}
+
+proptest! {
+    #[test]
+    fn prop_il_limits_and_duplicates(
+        reveal_data in proptest::collection::vec((any::<[u8;32]>(), any::<bool>()), 0..=12),
+        sender in any::<[u8;20]>().prop_map(|b| format!("0x{}", hex::encode(b))),
+        max_reveals in 0u32..=16u32,
+        max_avails in 0u32..=16u32,
+        max_commits in 0u32..=16u32,
+    ) {
+        let height = 200u64;
+        let mem: Arc<MempoolImpl> = MempoolImpl::new(cfg());
+        let fee_bid: u128 = 1_000;
+
+        // insert commit+reveal pairs, optionally attempting duplicate reveals
+        let mut il: Vec<CommitmentId> = Vec::new();
+        for (i, (salt, dup)) in reveal_data.iter().enumerate() {
+            match insert_commit_and_reveal(&mem, &sender, i as u64, *salt, height, fee_bid) {
+                Ok(id) => {
+                    if *dup {
+                        // attempt to insert a duplicate reveal for the same (sender, nonce, commitment)
+                        let dup_rev = make_reveal_tx(sender.clone(), i as u64, *salt);
+                        let _ = mem.insert_reveal(dup_rev, height, fee_bid);
+                    }
+                    il.push(id);
+                }
+                Err(AdmissionError::Duplicate) => {
+                    // ignore duplicates from repeated salts
+                }
+                Err(e) => panic!("unexpected insert error: {:?}", e),
+            }
+        }
+
+        let state = SV { height, il: il.clone() };
+        let limits = BlockSelectionLimits { max_reveals, max_avails, max_commits };
+        let res = mem.select_block(&state, limits);
+
+        if il.is_empty() {
+            let blk = res.expect("empty IL must succeed");
+            prop_assert!(blk.reveals.len() <= max_reveals as usize);
+
+            let avail_count = blk
+                .txs
+                .iter()
+                .filter(|tx| matches!(tx, Tx::Avail(_)))
+                .count();
+            let commit_count = blk
+                .txs
+                .iter()
+                .filter(|tx| matches!(tx, Tx::Commit(_)))
+                .count();
+            prop_assert!(avail_count <= max_avails as usize);
+            prop_assert!(commit_count <= max_commits as usize);
+        } else if max_reveals as usize >= il.len() {
+            let blk = res.expect("selection should succeed when cap is sufficient");
+            prop_assert!(blk.reveals.len() >= il.len());
+            prop_assert!(blk.reveals.len() <= max_reveals as usize);
+
+            let avail_count = blk
+                .txs
+                .iter()
+                .filter(|tx| matches!(tx, Tx::Avail(_)))
+                .count();
+            let commit_count = blk
+                .txs
+                .iter()
+                .filter(|tx| matches!(tx, Tx::Commit(_)))
+                .count();
+            prop_assert!(avail_count <= max_avails as usize);
+            prop_assert!(commit_count <= max_commits as usize);
+        } else {
+            use l1_blockchain::mempool::SelectError;
+            match res {
+                Err(SelectError::InclusionListUnmet { .. }) => {}
+                other => prop_assert!(false, "expected InclusionListUnmet, got {:?}", other),
+            }
         }
     }
 }
