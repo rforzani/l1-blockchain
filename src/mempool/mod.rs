@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     sync::{Arc, RwLock},
 };
 
@@ -23,7 +23,7 @@ pub struct MempoolConfig {
     pub reveal_window_blocks: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TxId(pub [u8; 32]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -208,7 +208,7 @@ impl Mempool for MempoolImpl {
         let il = state.commitments_due_and_available(height);
 
         let commits = self.commits.read().expect("commit queue poisoned");
-        let mut avails = self.avails.write().expect("avail queue poisoned");
+        let avails = self.avails.read().expect("avail queue poisoned");
         let reveals = self.reveals.read().expect("reveal queue poisoned");
 
         // --- Mandatory reveals for IL ---
@@ -254,50 +254,30 @@ impl Mempool for MempoolImpl {
         let mut avails_added: u32 = 0;
 
         // Gather all avails whose ready_at is <= height.
-        let not_ready = avails.ready_index.split_off(&(height + 1));
-        let ready_entries = std::mem::replace(&mut avails.ready_index, not_ready);
-        let mut ready_ids = Vec::new();
-        for (_h, id) in ready_entries {
-            ready_ids.push(id);
+        let mut ready_ids = HashSet::new();
+        for (_h, set) in avails.ready_index.range(..=height) {
+            for txid in set {
+                ready_ids.insert(*txid);
+            }
         }
 
-        if limits.max_avails > 0 && !ready_ids.is_empty() {
-            // Build fee-ordered view of just-ready avails.
-            let mut fee_ready: BTreeMap<(i128, String), TxId> = BTreeMap::new();
-            for txid in &ready_ids {
-                if let Some(meta) = avails.by_id.get(txid) {
-                    let key = (-(meta.fee_bid as i128), meta.sender.clone());
-                    fee_ready.insert(key, *txid);
-                }
+        for (_fee_key, txid) in avails.fee_order.iter() {
+            if avails_added >= limits.max_avails {
+                break;
             }
-
-            let mut included: HashSet<TxId> = HashSet::new();
-            for (_, txid) in fee_ready.iter() {
-                if avails_added >= limits.max_avails {
-                    break;
-                }
-                let meta = match avails.by_id.get(txid) {
-                    Some(m) => m,
-                    None => continue,
-                };
-                if il_set.contains(&meta.commitment) {
-                    continue;
-                }
-                if let Some(avail) = avails.payload_by_id.get(txid) {
-                    txs.push(Tx::Avail(avail.clone()));
-                    avails_added += 1;
-                    included.insert(*txid);
-                }
+            if !ready_ids.contains(txid) {
+                continue;
             }
-
-            // Reinsert any not-included ready ids for future blocks.
-            for txid in ready_ids {
-                if included.contains(&txid) {
-                    continue;
-                }
-                if let Some(ready_at) = avails.by_id.get(&txid).map(|m| m.ready_at) {
-                    avails.ready_index.insert(ready_at, txid);
-                }
+            let meta = match avails.by_id.get(txid) {
+                Some(m) => m,
+                None => continue,
+            };
+            if il_set.contains(&meta.commitment) {
+                continue;
+            }
+            if let Some(avail) = avails.payload_by_id.get(txid) {
+                txs.push(Tx::Avail(avail.clone()));
+                avails_added += 1;
             }
         }
 

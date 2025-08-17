@@ -1,7 +1,7 @@
 // src/mempool/queues.rs
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::AdmissionError;
 use crate::codec::{access_list_bytes, tx_bytes, tx_enum_bytes};
@@ -76,7 +76,7 @@ pub struct AvailQueue {
     pub by_commitment: HashMap<CommitmentId, TxId>,
     pub fee_order: BTreeMap<(i128, String), TxId>,
     /// Avails keyed by the height when they become ready
-    pub ready_index: BTreeMap<u64, TxId>,
+    pub ready_index: BTreeMap<u64, BTreeSet<TxId>>,
     pub payload_by_id: HashMap<TxId, AvailTx>,
 }
 
@@ -229,7 +229,7 @@ impl AvailQueue {
 
         self.by_commitment.insert(CommitmentId(a.commitment), id);
         self.fee_order.insert(item.key_for_fee_order(), id);
-        self.ready_index.insert(item.ready_at, id);
+        self.ready_index.entry(item.ready_at).or_default().insert(id);
         self.by_id.insert(id, item);
         self.payload_by_id.insert(id, a.clone());
         Ok(id)
@@ -371,7 +371,12 @@ impl AvailQueue {
         if let Some(item) = self.by_id.remove(id) {
             self.by_commitment.remove(&item.commitment);
             self.fee_order.remove(&item.key_for_fee_order());
-            self.ready_index.remove(&item.ready_at);
+            if let Some(set) = self.ready_index.get_mut(&item.ready_at) {
+                set.remove(id);
+                if set.is_empty() {
+                    self.ready_index.remove(&item.ready_at);
+                }
+            }
             self.payload_by_id.remove(id);
             true
         } else {

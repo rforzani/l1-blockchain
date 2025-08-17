@@ -275,6 +275,63 @@ fn selection_inclusion_list_missing() {
 }
 
 #[test]
+fn avail_ready_index_and_eviction() {
+    let mp = MempoolImpl::new(cfg());
+    let sender1 = addr(10);
+    let sender2 = addr(11);
+
+    let (_c1, _tx1, _salt1, cm1) = make_commit(&sender1, 0);
+    let (_c2, _tx2, _salt2, cm2) = make_commit(&sender2, 0);
+    let a1 = make_avail(&sender1, cm1);
+    let a2 = make_avail(&sender2, cm2);
+
+    let id1 = mp.insert_avail(Tx::Avail(a1.clone()), 100, 1).unwrap();
+    let id2 = mp.insert_avail(Tx::Avail(a2.clone()), 100, 1).unwrap();
+
+    {
+        let (_commits, avails, _reveals) = mp.debug_read();
+        let set = avails.ready_index.get(&100).expect("bucket exists");
+        assert!(set.contains(&id1));
+        assert!(set.contains(&id2));
+    }
+
+    {
+        let mut avails_lock = mp.avails.write().unwrap();
+        avails_lock.evict_by_id(&id1);
+    }
+
+    {
+        let (_commits, avails, _reveals) = mp.debug_read();
+        let set = avails.ready_index.get(&100).expect("bucket exists after eviction");
+        assert!(!set.contains(&id1));
+        assert!(set.contains(&id2));
+    }
+}
+
+#[test]
+fn avail_selection_deterministic_and_non_destructive() {
+    let mp = MempoolImpl::new(cfg());
+    let sender = addr(12);
+
+    let (_c1, _tx1, _salt1, cm1) = make_commit(&sender, 0);
+    let (_c2, _tx2, _salt2, cm2) = make_commit(&sender, 1);
+    let a_high = make_avail(&sender, cm1);
+    let a_low = make_avail(&sender, cm2);
+
+    mp.insert_avail(Tx::Avail(a_high.clone()), 0, 10).unwrap();
+    mp.insert_avail(Tx::Avail(a_low.clone()), 0, 5).unwrap();
+
+    let state = SV { height: 0, il: vec![] };
+    let lim = limits();
+
+    let block1 = mp.select_block(&state, lim).expect("first selection");
+    assert_eq!(block1.txs, vec![Tx::Avail(a_high.clone()), Tx::Avail(a_low.clone())]);
+
+    let block2 = mp.select_block(&state, lim).expect("second selection");
+    assert_eq!(block2.txs, block1.txs);
+}
+
+#[test]
 fn evict_stale_drops_old_entries_and_updates_pending_count() {
     // Tight TTLs so we can see evictions clearly.
     let mut cfg = cfg();
