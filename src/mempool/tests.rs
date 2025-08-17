@@ -275,6 +275,27 @@ fn selection_inclusion_list_missing() {
 }
 
 #[test]
+fn selection_missing_reveal_payload_logged_and_skipped() {
+    let mp = MempoolImpl::new(cfg());
+    let sender = addr(60);
+    let (c, tx, salt, cm) = make_commit(&sender, 0);
+    mp.insert_commit(Tx::Commit(c), 100, 1).unwrap();
+    let r = make_reveal(&sender, tx, salt);
+    let rid = mp.insert_reveal(r, 100, 1).unwrap();
+
+    {
+        let mut reveals = mp.reveals.write().unwrap();
+        reveals.payload_by_id.remove(&rid);
+    }
+
+    let sv = SV { height: 101, il: vec![CommitmentId(cm)] };
+    let block = mp
+        .select_block(&sv, limits())
+        .expect("selection should succeed despite missing payload");
+    assert!(block.reveals.is_empty(), "reveal with missing payload skipped");
+}
+
+#[test]
 fn avail_ready_index_and_eviction() {
     let mp = MempoolImpl::new(cfg());
     let sender1 = addr(10);
