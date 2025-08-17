@@ -117,7 +117,7 @@ impl Mempool for MempoolImpl {
         match tx {
             Tx::Commit(c) => {
                 let mut q = self.queues.write().unwrap();
-                Ok(q.insert_commit_minimal(&c, current_height, fee_bid))
+                q.insert_commit_minimal(&c, current_height, fee_bid)
             }
             _ => Err(AdmissionError::WrongTxType),
         }
@@ -127,7 +127,7 @@ impl Mempool for MempoolImpl {
         match tx {
             Tx::Avail(a) => {
                 let mut q = self.queues.write().unwrap();
-                Ok(q.insert_avail_minimal(&a, current_height, fee_bid))
+                q.insert_avail_minimal(&a, current_height, fee_bid)
             }
             _ => Err(AdmissionError::WrongTxType),
         }
@@ -135,7 +135,7 @@ impl Mempool for MempoolImpl {
 
     fn insert_reveal(&self, r: RevealTx, current_height: u64, fee_bid: u128) -> Result<TxId, AdmissionError> {
         let mut q = self.queues.write().unwrap();
-        Ok(q.insert_reveal_minimal(&r, current_height, fee_bid))
+        q.insert_reveal_minimal(&r, current_height, fee_bid)
     }
 
     fn select_block(
