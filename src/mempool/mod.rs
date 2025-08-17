@@ -118,7 +118,7 @@ impl Mempool for MempoolImpl {
         match tx {
             Tx::Commit(c) => {
                 let mut q = self.queues.write().unwrap();
-                q.insert_commit_minimal(&c, current_height, fee_bid)
+                q.insert_commit_minimal(&c, current_height, fee_bid, self.config.max_pending_commits_per_account)
             }
             _ => Err(AdmissionError::WrongTxType),
         }
