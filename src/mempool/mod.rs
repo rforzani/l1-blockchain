@@ -7,6 +7,7 @@ use std::sync::{Arc, RwLock};
 use crate::types::{Tx, RevealTx};
 pub mod queues;
 pub mod select;
+mod tests;
 
 #[derive(Clone, Debug)]
 pub struct MempoolConfig {
