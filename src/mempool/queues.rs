@@ -1,15 +1,15 @@
 // src/mempool/queues.rs
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, BTreeMap};
+use std::collections::{BTreeMap, HashMap};
 
-use crate::types::Hash;
-use crate::mempool::{TxId, CommitmentId};
-use crate::codec::{tx_enum_bytes, tx_bytes, access_list_bytes};
-use crate::crypto::{hash_bytes_sha256, commitment_hash, is_hex_addr};
-use crate::state::{CHAIN_ID, MAX_AL_READS, MAX_AL_WRITES};
-use crate::types::{Tx, CommitTx, AvailTx, RevealTx, StateKey};
 use super::AdmissionError;
+use crate::codec::{access_list_bytes, tx_bytes, tx_enum_bytes};
+use crate::crypto::{commitment_hash, hash_bytes_sha256, is_hex_addr};
+use crate::mempool::{CommitmentId, TxId};
+use crate::state::{CHAIN_ID, MAX_AL_READS, MAX_AL_WRITES};
+use crate::types::Hash;
+use crate::types::{AvailTx, CommitTx, RevealTx, StateKey, Tx};
 
 /// --- Queue item shapes ---
 /// These are small, immutable records we store once a tx passes basic prechecks.
@@ -18,19 +18,19 @@ use super::AdmissionError;
 /// A queued Commit (owner-signed)
 pub struct CommitQueueItem {
     pub id: TxId,
-    pub commitment: CommitmentId,   // equals the on-chain commitment
-    pub sender: String,             // "0x..." hex
-    pub access_list_digest: Hash,   // hash of canonical AL bytes
-    pub fee_bid: u128,              // placeholder for future fee markets
-    pub arrival_height: u64,        // when the node first saw it
+    pub commitment: CommitmentId, // equals the on-chain commitment
+    pub sender: String,           // "0x..." hex
+    pub access_list_digest: Hash, // hash of canonical AL bytes
+    pub fee_bid: u128,            // placeholder for future fee markets
+    pub arrival_height: u64,      // when the node first saw it
 }
 
 /// A queued Avail (owner-signed)
 pub struct AvailQueueItem {
     pub id: TxId,
     pub commitment: CommitmentId,
-    pub sender: String,             // must match commitment owner (STF enforces)
-    pub ready_at: u64,              // height when avail becomes valid
+    pub sender: String, // must match commitment owner (STF enforces)
+    pub ready_at: u64,  // height when avail becomes valid
     pub fee_bid: u128,
     pub arrival_height: u64,
 }
@@ -38,17 +38,22 @@ pub struct AvailQueueItem {
 /// A queued Reveal (block-body item)
 pub struct RevealQueueItem {
     pub id: TxId,
-    pub commitment: CommitmentId,   // recomputed from (tx_bytes, AL, salt)
-    pub sender: String,             // must equal tx.from (STF enforces)
-    pub nonce: u64,                 // tx.nonce (needed for ordering)
-    pub access_list_digest: Hash,   // digest used when recomputing commitment
+    pub commitment: CommitmentId, // recomputed from (tx_bytes, AL, salt)
+    pub sender: String,           // must equal tx.from (STF enforces)
+    pub nonce: u64,               // tx.nonce (needed for ordering)
+    pub access_list_digest: Hash, // digest used when recomputing commitment
     pub fee_bid: u128,
     pub arrival_height: u64,
 }
 
 /// Enum to introspect what was evicted
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EvictKind { Commit, Avail, Reveal, None }
+pub enum EvictKind {
+    Commit,
+    Avail,
+    Reveal,
+    None,
+}
 
 /// --- Minimal indices (no behavior yet) ---
 /// We'll flesh these out later; for now they make types visible and compile.
@@ -64,13 +69,14 @@ pub struct CommitQueue {
     pub pending_per_owner: HashMap<String, usize>,
     /// transaction payload mapped to its id
     pub payload_by_id: HashMap<TxId, CommitTx>,
-
 }
 
 pub struct AvailQueue {
     pub by_id: HashMap<TxId, AvailQueueItem>,
     pub by_commitment: HashMap<CommitmentId, TxId>,
     pub fee_order: BTreeMap<(i128, String), TxId>,
+    /// Avails keyed by the height when they become ready
+    pub ready_index: BTreeMap<u64, TxId>,
     pub payload_by_id: HashMap<TxId, AvailTx>,
 }
 
@@ -94,7 +100,7 @@ pub fn txid_from(bytes: &[u8]) -> TxId {
 /// (We won't implement methods yet.)
 pub struct Queues {
     pub commits: CommitQueue,
-    pub avails:  AvailQueue,
+    pub avails: AvailQueue,
     pub reveals: RevealQueue,
 }
 
@@ -121,7 +127,12 @@ impl CommitQueue {
         if c.access_list.reads.len() > MAX_AL_READS || c.access_list.writes.len() > MAX_AL_WRITES {
             return Err(AdmissionError::BadAccessList);
         }
-        for k in c.access_list.reads.iter().chain(c.access_list.writes.iter()) {
+        for k in c
+            .access_list
+            .reads
+            .iter()
+            .chain(c.access_list.writes.iter())
+        {
             let addr = match k {
                 StateKey::Balance(a) | StateKey::Nonce(a) => a,
             };
@@ -133,7 +144,10 @@ impl CommitQueue {
         let nonce = StateKey::Nonce(c.sender.clone());
         let reads = &c.access_list.reads;
         let writes = &c.access_list.writes;
-        let has_req = reads.contains(&bal) && writes.contains(&bal) && reads.contains(&nonce) && writes.contains(&nonce);
+        let has_req = reads.contains(&bal)
+            && writes.contains(&bal)
+            && reads.contains(&nonce)
+            && writes.contains(&nonce);
         if !has_req {
             return Err(AdmissionError::BadAccessList);
         }
@@ -148,7 +162,13 @@ impl CommitQueue {
     }
 
     /// Insert a Commit into the indexes after prechecking.
-    pub fn insert_commit_minimal(&mut self, c: &CommitTx, current_height: u64, fee_bid: u128, max_pending: u32) -> Result<TxId, AdmissionError> {
+    pub fn insert_commit_minimal(
+        &mut self,
+        c: &CommitTx,
+        current_height: u64,
+        fee_bid: u128,
+        max_pending: u32,
+    ) -> Result<TxId, AdmissionError> {
         self.precheck_commit(c, max_pending)?;
 
         let enc = tx_enum_bytes(&Tx::Commit(c.clone()));
@@ -187,7 +207,12 @@ impl AvailQueue {
     }
 
     /// Insert an Avail. We don't compute ready_at here (need state); set it to current_height for now.
-    pub fn insert_avail_minimal(&mut self, a: &AvailTx, current_height: u64, fee_bid: u128) -> Result<TxId, AdmissionError> {
+    pub fn insert_avail_minimal(
+        &mut self,
+        a: &AvailTx,
+        current_height: u64,
+        fee_bid: u128,
+    ) -> Result<TxId, AdmissionError> {
         self.precheck_avail(a)?;
 
         let enc = tx_enum_bytes(&Tx::Avail(a.clone()));
@@ -204,6 +229,7 @@ impl AvailQueue {
 
         self.by_commitment.insert(CommitmentId(a.commitment), id);
         self.fee_order.insert(item.key_for_fee_order(), id);
+        self.ready_index.insert(item.ready_at, id);
         self.by_id.insert(id, item);
         self.payload_by_id.insert(id, a.clone());
         Ok(id)
@@ -211,21 +237,34 @@ impl AvailQueue {
 }
 
 impl RevealQueue {
-    fn precheck_reveal(&self, r: &RevealTx, cmt: &Hash, commits: &CommitQueue) -> Result<(), AdmissionError> {
+    fn precheck_reveal(
+        &self,
+        r: &RevealTx,
+        cmt: &Hash,
+        commits: &CommitQueue,
+    ) -> Result<(), AdmissionError> {
         if r.sender != r.tx.from {
             return Err(AdmissionError::InvalidSignature);
         }
         if !commits.by_commitment.contains_key(&CommitmentId(*cmt)) {
             return Err(AdmissionError::MismatchedCommitment);
         }
-        if r.tx.access_list.reads.len() > MAX_AL_READS || r.tx.access_list.writes.len() > MAX_AL_WRITES {
+        if r.tx.access_list.reads.len() > MAX_AL_READS
+            || r.tx.access_list.writes.len() > MAX_AL_WRITES
+        {
             return Err(AdmissionError::BadAccessList);
         }
         Ok(())
     }
 
     /// Insert a Reveal. We compute the commitment from (tx_bytes, AL bytes, salt) the same way the STF does.
-    pub fn insert_reveal_minimal(&mut self, r: &RevealTx, commits: &CommitQueue, current_height: u64, fee_bid: u128) -> Result<TxId, AdmissionError> {
+    pub fn insert_reveal_minimal(
+        &mut self,
+        r: &RevealTx,
+        commits: &CommitQueue,
+        current_height: u64,
+        fee_bid: u128,
+    ) -> Result<TxId, AdmissionError> {
         let mut buf = tx_bytes(&r.tx);
         buf.extend_from_slice(&r.salt);
         let id = txid_from(&buf);
@@ -299,8 +338,12 @@ impl CommitQueue {
             // decrement per-owner pending counter (never underflow)
             if let Entry::Occupied(mut e) = self.pending_per_owner.entry(item.sender) {
                 let v = e.get_mut();
-                if *v > 0 { *v -= 1; }
-                if *v == 0 { e.remove_entry(); }
+                if *v > 0 {
+                    *v -= 1;
+                }
+                if *v == 0 {
+                    e.remove_entry();
+                }
             }
             true
         } else {
@@ -328,6 +371,7 @@ impl AvailQueue {
         if let Some(item) = self.by_id.remove(id) {
             self.by_commitment.remove(&item.commitment);
             self.fee_order.remove(&item.key_for_fee_order());
+            self.ready_index.remove(&item.ready_at);
             self.payload_by_id.remove(id);
             true
         } else {
@@ -376,7 +420,7 @@ impl Default for CommitQueue {
             by_commitment: HashMap::new(),
             fee_order: BTreeMap::new(),
             pending_per_owner: HashMap::new(),
-            payload_by_id: HashMap::new()
+            payload_by_id: HashMap::new(),
         }
     }
 }
@@ -387,7 +431,8 @@ impl Default for AvailQueue {
             by_id: HashMap::new(),
             by_commitment: HashMap::new(),
             fee_order: BTreeMap::new(),
-            payload_by_id: HashMap::new()
+            ready_index: BTreeMap::new(),
+            payload_by_id: HashMap::new(),
         }
     }
 }
@@ -398,7 +443,7 @@ impl Default for RevealQueue {
             by_id: HashMap::new(),
             by_commitment: HashMap::new(),
             fee_order: BTreeMap::new(),
-            payload_by_id: HashMap::new()
+            payload_by_id: HashMap::new(),
         }
     }
 }
@@ -432,6 +477,7 @@ mod tests {
         assert!(q.avails.by_id.is_empty());
         assert!(q.avails.by_commitment.is_empty());
         assert!(q.avails.fee_order.is_empty());
+        assert!(q.avails.ready_index.is_empty());
         assert!(q.avails.payload_by_id.is_empty());
 
         // Reveals
