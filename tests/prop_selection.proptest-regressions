@@ -4,4 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc fc1eeccffca9ec27a8f015e4d7c317c33645f66041c59d33d1019d2bbc0a44cc # shrinks to il = [CommitmentId([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])], sender = "a", include_required = true
+cc 82b06cbf5d14c5b3d56ebdb2e2c2f5e71a15178161f9bbd7ae9f81339ba3be71 # shrinks to salts = [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]], sender = "0x0000000000000000000000000000000000000000", include_required = true
