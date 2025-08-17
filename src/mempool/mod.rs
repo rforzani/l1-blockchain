@@ -375,6 +375,18 @@ impl Mempool for MempoolImpl {
             if il_set.contains(&meta.commitment) {
                 continue;
             }
+
+            // STATE VIEW CHECK BEFORE APPENDING AN AVAIL TRANSACTION
+            if !state.commit_on_chain(meta.commitment) {
+                continue; // skip until commit is on-chain
+            }
+            if state.avail_on_chain(meta.commitment) {
+                continue; // skip duplicate avail
+            }
+            if !state.avail_allowed_at(height, meta.commitment) {
+                continue; // outside allowed window
+            }
+
             if let Some(avail) = avails.payload_by_id.get(txid) {
                 txs.push(Tx::Avail(avail.clone()));
                 avails_added += 1;
@@ -391,9 +403,15 @@ impl Mempool for MempoolImpl {
                 if commits_added >= limits.max_commits {
                     break;
                 }
+
                 // Fetch payload; skip if any index inconsistency.
                 if let Some(commit_tx) = commits.payload_by_id.get(txid) {
-                    // (Optional future: consult StateView for per-account pending limit)
+                    
+                    // STATEVIEW CHECK BEFORE PUSHING A COMMIT TX
+                    if state.pending_commit_room(&commit_tx.sender) == 0 {
+                        continue; // sender at pending-capacity, skip
+                    }
+
                     txs.push(Tx::Commit(commit_tx.clone()));
                     commits_added += 1;
                 }
