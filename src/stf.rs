@@ -1,18 +1,19 @@
 // src/stf.rs
 
+use crate::codec::access_list_bytes;
 use crate::crypto::commitment_hash;
 use crate::crypto::merkle_root;
 use crate::crypto::hash_bytes_sha256;
+use crate::fees::FEE_PARAMS;
 use crate::state::Available;
 use crate::state::Commitments;
-use crate::state::{AVAIL_FEE, CHAIN_ID, COMMIT_FEE, DECRYPTION_DELAY, MAX_AVAILS_PER_BLOCK, MAX_PENDING_COMMITS_PER_ACCOUNT, MAX_REVEALS_PER_BLOCK, REVEAL_WINDOW};
+use crate::state::{CHAIN_ID, DECRYPTION_DELAY, MAX_AVAILS_PER_BLOCK, MAX_PENDING_COMMITS_PER_ACCOUNT, MAX_REVEALS_PER_BLOCK, REVEAL_WINDOW};
 use crate::state::{Balances, Nonces};
 use crate::crypto::{addr_from_pubkey, addr_hex};
 use crate::codec::{tx_enum_bytes, receipt_bytes, header_bytes, tx_bytes};
 use crate::types::AvailTx;
 use crate::types::CommitmentMeta;
 use crate::types::{Block, Receipt, ExecOutcome, Hash, BlockHeader, Transaction, StateKey, Tx, Event, RevealTx, CommitTx, AccessList};
-use crate::gas::BASE_FEE_PER_TX;
 use std::collections::HashSet;
 use std::fmt;
 
@@ -68,7 +69,6 @@ pub fn process_transaction(
     nonces:   &mut Nonces,
 ) -> Result<Receipt, TxError>
 {
-    use crate::gas::BASE_FEE_PER_TX;
     use crate::types::{ExecOutcome, Receipt, StateKey};
     use crate::crypto::is_hex_addr;
     use crate::state::{MAX_AL_READS, MAX_AL_WRITES};
@@ -126,12 +126,15 @@ pub fn process_transaction(
     }
 
     // 3) Charge gas up front (fail early)
+
+    let base = FEE_PARAMS.exec_base;
+
     {
         let sb = balances.entry(tx.from.clone()).or_insert(0);
-        if *sb < BASE_FEE_PER_TX {
+        if *sb < base {
             return Err(TxError::IntrinsicInvalid("insufficient funds to pay gas fee".into()));
         }
-        *sb -= BASE_FEE_PER_TX;
+        *sb -= base;
     } // sender borrow ends
 
     // 4) Execute transfer (no overlapping &mut borrows)
@@ -173,7 +176,7 @@ pub fn process_transaction(
     nonces.insert(tx.from.clone(), expected_nonce + 1);
 
     // 6) Receipt
-    Ok(Receipt { outcome, gas_used: BASE_FEE_PER_TX, error })
+    Ok(Receipt { outcome, gas_used: base, error })
 }
 
 fn process_avail(
@@ -227,11 +230,12 @@ fn process_avail(
     }
 
     // fee paid by owner (v1)  --- TO BE CHANGED LATER
+    let avail_fee = FEE_PARAMS.avail_base;
     let bal = balances.entry(owner).or_insert(0);
-    if *bal < AVAIL_FEE {
+    if *bal < avail_fee {
         return Err(TxError::IntrinsicInvalid("insufficient funds for avail fee".into()));
     }
-    *bal -= AVAIL_FEE;
+    *bal -= avail_fee;
 
     available.insert(a.commitment);
 
@@ -320,7 +324,10 @@ pub fn process_commit(
     // --- 3) Economics / anti-abuse ---
     let sender = c.sender.clone();
     let bal = balances.entry(sender.clone()).or_insert(0);
-    if *bal < COMMIT_FEE {
+    
+    let commit_fee = FEE_PARAMS.commit_base;
+
+    if *bal < commit_fee {
         return Err(TxError::IntrinsicInvalid("insufficient funds to pay commit fee".into()));
     }
     if pending_for_owner(commitments, &c.sender) >= MAX_PENDING_COMMITS_PER_ACCOUNT {
@@ -331,7 +338,7 @@ pub fn process_commit(
             return Err(TxError::IntrinsicInvalid("duplicate commitment".into()));
         }
     }
-    *bal = bal.saturating_sub(COMMIT_FEE);
+    *bal = bal.saturating_sub(commit_fee);
 
     // --- 4) Time bounds & record ---
     let ready_at = current_height + DECRYPTION_DELAY;
@@ -356,7 +363,7 @@ pub fn process_commit(
 
     Ok(Receipt {
         outcome: ExecOutcome::Success,
-        gas_used: BASE_FEE_PER_TX,
+        gas_used: commit_fee,
         error: None,
     })
 }
@@ -374,7 +381,9 @@ fn process_reveal(
         return Err(TxError::IntrinsicInvalid("reveal sender != tx.from".to_string()));
     }
 
-    let cmt = commitment_hash(&tx_bytes(&r.tx), &r.salt, CHAIN_ID);
+    let tx_ser = tx_bytes(&r.tx);
+    let reveal_al_bytes = access_list_bytes(&r.tx.access_list);
+    let cmt = commitment_hash(&tx_ser, &reveal_al_bytes, &r.salt, CHAIN_ID);
 
     // Prepare executable transaction with access list from commitment metadata
     let mut exec_tx = Transaction {
@@ -408,6 +417,13 @@ fn process_reveal(
         }
         // --------------------------------
 
+        // verify commitment using stored access list
+        let meta_al_bytes = access_list_bytes(&meta.access_list);
+        let expected = commitment_hash(&tx_ser, &meta_al_bytes, &r.salt, CHAIN_ID);
+        if expected != cmt {
+            return Err(TxError::IntrinsicInvalid("commitment/access list mismatch".to_string()));
+        }
+
         exec_tx.access_list = meta.access_list.clone();
         meta.consumed = true; // mark as used
     }
@@ -431,7 +447,7 @@ pub fn process_block(
     let mut txs_hashes: Vec<Hash> = Vec::new();
     let mut receipt_hashes: Vec<Hash> = Vec::new();
     let mut events: Vec<Event> = Vec::new();
-    let mut revealed_pairs: Vec<(Hash, Hash)> = Vec::new(); // (commitment, tx_hash)
+    let mut revealed_pairs: Vec<(Hash, Hash)> = Vec::new();
 
     // Track reveals included in THIS block, and build IL for "due AND available"
     let mut revealed_this_block: HashSet<Hash> = HashSet::new();
@@ -490,7 +506,8 @@ pub fn process_block(
 
         // pair for reveal_set_root
         let tx_ser = tx_bytes(&r.tx);
-        let cmt    = commitment_hash(&tx_ser, &r.salt, CHAIN_ID);
+        let al_bytes = access_list_bytes(&r.tx.access_list);
+        let cmt    = commitment_hash(&tx_ser, &al_bytes, &r.salt, CHAIN_ID);
         let txh    = hash_bytes_sha256(&tx_ser);
         revealed_pairs.push((cmt, txh));
         revealed_this_block.insert(cmt);
@@ -537,7 +554,7 @@ pub fn process_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Transaction};
+    use crate::{codec::access_list_bytes, types::Transaction};
     use std::collections::HashMap;
 
     const ALICE: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -550,12 +567,8 @@ mod tests {
         use crate::chain::Chain;
         use crate::codec::{tx_bytes, string_bytes, access_list_bytes};
         use crate::crypto::{commitment_hash, commit_signing_preimage, avail_signing_preimage, addr_from_pubkey, addr_hex};
-        use crate::state::{
-            Balances, Nonces, Commitments, Available, COMMIT_FEE, DECRYPTION_DELAY, REVEAL_WINDOW,
-            CHAIN_ID, AVAIL_FEE
-        };
+        use crate::state::{Balances, Nonces, Commitments, Available, DECRYPTION_DELAY, REVEAL_WINDOW};
         use crate::types::{CommitTx, RevealTx, AvailTx, Block, ExecOutcome, Hash, AccessList, StateKey, Transaction};
-        use crate::gas::BASE_FEE_PER_TX;
     
         // helper: fill chain with empty blocks up to (but not including) `target`
         fn advance_to(
@@ -571,6 +584,10 @@ mod tests {
                 chain.apply_block(&b, balances, nonces, comms, avail).expect("advance");
             }
         }
+
+        let commit_fee = FEE_PARAMS.commit_base;
+        let base = FEE_PARAMS.exec_base;
+        let avail_fee = FEE_PARAMS.avail_base;
     
         // Deterministic keypair for signing
         let sk = SigningKey::from_bytes(&[7u8; 32]);
@@ -594,13 +611,15 @@ mod tests {
         let al = AccessList::for_transfer(&sender, &bob);
         let sender_bytes = string_bytes(&sender);
         let al_bytes     = access_list_bytes(&al);
-    
+
         // Inner plaintext transfer (to be revealed later)
         let tx = Transaction::transfer(&sender, &bob, 30, 0);
-    
+
         // Salt and commitment
         let salt: Hash = [7u8; 32];
-        let cmt = commitment_hash(&tx_bytes(&tx), &salt, CHAIN_ID);
+        let tx_ser = tx_bytes(&tx);
+        let tx_al_bytes = access_list_bytes(&tx.access_list);
+        let cmt = commitment_hash(&tx_ser, &tx_al_bytes, &salt, CHAIN_ID);
     
         // ---- Block 1: Commit (SIGNED) ----
         let ciphertext_hash = [0u8; 32];
@@ -623,7 +642,7 @@ mod tests {
             .expect("block 1 (commit) should apply");
     
         // After commit: only commit fee is burned, nonce unchanged
-        assert_eq!(balances[&sender], 100 - COMMIT_FEE);
+        assert_eq!(balances[&sender], 100 - commit_fee);
         assert_eq!(balances[&bob], 50);
         assert_eq!(*nonces.get(&sender).unwrap_or(&0), 0);
     
@@ -638,17 +657,9 @@ mod tests {
         let pre_avail = avail_signing_preimage(&cmt, &sender_bytes, CHAIN_ID);
         let sig_avail = sk.sign(&pre_avail).to_bytes();
     
-        // Reveal need not resend access list
-        let tx_no_al = Transaction::new(
-            sender.clone(),
-            bob.clone(),
-            30,
-            0,
-            AccessList { reads: vec![], writes: vec![] },
-        );
-
+        // Reveal must provide the same access list so the commitment can be recomputed
         let reveals = vec![
-            RevealTx { tx: tx_no_al, salt, sender: sender.clone() }
+            RevealTx { tx: tx.clone(), salt, sender: sender.clone() }
         ];
         let b_ready = Block::new_with_reveals(
             vec![ Tx::Avail(AvailTx {
@@ -669,12 +680,12 @@ mod tests {
         assert_eq!(res2.receipts.len(), 2);
         let rcpt_reveal = res2.receipts.last().unwrap();
         assert_eq!(rcpt_reveal.outcome, ExecOutcome::Success);
-        assert_eq!(rcpt_reveal.gas_used, BASE_FEE_PER_TX);
+        assert_eq!(rcpt_reveal.gas_used, base);
     
         // Final balances:
         // Alice: 100 - COMMIT_FEE - BASE_FEE - 30 - AVAIL_FEE
         // Bob:   50 + 30
-        assert_eq!(balances[&sender], 100 - COMMIT_FEE - BASE_FEE_PER_TX - 30 - AVAIL_FEE);
+        assert_eq!(balances[&sender], 100 - commit_fee - base - 30 - avail_fee);
         assert_eq!(balances[&bob], 80);
     
         // Nonce consumed on reveal (not on commit)
@@ -822,7 +833,9 @@ mod tests {
         // Create a commitment by simulating a commit included at height=5
         let inner = Transaction::transfer(&sender, BOB, 1, 0);
         let salt: Hash = [2u8; 32];
-        let cmt  = commitment_hash(&tx_bytes(&inner), &salt, CHAIN_ID);
+        let inner_ser = tx_bytes(&inner);
+        let inner_al_bytes = access_list_bytes(&inner.access_list);
+        let cmt  = commitment_hash(&inner_ser, &inner_al_bytes, &salt, CHAIN_ID);
 
         let ready_at = 5 + DECRYPTION_DELAY;
         let deadline = ready_at + REVEAL_WINDOW;

@@ -81,13 +81,21 @@ pub fn avail_signing_preimage(
     buf
 }
 
-pub fn commitment_hash(tx_bytes: &[u8], salt: &Hash, chain_id: u64) -> Hash {
-    // capacity = domain + chain_id(8) + tx + salt(32)
-    let mut buf = Vec::with_capacity(COMMIT_DOMAIN.len() + 8 + tx_bytes.len() + 32);
+pub fn commitment_hash(
+    tx_bytes: &[u8],
+    access_list_bytes: &[u8],
+    salt: &Hash,
+    chain_id: u64,
+) -> Hash {
+    // capacity = domain + chain_id(8) + tx + salt(32) + access_list_hash(32)
+    let mut buf = Vec::with_capacity(COMMIT_DOMAIN.len() + 8 + tx_bytes.len() + 32 + 32);
     buf.extend_from_slice(COMMIT_DOMAIN);
     buf.extend_from_slice(&chain_id.to_le_bytes());
     buf.extend_from_slice(tx_bytes);
     buf.extend_from_slice(salt);
+    // keep commitment size stable by hashing the access list bytes
+    let al_hash = hash_bytes_sha256(access_list_bytes);
+    buf.extend_from_slice(&al_hash);
     hash(&buf)
 }
 
