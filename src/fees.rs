@@ -65,7 +65,7 @@ pub struct FeeSplitBps {
 }
 
 pub const FEE_SPLIT: FeeSplitBps = FeeSplitBps {
-    burn_bps: 10_000, proposer_bps: 0, treasury_bps: 0
+    burn_bps: 9_500, proposer_bps: 500, treasury_bps: 0
 };
 
 /// Split a fee `amount` into (burn, proposer, treasury) portions
@@ -238,11 +238,13 @@ mod tests {
     }
 
     #[test]
-    fn split_amount_burn_only() {
-        let (burn, prop, tres) = split_amount(1000);
-        assert_eq!(burn, 1000);
-        assert_eq!(prop, 0);
-        assert_eq!(tres, 0);
+    fn split_amount_sends_share_to_proposer() {
+        let amount = 1000;
+        let (burn, proposer, treasury) = split_amount(amount);
+        assert_eq!(burn + proposer + treasury, amount);
+        assert_eq!(proposer, 50);   // 5% of 1000
+        assert_eq!(treasury, 0);
+        assert_eq!(burn, 950);
     }
 
     #[test]
