@@ -3,6 +3,7 @@
 
 use proptest::prelude::*;
 use std::sync::Arc;
+use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 
 // ===== Adjust the crate name if needed (Cargo.toml [package].name; hyphen -> underscore) =====
 use l1_blockchain::codec::{access_list_bytes, tx_bytes};
@@ -94,6 +95,91 @@ proptest! {
         let limits = BlockSelectionLimits { max_reveals: 10, max_avails: 0, max_commits: 0 };
         let blk = mem.select_block(&state, limits).expect("selection ok");
         prop_assert_eq!(blk.reveals.len(), 0);
+    }
+}
+
+proptest! {
+    #[test]
+    fn prop_block_selection_deterministic(
+        salts in proptest::collection::vec(any::<[u8;32]>(), 0..=6),
+        seed1 in any::<[u8;32]>(),
+        seed2 in any::<[u8;32]>(),
+    ) {
+        let cfg = cfg();
+        let mp1: Arc<MempoolImpl> = MempoolImpl::new(cfg.clone());
+        let mp2: Arc<MempoolImpl> = MempoolImpl::new(cfg);
+
+        // Build identical tx triples for both mempools
+        let mut triples = Vec::new();
+        for (i, salt) in salts.iter().enumerate() {
+            let sender = format!("0x{:040x}", i + 1);
+            let (commit, avail, reveal, cid) = build_triple(sender, 0, *salt);
+            triples.push((commit, avail, reveal, cid));
+        }
+
+        // Helper to produce shuffled operations ensuring commits precede reveals
+        fn shuffled_ops(seed: [u8;32], n: usize) -> Vec<(usize, u8)> {
+            let mut ops: Vec<(usize, u8)> = Vec::new();
+            for i in 0..n {
+                ops.push((i, 0)); // commit
+                ops.push((i, 1)); // avail
+                ops.push((i, 2)); // reveal
+            }
+            let mut rng = StdRng::from_seed(seed);
+            ops.shuffle(&mut rng);
+
+            for idx in 0..n {
+                let mut cpos = None;
+                let mut rpos = None;
+                for (pos, (ti, kind)) in ops.iter().enumerate() {
+                    if *ti == idx {
+                        match kind {
+                            0 => cpos = Some(pos),
+                            2 => rpos = Some(pos),
+                            _ => {}
+                        }
+                    }
+                }
+                if let (Some(c), Some(r)) = (cpos, rpos) {
+                    if c > r {
+                        ops.swap(c, r);
+                    }
+                }
+            }
+            ops
+        }
+
+        let n = triples.len();
+        let ops1 = shuffled_ops(seed1, n);
+        for (idx, kind) in ops1 {
+            let (ref c, ref a, ref r, _) = triples[idx];
+            match kind {
+                0 => { mp1.insert_commit(c.clone(), 0, 1).unwrap(); }
+                1 => { mp1.insert_avail(a.clone(), 0, 1).unwrap(); }
+                _ => { mp1.insert_reveal(r.clone(), 0, 1).unwrap(); }
+            }
+        }
+
+        let ops2 = shuffled_ops(seed2, n);
+        for (idx, kind) in ops2 {
+            let (ref c, ref a, ref r, _) = triples[idx];
+            match kind {
+                0 => { mp2.insert_commit(c.clone(), 0, 1).unwrap(); }
+                1 => { mp2.insert_avail(a.clone(), 0, 1).unwrap(); }
+                _ => { mp2.insert_reveal(r.clone(), 0, 1).unwrap(); }
+            }
+        }
+
+        // Select blocks with identical state view and limits
+        let il: Vec<CommitmentId> = triples.iter().map(|t| t.3).collect();
+        let state = SV { height: 0, il };
+        let limits = BlockSelectionLimits { max_reveals: 1024, max_avails: 1024, max_commits: 1024 };
+
+        let blk1 = mp1.select_block(&state, limits).expect("mp1 select");
+        let blk2 = mp2.select_block(&state, limits).expect("mp2 select");
+
+        prop_assert_eq!(blk1.reveals, blk2.reveals);
+        prop_assert_eq!(blk1.txs, blk2.txs);
     }
 }
 
@@ -286,6 +372,36 @@ fn insert_commit_only(
 
     mem.insert_commit(Tx::Commit(commit), height, fee_bid)?;
     Ok(CommitmentId(cmt))
+}
+
+/// Construct a commit, avail, and reveal triple for a given sender and nonce.
+fn build_triple(
+    sender: String,
+    nonce: u64,
+    salt: [u8; 32],
+) -> (Tx, Tx, RevealTx, CommitmentId) {
+    let reveal = make_reveal_tx(sender.clone(), nonce, salt);
+    let tx_ser = tx_bytes(&reveal.tx);
+    let al_bytes = access_list_bytes(&reveal.tx.access_list);
+    let cmt = commitment_hash(&tx_ser, &al_bytes, &reveal.salt, CHAIN_ID);
+
+    let commit = CommitTx {
+        commitment: cmt,
+        sender: sender.clone(),
+        access_list: reveal.tx.access_list.clone(),
+        ciphertext_hash: [0u8; 32],
+        pubkey: [0u8; 32],
+        sig: [0u8; 64],
+    };
+
+    let avail = AvailTx {
+        commitment: cmt,
+        sender: sender.clone(),
+        pubkey: [0u8; 32],
+        sig: [0u8; 64],
+    };
+
+    (Tx::Commit(commit), Tx::Avail(avail), reveal, CommitmentId(cmt))
 }
 
 fn cfg() -> MempoolConfig {
