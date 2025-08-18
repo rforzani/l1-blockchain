@@ -423,7 +423,8 @@ fn inclusion_list_due_must_be_included() {
     let vk2 = VerifyingKey::from(&sk2);
     let pk_bytes2 = vk2.to_bytes();
 
-    let sender: String = addr_hex(&addr_from_pubkey(&pk_bytes));
+    use crate::types::Address;
+    let sender: Address = addr_hex(&addr_from_pubkey(&pk_bytes));
     let recipient = addr_hex(&addr_from_pubkey(&pk_bytes2));
 
     // helper: fill chain with empty blocks up to (but not including) `target`

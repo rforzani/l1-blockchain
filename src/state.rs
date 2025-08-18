@@ -1,7 +1,7 @@
 // src/state.rs
 
 use std::collections::{HashMap, HashSet};
-use crate::types::{Hash, CommitmentMeta};
+use crate::types::{Hash, CommitmentMeta, Address};
 
 pub const CHAIN_ID: u64 = 1;
 pub const COMMIT_FEE: u64 = 1;
@@ -16,8 +16,8 @@ pub const MAX_PENDING_COMMITS_PER_ACCOUNT: usize = 1_000;
 pub const MAX_AL_READS: usize = 256;
 pub const MAX_AL_WRITES: usize = 256;
 
-pub type Balances = HashMap<String, u64>;
-pub type Nonces = HashMap<String, u64>;
+pub type Balances = HashMap<Address, u64>;
+pub type Nonces = HashMap<Address, u64>;
 pub type Commitments = HashMap<Hash, CommitmentMeta>; 
 pub type Available = HashSet<Hash>;
 
