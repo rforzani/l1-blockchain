@@ -1,21 +1,23 @@
 // src/types.rs
 
+pub type Address = String;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Transaction {
-    pub from: String,
-    pub to: String,
+    pub from: Address,
+    pub to: Address,
     pub amount: u64,
     pub nonce: u64,
     pub access_list: AccessList
 }
 
 impl Transaction {
-    pub fn new(from: impl Into<String>, to: impl Into<String>, amount: u64, nonce: u64, access_list: AccessList) -> Self {
+    pub fn new(from: impl Into<Address>, to: impl Into<Address>, amount: u64, nonce: u64, access_list: AccessList) -> Self {
         Self { from: from.into(), to: to.into(), amount, nonce, access_list }
     }
-    pub fn transfer(from: impl Into<String>, to: impl Into<String>, amount: u64, nonce: u64) -> Self {
-        let from_s = from.into();
-        let to_s = to.into();
+    pub fn transfer(from: impl Into<Address>, to: impl Into<Address>, amount: u64, nonce: u64) -> Self {
+        let from_s: Address = from.into();
+        let to_s: Address = to.into();
         let al = AccessList::for_transfer(&from_s, &to_s);
         Transaction { from: from_s, to: to_s, amount, nonce, access_list: al }
     }
@@ -75,8 +77,8 @@ pub struct BlockHeader {
 	•	Scheduler lock order: for each tx, lock writes first (sorted), then reads, to avoid deadlocks.
  */
 pub enum StateKey {
-    Balance(String),
-    Nonce(String),
+    Balance(Address),
+    Nonce(Address),
 }
 
 /*
@@ -112,17 +114,17 @@ impl AccessList {
         self.writes.dedup();
     }
 
-    pub fn for_transfer(from: &str, to: &str) -> Self {
+    pub fn for_transfer(from: &Address, to: &Address) -> Self {
         AccessList {
             reads: vec![
-                StateKey::Balance(from.to_string()),
-                StateKey::Balance(to.to_string()),
-                StateKey::Nonce(from.to_string()),
+                StateKey::Balance(from.clone()),
+                StateKey::Balance(to.clone()),
+                StateKey::Nonce(from.clone()),
             ],
             writes: vec![
-                StateKey::Balance(from.to_string()),
-                StateKey::Balance(to.to_string()),
-                StateKey::Nonce(from.to_string()),
+                StateKey::Balance(from.clone()),
+                StateKey::Balance(to.clone()),
+                StateKey::Nonce(from.clone()),
             ],
         }
     }
@@ -145,16 +147,16 @@ impl AccessList {
     }
 
     /// Convenience: require sender balance read+write (commit fee).
-    pub fn require_sender_balance_rw(&self, sender: &str) -> bool {
-        let k = StateKey::Balance(sender.to_string());
+    pub fn require_sender_balance_rw(&self, sender: &Address) -> bool {
+        let k = StateKey::Balance(sender.clone());
         println!("{:?}", k);
         println!("{}", Self::contains_sorted(&self.reads, &k));
         Self::contains_sorted(&self.reads, &k) && Self::contains_sorted(&self.writes, &k)
     }
 
     /// Convenience: require sender nonce read+write (reveal path).
-    pub fn require_sender_nonce_rw(&self, sender: &str) -> bool {
-        let k = StateKey::Nonce(sender.to_string());
+    pub fn require_sender_nonce_rw(&self, sender: &Address) -> bool {
+        let k = StateKey::Nonce(sender.clone());
         Self::contains_sorted(&self.reads, &k) && Self::contains_sorted(&self.writes, &k)
     }
 }
@@ -162,18 +164,18 @@ impl AccessList {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommitTx {
     pub commitment: Hash,
-    pub sender: String,
+    pub sender: Address,
     pub access_list: AccessList,
     pub ciphertext_hash: Hash,
-    pub pubkey: [u8; 32], 
+    pub pubkey: [u8; 32],
     pub sig: [u8; 64]
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct AvailTx { 
+pub struct AvailTx {
     pub commitment: Hash,
-    pub sender: String, 
-    pub pubkey: [u8; 32], 
+    pub sender: Address,
+    pub pubkey: [u8; 32],
     pub sig: [u8; 64]
 }
 
@@ -181,7 +183,7 @@ pub struct AvailTx {
 pub struct RevealTx {
     pub tx: Transaction,
     pub salt: Hash,
-    pub sender: String
+    pub sender: Address
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -192,7 +194,7 @@ pub enum Tx {
 
 #[derive(Debug, Clone)]
 pub struct CommitmentMeta {
-    pub owner: String,
+    pub owner: Address,
     pub expires_at: u64,
     pub consumed: bool,
     pub included_at: u64,
@@ -201,7 +203,7 @@ pub struct CommitmentMeta {
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    CommitStored { commitment: Hash, owner: String, expires_at: u64 },
+    CommitStored { commitment: Hash, owner: Address, expires_at: u64 },
     CommitConsumed { commitment: Hash },
     CommitExpired { commitment: Hash },
     AvailabilityRecorded { commitment: Hash }

@@ -1,7 +1,7 @@
 //src/crypto.rs
 
 use sha2::{Digest, Sha256};
-use crate::{chain, types::Hash};
+use crate::types::{Hash, Address};
 use ed25519_dalek::{Signature, VerifyingKey, Verifier};
 
 const DOM_ORDER:  &[u8] = b"ORDER";
@@ -31,7 +31,7 @@ pub fn addr_from_pubkey(pubkey: &[u8; 32]) -> [u8; 20] {
 }
 
 /// "0x" + lowercase hex encoding of a 20-byte address
-pub fn addr_hex(addr: &[u8; 20]) -> String {
+pub fn addr_hex(addr: &[u8; 20]) -> Address {
     let mut s = String::with_capacity(2 + 40);
     s.push_str("0x");
     s.push_str(&hex::encode(addr));

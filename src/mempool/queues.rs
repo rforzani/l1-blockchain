@@ -8,8 +8,7 @@ use crate::codec::{access_list_bytes, tx_bytes, tx_enum_bytes};
 use crate::crypto::{hash_bytes_sha256, is_hex_addr};
 use crate::mempool::{CommitmentId, TxId};
 use crate::state::{MAX_AL_READS, MAX_AL_WRITES};
-use crate::types::Hash;
-use crate::types::{AvailTx, CommitTx, RevealTx, StateKey, Tx};
+use crate::types::{AvailTx, CommitTx, RevealTx, StateKey, Tx, Address, Hash};
 
 /// --- Queue item shapes ---
 /// These are small, immutable records we store once a tx passes basic prechecks.
@@ -19,7 +18,7 @@ use crate::types::{AvailTx, CommitTx, RevealTx, StateKey, Tx};
 pub struct CommitQueueItem {
     pub id: TxId,
     pub commitment: CommitmentId, // equals the on-chain commitment
-    pub sender: String,           // "0x..." hex
+    pub sender: Address,           // "0x..." hex
     pub access_list_digest: Hash, // hash of canonical AL bytes
     pub fee_bid: u128,            // placeholder for future fee markets
     pub arrival_height: u64,      // when the node first saw it
@@ -29,7 +28,7 @@ pub struct CommitQueueItem {
 pub struct AvailQueueItem {
     pub id: TxId,
     pub commitment: CommitmentId,
-    pub sender: String, // must match commitment owner (STF enforces)
+    pub sender: Address, // must match commitment owner (STF enforces)
     pub ready_at: u64,  // height when avail becomes valid
     pub fee_bid: u128,
     pub arrival_height: u64,
@@ -39,7 +38,7 @@ pub struct AvailQueueItem {
 pub struct RevealQueueItem {
     pub id: TxId,
     pub commitment: CommitmentId, // recomputed from (tx_bytes, AL, salt)
-    pub sender: String,           // must equal tx.from (STF enforces)
+    pub sender: Address,           // must equal tx.from (STF enforces)
     pub nonce: u64,               // tx.nonce (needed for ordering)
     pub access_list_digest: Hash, // digest used when recomputing commitment
     pub fee_bid: u128,
@@ -64,9 +63,9 @@ pub struct CommitQueue {
     /// lookup by commitment
     pub by_commitment: HashMap<CommitmentId, TxId>,
     /// fee-ordered view for greedy selection (negated fee to sort desc via BTreeMap ascending order)
-    pub fee_order: BTreeMap<(i128, String), TxId>, // key: (-fee_bid as i128, sender)
+    pub fee_order: BTreeMap<(i128, Address), TxId>, // key: (-fee_bid as i128, sender)
     /// pending commits per owner
-    pub pending_per_owner: HashMap<String, usize>,
+    pub pending_per_owner: HashMap<Address, usize>,
     /// transaction payload mapped to its id
     pub payload_by_id: HashMap<TxId, CommitTx>,
 }
@@ -74,7 +73,7 @@ pub struct CommitQueue {
 pub struct AvailQueue {
     pub by_id: HashMap<TxId, AvailQueueItem>,
     pub by_commitment: HashMap<CommitmentId, TxId>,
-    pub fee_order: BTreeMap<(i128, String), TxId>,
+    pub fee_order: BTreeMap<(i128, Address), TxId>,
     /// Avails keyed by the height when they become ready
     pub ready_index: BTreeMap<u64, BTreeSet<TxId>>,
     pub payload_by_id: HashMap<TxId, AvailTx>,
@@ -83,9 +82,9 @@ pub struct AvailQueue {
 pub struct RevealQueue {
     pub by_id: HashMap<TxId, RevealQueueItem>,
     /// All reveals for a commitment, ordered by (sender, nonce)
-    pub by_commitment: HashMap<CommitmentId, BTreeMap<(String, u64), TxId>>,
+    pub by_commitment: HashMap<CommitmentId, BTreeMap<(Address, u64), TxId>>,
     /// fee-ordered view for extra (non-mandatory) reveals
-    pub fee_order: BTreeMap<(i128, String, u64), TxId>, // (-fee, sender, nonce)
+    pub fee_order: BTreeMap<(i128, Address, u64), TxId>, // (-fee, sender, nonce)
     /// transaction payload mapped to its id
     pub payload_by_id: HashMap<TxId, (RevealTx, CommitmentId)>,
 }
@@ -105,17 +104,17 @@ pub struct Queues {
 }
 
 impl CommitQueueItem {
-    fn key_for_fee_order(&self) -> (i128, String) {
+    fn key_for_fee_order(&self) -> (i128, Address) {
         (-(self.fee_bid as i128), self.sender.clone())
     }
 }
 impl AvailQueueItem {
-    fn key_for_fee_order(&self) -> (i128, String) {
+    fn key_for_fee_order(&self) -> (i128, Address) {
         (-(self.fee_bid as i128), self.sender.clone())
     }
 }
 impl RevealQueueItem {
-    fn key_for_fee_order(&self) -> (i128, String, u64) {
+    fn key_for_fee_order(&self) -> (i128, Address, u64) {
         (-(self.fee_bid as i128), self.sender.clone(), self.nonce)
     }
 }
