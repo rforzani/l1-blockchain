@@ -58,6 +58,7 @@ pub type Hash = [u8; 32];
 pub struct BlockHeader {
     pub parent_hash: Hash,
     pub height: u64,
+    pub proposer: Address,
     pub txs_root: Hash,
     pub receipts_root: Hash,
     pub gas_used: u64,

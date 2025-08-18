@@ -121,6 +121,7 @@ pub fn header_bytes(h: &BlockHeader) -> Vec<u8> {
     
     v.extend_from_slice(&h.parent_hash);
     put_u64(&mut v, h.height);
+    put_str(&mut v, &h.proposer);
     v.extend_from_slice(&h.txs_root);
     v.extend_from_slice(&h.receipts_root);
     put_u64(&mut v, h.gas_used);

@@ -58,6 +58,32 @@ impl FeeState {
     }
 }
 
+pub struct FeeSplitBps {
+    pub burn_bps: u16,
+    pub proposer_bps: u16,
+    pub treasury_bps: u16,
+}
+
+pub const FEE_SPLIT: FeeSplitBps = FeeSplitBps {
+    burn_bps: 10_000, proposer_bps: 0, treasury_bps: 0
+};
+
+/// Split a fee `amount` into (burn, proposer, treasury) portions
+/// according to `FEE_SPLIT`. Totals are conserved; any rounding
+/// remainder is added to burn.
+pub fn split_amount(amount: u64) -> (u64 /*burn*/, u64 /*proposer*/, u64 /*treasury*/) {
+    let total_bps: u64 = 10_000; // 100% in basis points
+
+    let proposer = amount.saturating_mul(FEE_SPLIT.proposer_bps as u64) / total_bps;
+    let treasury = amount.saturating_mul(FEE_SPLIT.treasury_bps as u64) / total_bps;
+
+    // Burn is “what’s left” after proposer+treasury; ensures exact conservation
+    let used = proposer + treasury;
+    let burn = amount.saturating_sub(used);
+
+    (burn, proposer, treasury)
+}
+
 /// EIP-1559 style update on *execution* lane using reveal count.
 pub fn update_exec_base(
     prev_base: u64,
@@ -209,5 +235,23 @@ mod tests {
             FEE_PARAMS.exec_damping_bps,
         );
         assert!(next_damped - prev <= next_nodamp - prev);
+    }
+
+    #[test]
+    fn split_amount_burn_only() {
+        let (burn, prop, tres) = split_amount(1000);
+        assert_eq!(burn, 1000);
+        assert_eq!(prop, 0);
+        assert_eq!(tres, 0);
+    }
+
+    #[test]
+    fn split_amount_with_shares() {
+        // imagine config is burn=8000, proposer=1500, treasury=500
+        let (burn, prop, tres) = split_amount(1000);
+        assert_eq!(burn + prop + tres, 1000);
+        assert_eq!(prop, 150);
+        assert_eq!(tres, 50);
+        assert_eq!(burn, 800);
     }
 }
