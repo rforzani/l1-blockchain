@@ -11,12 +11,15 @@ pub struct FeeParams {
 
     // Targets (units: items per block)
     pub exec_target_reveals_per_block: u32,
-    pub commit_target_commits: u32,
-    pub avail_target_avails: u32,
+    pub commit_target_commits_per_block: u32,
+    pub avail_target_avails_per_block: u32,
 
-    // Per-lane tuning (for Point 2 we ONLY use the exec ones)
+    // Per-lane tuning
     pub exec_max_change_denominator: u16,   // e.g. 1250 = ±12.5% per block
     pub exec_damping_bps: u16,      // 10_000 = no extra damping
+
+    pub commit_max_change_denominator: u16,   // e.g. 1250 = ±12.5% per block
+    pub commit_damping_bps: u16,      // 10_000 = no extra damping
 
     // Floors
     pub exec_min_base: u64,
@@ -30,11 +33,14 @@ pub const FEE_PARAMS: FeeParams = FeeParams {
     avail_base_init:  AVAIL_FEE,
 
     exec_target_reveals_per_block:    70,
-    commit_target_commits:  50,
-    avail_target_avails:    50,
+    commit_target_commits_per_block:  50,
+    avail_target_avails_per_block:    50,
 
     exec_max_change_denominator: 1250,
     exec_damping_bps: 10_000, // start with no damping; tune later
+
+    commit_max_change_denominator: 1250,
+    commit_damping_bps: 10_000, // start with no damping; tune later
 
     exec_min_base:   BASE_FEE_PER_TX,
     min_commit: COMMIT_FEE,
@@ -82,6 +88,17 @@ pub fn split_amount(amount: u64) -> (u64 /*burn*/, u64 /*proposer*/, u64 /*treas
     let burn = amount.saturating_sub(used);
 
     (burn, proposer, treasury)
+}
+
+pub fn update_commit_base(prev_base: u64, commits_used: u32) -> u64 {
+    update_exec_base(
+        prev_base,
+        commits_used,
+        FEE_PARAMS.commit_target_commits_per_block,
+        FEE_PARAMS.commit_max_change_denominator,
+        FEE_PARAMS.min_commit,
+        FEE_PARAMS.commit_damping_bps,
+    )
 }
 
 /// EIP-1559 style update on *execution* lane using reveal count.
@@ -170,7 +187,7 @@ mod tests {
             FEE_PARAMS.exec_target_reveals_per_block,
             FEE_PARAMS.exec_max_change_denominator,
             FEE_PARAMS.exec_min_base,
-            FEE_PARAMS.exec_damping_bps,
+            FEE_PARAMS.exec_damping_bps,   
         );
         assert!(next > prev);
         assert!(next <= prev + cap_step(prev));

@@ -1,6 +1,6 @@
 //src/chain.rs
 
-use crate::fees::{update_exec_base, FeeState, FEE_PARAMS};
+use crate::fees::{update_commit_base, update_exec_base, FeeState, FEE_PARAMS};
 use crate::stf::{process_block, BlockResult, BlockError};
 use crate::state::{Available, Balances, Commitments, Nonces, CHAIN_ID, DECRYPTION_DELAY, REVEAL_WINDOW, ZERO_ADDRESS};
 use crate::types::{Block, Hash};
@@ -85,6 +85,10 @@ impl Chain {
         self.tip_hash = res.block_hash;
         self.height = block.block_number;
         self.fee_state.exec_base = next_exec;
+        self.fee_state.commit_base = update_commit_base(
+            self.fee_state.commit_base,
+            res.commits_used,
+        );
         Ok(res)
     }
 }

@@ -62,6 +62,7 @@ pub struct BlockResult {
     pub block_hash: Hash,
     pub events: Vec<Event>,
     pub exec_reveals_used: u32,
+    pub commits_used: u32,
 }
 
 pub fn process_transaction(
@@ -493,6 +494,7 @@ pub fn process_block(
     let mut receipts: Vec<Receipt> = Vec::new();
     let mut gas_total: u64 = 0;
     let mut reveals_included: u32 = 0;
+    let mut commits_included: u32 = 0;
 
     let mut txs_hashes: Vec<Hash> = Vec::new();
     let mut receipt_hashes: Vec<Hash> = Vec::new();
@@ -524,6 +526,8 @@ pub fn process_block(
 
     // 1) Process "transactions" (commit/avail only)
     for (i, tx) in block.transactions.iter().enumerate() {
+        let is_commit = matches!(tx, Tx::Commit(_));
+
         let rcpt_res = match tx {
             Tx::Commit(c) => process_commit(c, balances, commitments, block.block_number, &mut events, fee_state, proposer, burned_total),
             Tx::Avail(a)  => process_avail(a, commitments, available, block.block_number, &mut events, balances, fee_state, proposer, burned_total),
@@ -531,6 +535,9 @@ pub fn process_block(
 
         match rcpt_res {
             Ok(receipt) => {
+                if is_commit { 
+                    commits_included += 1; 
+                }
                 gas_total += receipt.gas_used;
                 txs_hashes.push(hash_bytes_sha256(&tx_enum_bytes(tx)));
                 receipt_hashes.push(hash_bytes_sha256(&receipt_bytes(&receipt)));
@@ -550,7 +557,7 @@ pub fn process_block(
 
     for r in &reveals_sorted {
         let rcpt = process_reveal(r, balances, nonces, block.block_number, commitments, &mut events, fee_state, proposer, burned_total)?;
-        reveals_included = reveals_included + 1;
+        reveals_included += 1;
         gas_total += rcpt.gas_used;
         receipt_hashes.push(hash_bytes_sha256(&receipt_bytes(&rcpt)));
         receipts.push(rcpt);
@@ -603,7 +610,7 @@ pub fn process_block(
     };
     let block_hash = hash_bytes_sha256(&header_bytes(&header));
 
-    Ok(BlockResult { receipts, gas_total, txs_root, receipts_root, header, block_hash, events, exec_reveals_used: reveals_included })
+    Ok(BlockResult { receipts, gas_total, txs_root, receipts_root, header, block_hash, events, exec_reveals_used: reveals_included, commits_used: commits_included })
 }
 
 #[cfg(test)]
