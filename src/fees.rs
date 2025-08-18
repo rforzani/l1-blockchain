@@ -64,6 +64,17 @@ impl FeeState {
     }
 }
 
+pub enum Lane { Exec, Commit, Avail }
+
+#[inline]
+pub fn lane_base(f: &FeeState, lane: Lane) -> u64 {
+    match lane {
+        Lane::Exec => f.exec_base,
+        Lane::Commit => f.commit_base,
+        Lane::Avail => f.avail_base,
+    }
+}
+
 pub struct FeeSplitBps {
     pub burn_bps: u16,
     pub proposer_bps: u16,
