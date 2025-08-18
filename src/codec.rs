@@ -127,6 +127,9 @@ pub fn header_bytes(h: &BlockHeader) -> Vec<u8> {
     v.extend_from_slice(&h.randomness);       
     v.extend_from_slice(&h.reveal_set_root);
     v.extend_from_slice(&h.il_root);
+    put_u64(&mut v, h.exec_base_fee);
+    put_u64(&mut v, h.commit_base_fee);
+    put_u64(&mut v, h.avail_base_fee);
 
     v
 }

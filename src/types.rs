@@ -61,7 +61,10 @@ pub struct BlockHeader {
     pub gas_used: u64,
     pub randomness: Hash,
     pub reveal_set_root: Hash,
-    pub il_root: Hash
+    pub il_root: Hash,
+    pub exec_base_fee: u64,
+    pub commit_base_fee: u64,
+    pub avail_base_fee: u64
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

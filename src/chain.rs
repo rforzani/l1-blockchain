@@ -1,18 +1,20 @@
 //src/chain.rs
 
+use crate::fees::FeeState;
 use crate::stf::{process_block, BlockResult, BlockError};
-use crate::state::{Available, Balances, Commitments, Nonces, AVAIL_FEE, CHAIN_ID, DECRYPTION_DELAY, REVEAL_WINDOW};
+use crate::state::{Available, Balances, Commitments, Nonces, CHAIN_ID, DECRYPTION_DELAY, REVEAL_WINDOW};
 use crate::types::{Block, Hash};
 use crate::verify::verify_block_roots;
 
 pub struct Chain {
     pub tip_hash: Hash,
     pub height: u64,
+    pub fee_state: FeeState
 }
 
 impl Chain {
     pub fn new() -> Self {
-        Self { tip_hash: [0u8;32], height: 0 }
+        Self { tip_hash: [0u8;32], height: 0, fee_state: FeeState::from_defaults() }
     }
 
     // Returns BlockResult on success (so caller can inspect roots, receipts, etc.)
@@ -38,7 +40,7 @@ impl Chain {
         let mut sim_available = available.clone();
 
         // 2) process with current tip as parent
-        let res = process_block(block, &mut sim_balances, &mut sim_nonces, &mut sim_commitments, &mut sim_available, &self.tip_hash)?;
+        let res = process_block(block, &mut sim_balances, &mut sim_nonces, &mut sim_commitments, &mut sim_available, &self.tip_hash, &self.fee_state)?;
 
         // Parent guard: the block we just built must link to our tip
         if res.header.parent_hash != self.tip_hash {
@@ -359,6 +361,8 @@ fn tamper_block_no_state_change() {
     let mut commitments: Commitments = Default::default();
     let mut available:   Available   = Default::default();
 
+    let fee_state = FeeState::from_defaults();
+
     // Build (builder path)
     let res = process_block(
         &block,
@@ -367,6 +371,7 @@ fn tamper_block_no_state_change() {
         &mut commitments,
         &mut available,
         &parent,
+        &fee_state
     ).expect("ok");
 
     // Sanity: commit fee burned, nonce unchanged
@@ -540,14 +545,13 @@ fn reveal_bundle_executes_multiple_reveals_and_satisfies_il() {
     use crate::chain::Chain;
     use crate::state::{
         Balances, Nonces, Commitments, Available,
-        DECRYPTION_DELAY, REVEAL_WINDOW, COMMIT_FEE, AVAIL_FEE, CHAIN_ID
+        DECRYPTION_DELAY, REVEAL_WINDOW, CHAIN_ID
     };
     use crate::types::{
         Block, Tx, CommitTx, RevealTx, Transaction, AccessList, StateKey, Hash, AvailTx
     };
     use crate::codec::{tx_bytes, string_bytes, access_list_bytes};
     use crate::crypto::{commitment_hash, commit_signing_preimage, avail_signing_preimage};
-    use crate::gas::BASE_FEE_PER_TX;
     use crate::crypto::{addr_from_pubkey, addr_hex};
 
     // helper: advance chain with empty blocks up to (but not including) `target`
@@ -683,9 +687,11 @@ fn reveal_bundle_executes_multiple_reveals_and_satisfies_il() {
     assert_eq!(res.receipts.len(), 2);
     println!("{:?}", res.receipts[0]);
 
+    let fee_state = FeeState::from_defaults();
+
     // balances: commit fees + reveal gas + transfers + avail fees
     // Alice started 1000; paid 2*COMMIT_FEE at b1; then pays 2*BASE_FEE and transfers 30 total; plus 2 * AVAIL_FEE
-    let expected_alice = 1_000 - 2*COMMIT_FEE - 2*BASE_FEE_PER_TX - 10 - 20 - 2*AVAIL_FEE;
+    let expected_alice = 1_000 - 2*fee_state.commit_base - 2*fee_state.exec_base - 10 - 20 - 2*fee_state.avail_base;
     assert_eq!(balances[&sender], expected_alice);
 }
 

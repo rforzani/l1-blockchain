@@ -30,3 +30,20 @@ pub const FEE_PARAMS: FeeParams = FeeParams {
     min_commit: COMMIT_FEE,
     min_avail:  AVAIL_FEE,
 };
+
+#[derive(Clone, Copy, Debug)] 
+pub struct FeeState { 
+    pub exec_base: u64, 
+    pub commit_base: u64, 
+    pub avail_base: u64 
+}
+
+impl FeeState { 
+    pub fn from_defaults() -> Self {
+        Self { 
+            exec_base: FEE_PARAMS.exec_base, 
+            commit_base: FEE_PARAMS.commit_base, 
+            avail_base: FEE_PARAMS.avail_base 
+        }
+    }
+}

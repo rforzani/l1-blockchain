@@ -415,8 +415,6 @@ fn cfg() -> MempoolConfig {
     }
 }
 
-// -------------------- The property test --------------------
-
 proptest! {
     /// IL must succeed iff each IL commitment has a reveal at the required nonce (0 in this SV).
     #[test]

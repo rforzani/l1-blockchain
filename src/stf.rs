@@ -4,7 +4,7 @@ use crate::codec::access_list_bytes;
 use crate::crypto::commitment_hash;
 use crate::crypto::merkle_root;
 use crate::crypto::hash_bytes_sha256;
-use crate::fees::FEE_PARAMS;
+use crate::fees::{FeeState};
 use crate::state::Available;
 use crate::state::Commitments;
 use crate::state::{CHAIN_ID, DECRYPTION_DELAY, MAX_AVAILS_PER_BLOCK, MAX_PENDING_COMMITS_PER_ACCOUNT, MAX_REVEALS_PER_BLOCK, REVEAL_WINDOW};
@@ -67,6 +67,7 @@ pub fn process_transaction(
     tx: &Transaction,
     balances: &mut Balances,
     nonces:   &mut Nonces,
+    fee_state: &FeeState
 ) -> Result<Receipt, TxError>
 {
     use crate::types::{ExecOutcome, Receipt, StateKey};
@@ -127,7 +128,7 @@ pub fn process_transaction(
 
     // 3) Charge gas up front (fail early)
 
-    let base = FEE_PARAMS.exec_base;
+    let base = fee_state.exec_base;
 
     {
         let sb = balances.entry(tx.from.clone()).or_insert(0);
@@ -185,7 +186,8 @@ fn process_avail(
     available: &mut Available,
     current_height: u64,
     events: &mut Vec<Event>,
-    balances: &mut Balances
+    balances: &mut Balances,
+    fee_state: &FeeState
 ) -> Result<Receipt, TxError> {
     use crate::codec::string_bytes;
     use crate::crypto::{avail_signing_preimage, verify_ed25519};
@@ -230,7 +232,7 @@ fn process_avail(
     }
 
     // fee paid by owner (v1)  --- TO BE CHANGED LATER
-    let avail_fee = FEE_PARAMS.avail_base;
+    let avail_fee = fee_state.avail_base;
     let bal = balances.entry(owner).or_insert(0);
     if *bal < avail_fee {
         return Err(TxError::IntrinsicInvalid("insufficient funds for avail fee".into()));
@@ -260,6 +262,7 @@ pub fn process_commit(
     commitments: &mut Commitments,
     current_height: u64,
     events: &mut Vec<Event>,
+    fee_state: &FeeState
 ) -> Result<Receipt, TxError> {
     use crate::codec::{string_bytes, access_list_bytes};
     use crate::crypto::{commit_signing_preimage, verify_ed25519, addr_from_pubkey, addr_hex, is_hex_addr};
@@ -325,7 +328,7 @@ pub fn process_commit(
     let sender = c.sender.clone();
     let bal = balances.entry(sender.clone()).or_insert(0);
     
-    let commit_fee = FEE_PARAMS.commit_base;
+    let commit_fee = fee_state.commit_base;
 
     if *bal < commit_fee {
         return Err(TxError::IntrinsicInvalid("insufficient funds to pay commit fee".into()));
@@ -375,6 +378,7 @@ fn process_reveal(
     current_height: u64,
     commitments: &mut Commitments,
     events: &mut Vec<Event>,
+    fee_state: &FeeState
 ) -> Result<Receipt, TxError> {
     // Sender sanity
     if r.sender != r.tx.from {
@@ -430,7 +434,7 @@ fn process_reveal(
 
     events.push(Event::CommitConsumed { commitment: cmt });
 
-    process_transaction(&exec_tx, balances, nonces)
+    process_transaction(&exec_tx, balances, nonces, fee_state)
 }
 
 pub fn process_block(
@@ -440,6 +444,7 @@ pub fn process_block(
     commitments: &mut Commitments,
     available: &mut Available,
     parent_hash: &Hash,
+    fee_state: &FeeState
 ) -> Result<BlockResult, BlockError> {
     let mut receipts: Vec<Receipt> = Vec::new();
     let mut gas_total: u64 = 0;
@@ -475,8 +480,8 @@ pub fn process_block(
     // 1) Process "transactions" (commit/avail only)
     for (i, tx) in block.transactions.iter().enumerate() {
         let rcpt_res = match tx {
-            Tx::Commit(c) => process_commit(c, balances, commitments, block.block_number, &mut events),
-            Tx::Avail(a)  => process_avail(a, commitments, available, block.block_number, &mut events, balances),
+            Tx::Commit(c) => process_commit(c, balances, commitments, block.block_number, &mut events, fee_state),
+            Tx::Avail(a)  => process_avail(a, commitments, available, block.block_number, &mut events, balances, fee_state),
         };
 
         match rcpt_res {
@@ -499,7 +504,7 @@ pub fn process_block(
     reveals_sorted.sort_by(|a, b| a.sender.cmp(&b.sender).then(a.tx.nonce.cmp(&b.tx.nonce)));
 
     for r in &reveals_sorted {
-        let rcpt = process_reveal(r, balances, nonces, block.block_number, commitments, &mut events)?;
+        let rcpt = process_reveal(r, balances, nonces, block.block_number, commitments, &mut events, fee_state)?;
         gas_total += rcpt.gas_used;
         receipt_hashes.push(hash_bytes_sha256(&receipt_bytes(&rcpt)));
         receipts.push(rcpt);
@@ -545,6 +550,9 @@ pub fn process_block(
         randomness: *parent_hash,
         reveal_set_root,
         il_root,
+        exec_base_fee: fee_state.exec_base,
+        commit_base_fee: fee_state.commit_base,
+        avail_base_fee: fee_state.avail_base
     };
     let block_hash = hash_bytes_sha256(&header_bytes(&header));
 
@@ -585,9 +593,11 @@ mod tests {
             }
         }
 
-        let commit_fee = FEE_PARAMS.commit_base;
-        let base = FEE_PARAMS.exec_base;
-        let avail_fee = FEE_PARAMS.avail_base;
+        let fee_state = FeeState::from_defaults();
+
+        let commit_fee = fee_state.commit_base;
+        let base = fee_state.exec_base;
+        let avail_fee = fee_state.avail_base;
     
         // Deterministic keypair for signing
         let sk = SigningKey::from_bytes(&[7u8; 32]);
@@ -709,8 +719,10 @@ mod tests {
         ]);
         let mut nonces = Default::default();
 
+        let fee_state = FeeState::from_defaults();
+
         let tx = Transaction::transfer(ALICE, BOB, 30,0);
-        let rcpt = process_transaction(&tx, &mut balances, &mut nonces).expect("valid but reverts");
+        let rcpt = process_transaction(&tx, &mut balances, &mut nonces, &fee_state).expect("valid but reverts");
         assert_eq!(rcpt.outcome, ExecOutcome::Revert);
         assert!(rcpt.error.is_some());
         assert_eq!(balances[ALICE], 19);
@@ -728,7 +740,9 @@ mod tests {
 
         let tx = Transaction::transfer(ALICE, BOB, 1, 0);
     
-        match process_transaction(&tx, &mut balances, &mut nonces) {
+        let fee_state = FeeState::from_defaults();
+
+        match process_transaction(&tx, &mut balances, &mut nonces, &fee_state) {
             Err(TxError::IntrinsicInvalid(msg)) => {
                 assert!(msg.contains("insufficient funds"));
             }
@@ -759,7 +773,9 @@ mod tests {
 
         let tx = Transaction::new(ALICE, BOB, 1, 0, al);
 
-        match process_transaction(&tx, &mut balances, &mut nonces) {
+        let fee_state = FeeState::from_defaults();
+
+        match process_transaction(&tx, &mut balances, &mut nonces, &fee_state) {
             Err(TxError::IntrinsicInvalid(msg)) => {
                 assert!(msg.contains("recipient balance write"));
             }
@@ -790,7 +806,9 @@ mod tests {
 
         let tx = Transaction::new(ALICE, BOB, 1, 0, al);
 
-        match process_transaction(&tx, &mut balances, &mut nonces) {
+        let fee_state = FeeState::from_defaults();
+
+        match process_transaction(&tx, &mut balances, &mut nonces, &fee_state) {
             Err(_) => {
                 panic!("Unexpected Error")
             },
@@ -860,11 +878,13 @@ mod tests {
             pubkey: pk_bytes,
             sig,
         };
+
+        let fee_state = FeeState::from_defaults();
     
         // Early: height = ready_at - 1
         let early_h = ready_at - 1;
         let err1 = crate::stf::process_avail(
-            &a, &mut commitments, &mut available, early_h, &mut events, &mut balances
+            &a, &mut commitments, &mut available, early_h, &mut events, &mut balances, &fee_state
         ).expect_err("early avail must be rejected");
         match err1 {
             crate::stf::TxError::IntrinsicInvalid(m) => {
@@ -875,7 +895,7 @@ mod tests {
         // Late: height = deadline + 1
         let late_h = deadline + 1;
         let err2 = crate::stf::process_avail(
-            &a, &mut commitments, &mut available, late_h, &mut events, &mut balances
+            &a, &mut commitments, &mut available, late_h, &mut events, &mut balances, &fee_state
         ).expect_err("late avail must be rejected");
         match err2 {
             crate::stf::TxError::IntrinsicInvalid(m) => {

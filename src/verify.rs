@@ -63,6 +63,7 @@ pub fn verify_block_roots(header: &BlockHeader, block: &Block, receipts: &[Recei
 fn verify_block_roots_catches_tamper() {
     use std::collections::HashMap;
     use ed25519_dalek::{SigningKey, VerifyingKey, Signer as _};
+    use crate::fees::FeeState;
     use crate::state::{Balances, Nonces, Commitments, Available, CHAIN_ID};
     use crate::stf::process_block;
     use crate::types::{Block, Tx, CommitTx, Hash, AccessList, StateKey};
@@ -109,6 +110,8 @@ fn verify_block_roots_catches_tamper() {
 
     // Genesis parent
     let parent: Hash = [0u8; 32];
+    
+    let fee_state = FeeState::from_defaults();
 
     // Build (builder path)
     let res = process_block(
@@ -117,7 +120,8 @@ fn verify_block_roots_catches_tamper() {
         &mut nonces,
         &mut comm,
         &mut avail,
-        &parent
+        &parent,
+        &fee_state
     ).expect("ok");
 
     // Verify (ok)
