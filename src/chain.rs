@@ -1127,3 +1127,93 @@ fn availability_outside_window_rejected() {
         other => panic!("expected IntrinsicInvalid for late avail, got {:?}", other),
     }
 }
+
+#[test]
+fn commit_base_tracks_commits_and_avails_static() {
+    use std::collections::HashMap;
+
+    use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
+
+    use crate::{
+        chain::Chain,
+        codec::{access_list_bytes, string_bytes},
+        crypto::{addr_from_pubkey, addr_hex, commit_signing_preimage},
+        fees::FEE_PARAMS,
+        state::{Balances, Nonces, Commitments, Available, CHAIN_ID},
+        types::{Block, CommitTx, Tx, AccessList, StateKey},
+    };
+    // Setup signer and sender address
+    let sk = SigningKey::from_bytes(&[1u8; 32]);
+    let vk = VerifyingKey::from(&sk);
+    let pk_bytes = vk.to_bytes();
+    let sender = addr_hex(&addr_from_pubkey(&pk_bytes));
+
+    // Chain with elevated commit base so adjustments are visible
+    let mut chain = Chain::new();
+    chain.fee_state.commit_base = 2_000;
+    let initial_commit_base = chain.fee_state.commit_base;
+    let initial_avail_base = chain.fee_state.avail_base;
+
+    // State with enough balance to cover many commits
+    let mut balances: Balances = HashMap::from([(sender.clone(), 300_000u64)]);
+    let mut nonces: Nonces = Default::default();
+    let mut commits: Commitments = Default::default();
+    let mut avail: Available = Default::default();
+
+    // Access list required for commit transactions
+    let al = AccessList {
+        reads: vec![
+            StateKey::Balance(sender.clone()),
+            StateKey::Nonce(sender.clone()),
+        ],
+        writes: vec![
+            StateKey::Balance(sender.clone()),
+            StateKey::Nonce(sender.clone()),
+        ],
+    };
+
+    // Block 1: no commits
+    let b1 = Block::new(Vec::new(), 1);
+    let res1 = chain
+        .apply_block(&b1, &mut balances, &mut nonces, &mut commits, &mut avail)
+        .expect("block 1 should apply");
+
+    assert_eq!(res1.commits_used, 0);
+    assert!(chain.fee_state.commit_base < initial_commit_base);
+    assert!(chain.fee_state.commit_base >= FEE_PARAMS.min_commit);
+    assert_eq!(chain.fee_state.avail_base, initial_avail_base);
+
+    let after_b1 = chain.fee_state.commit_base;
+
+    // Prepare many commit transactions for block 2
+    let mut txs = Vec::new();
+    let sender_bytes = string_bytes(&sender);
+    let al_bytes = access_list_bytes(&al);
+    let high_commits = 2 * FEE_PARAMS.commit_target_commits_per_block;
+    for i in 0..high_commits {
+        let mut commitment = [0u8; 32];
+        commitment[0] = i as u8;
+        let pre = commit_signing_preimage(&commitment, &[0u8; 32], &sender_bytes, &al_bytes, CHAIN_ID);
+        let sig = sk.sign(&pre).to_bytes();
+        txs.push(Tx::Commit(CommitTx {
+            commitment,
+            sender: sender.clone(),
+            ciphertext_hash: [0u8; 32],
+            access_list: al.clone(),
+            pubkey: pk_bytes,
+            sig,
+        }));
+    }
+
+    // Block 2: many commits
+    let b2 = Block::new(txs, 2);
+    let res2 = chain
+        .apply_block(&b2, &mut balances, &mut nonces, &mut commits, &mut avail)
+        .expect("block 2 should apply");
+
+    assert_eq!(res2.commits_used, high_commits as u32);
+    assert!(chain.fee_state.commit_base > after_b1);
+    let max_cap = after_b1 + (after_b1 / FEE_PARAMS.commit_max_change_denominator as u64).max(1);
+    assert!(chain.fee_state.commit_base <= max_cap);
+    assert_eq!(chain.fee_state.avail_base, initial_avail_base);
+}
