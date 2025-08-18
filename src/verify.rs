@@ -114,6 +114,8 @@ fn verify_block_roots_catches_tamper() {
     let fee_state = FeeState::from_defaults();
 
     // Build (builder path)
+    let proposer = crate::state::ZERO_ADDRESS.to_string();
+    let mut burned_total = 0;
     let res = process_block(
         &block,
         &mut balances,
@@ -121,7 +123,9 @@ fn verify_block_roots_catches_tamper() {
         &mut comm,
         &mut avail,
         &parent,
-        &fee_state
+        &fee_state,
+        &proposer,
+        &mut burned_total,
     ).expect("ok");
 
     // Verify (ok)

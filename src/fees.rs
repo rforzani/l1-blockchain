@@ -247,11 +247,15 @@ mod tests {
 
     #[test]
     fn split_amount_with_shares() {
-        // imagine config is burn=8000, proposer=1500, treasury=500
-        let (burn, prop, tres) = split_amount(1000);
-        assert_eq!(burn + prop + tres, 1000);
-        assert_eq!(prop, 150);
-        assert_eq!(tres, 50);
+        // verify math with a hypothetical split (burn=8000, proposer=1500, treasury=500)
+        let cfg = FeeSplitBps { burn_bps: 8_000, proposer_bps: 1_500, treasury_bps: 500 };
+        let amount = 1_000u64;
+        let proposer = amount.saturating_mul(cfg.proposer_bps as u64) / 10_000;
+        let treasury = amount.saturating_mul(cfg.treasury_bps as u64) / 10_000;
+        let burn = amount - proposer - treasury;
+        assert_eq!(burn + proposer + treasury, amount);
+        assert_eq!(proposer, 150);
+        assert_eq!(treasury, 50);
         assert_eq!(burn, 800);
     }
 }

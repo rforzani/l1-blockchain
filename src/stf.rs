@@ -4,16 +4,16 @@ use crate::codec::access_list_bytes;
 use crate::crypto::commitment_hash;
 use crate::crypto::merkle_root;
 use crate::crypto::hash_bytes_sha256;
-use crate::fees::{FeeState};
+use crate::fees::{FeeState, split_amount};
 use crate::state::Available;
 use crate::state::Commitments;
-use crate::state::{CHAIN_ID, DECRYPTION_DELAY, MAX_AVAILS_PER_BLOCK, MAX_PENDING_COMMITS_PER_ACCOUNT, MAX_REVEALS_PER_BLOCK, REVEAL_WINDOW};
+use crate::state::{CHAIN_ID, DECRYPTION_DELAY, MAX_AVAILS_PER_BLOCK, MAX_PENDING_COMMITS_PER_ACCOUNT, MAX_REVEALS_PER_BLOCK, REVEAL_WINDOW, TREASURY_ADDRESS};
 use crate::state::{Balances, Nonces};
 use crate::crypto::{addr_from_pubkey, addr_hex};
 use crate::codec::{tx_enum_bytes, receipt_bytes, header_bytes, tx_bytes};
 use crate::types::AvailTx;
 use crate::types::CommitmentMeta;
-use crate::types::{Block, Receipt, ExecOutcome, Hash, BlockHeader, Transaction, StateKey, Tx, Event, RevealTx, CommitTx, AccessList};
+use crate::types::{Block, Receipt, ExecOutcome, Hash, BlockHeader, Transaction, StateKey, Tx, Event, RevealTx, CommitTx, AccessList, Address};
 use std::collections::HashSet;
 use std::fmt;
 
@@ -68,7 +68,9 @@ pub fn process_transaction(
     tx: &Transaction,
     balances: &mut Balances,
     nonces:   &mut Nonces,
-    fee_state: &FeeState
+    fee_state: &FeeState,
+    proposer: &Address,
+    burned_total: &mut u64,
 ) -> Result<Receipt, TxError>
 {
     use crate::types::{ExecOutcome, Receipt, StateKey};
@@ -139,6 +141,17 @@ pub fn process_transaction(
         *sb -= base;
     } // sender borrow ends
 
+    let (burn, prop, tres) = split_amount(base);
+    *burned_total += burn;
+    if prop > 0 {
+        let pb = balances.entry(proposer.clone()).or_insert(0);
+        *pb = pb.saturating_add(prop);
+    }
+    if tres > 0 {
+        let tb = balances.entry(TREASURY_ADDRESS.to_string()).or_insert(0);
+        *tb = tb.saturating_add(tres);
+    }
+
     // 4) Execute transfer (no overlapping &mut borrows)
     let mut outcome = ExecOutcome::Success;
     let mut error: Option<String> = None;
@@ -188,7 +201,9 @@ fn process_avail(
     current_height: u64,
     events: &mut Vec<Event>,
     balances: &mut Balances,
-    fee_state: &FeeState
+    fee_state: &FeeState,
+    proposer: &Address,
+    burned_total: &mut u64,
 ) -> Result<Receipt, TxError> {
     use crate::codec::string_bytes;
     use crate::crypto::{avail_signing_preimage, verify_ed25519};
@@ -240,6 +255,17 @@ fn process_avail(
     }
     *bal -= avail_fee;
 
+    let (burn, prop, tres) = split_amount(avail_fee);
+    *burned_total += burn;
+    if prop > 0 {
+        let pb = balances.entry(proposer.clone()).or_insert(0);
+        *pb = pb.saturating_add(prop);
+    }
+    if tres > 0 {
+        let tb = balances.entry(TREASURY_ADDRESS.to_string()).or_insert(0);
+        *tb = tb.saturating_add(tres);
+    }
+
     available.insert(a.commitment);
 
     // idempotent insert
@@ -263,7 +289,9 @@ pub fn process_commit(
     commitments: &mut Commitments,
     current_height: u64,
     events: &mut Vec<Event>,
-    fee_state: &FeeState
+    fee_state: &FeeState,
+    proposer: &Address,
+    burned_total: &mut u64,
 ) -> Result<Receipt, TxError> {
     use crate::codec::{string_bytes, access_list_bytes};
     use crate::crypto::{commit_signing_preimage, verify_ed25519, addr_from_pubkey, addr_hex, is_hex_addr};
@@ -344,6 +372,17 @@ pub fn process_commit(
     }
     *bal = bal.saturating_sub(commit_fee);
 
+    let (burn, prop, tres) = split_amount(commit_fee);
+    *burned_total += burn;
+    if prop > 0 {
+        let pb = balances.entry(proposer.clone()).or_insert(0);
+        *pb = pb.saturating_add(prop);
+    }
+    if tres > 0 {
+        let tb = balances.entry(TREASURY_ADDRESS.to_string()).or_insert(0);
+        *tb = tb.saturating_add(tres);
+    }
+
     // --- 4) Time bounds & record ---
     let ready_at = current_height + DECRYPTION_DELAY;
     let deadline = ready_at + REVEAL_WINDOW;
@@ -379,7 +418,9 @@ fn process_reveal(
     current_height: u64,
     commitments: &mut Commitments,
     events: &mut Vec<Event>,
-    fee_state: &FeeState
+    fee_state: &FeeState,
+    proposer: &Address,
+    burned_total: &mut u64,
 ) -> Result<Receipt, TxError> {
     // Sender sanity
     if r.sender != r.tx.from {
@@ -435,7 +476,7 @@ fn process_reveal(
 
     events.push(Event::CommitConsumed { commitment: cmt });
 
-    process_transaction(&exec_tx, balances, nonces, fee_state)
+    process_transaction(&exec_tx, balances, nonces, fee_state, proposer, burned_total)
 }
 
 pub fn process_block(
@@ -445,7 +486,9 @@ pub fn process_block(
     commitments: &mut Commitments,
     available: &mut Available,
     parent_hash: &Hash,
-    fee_state: &FeeState
+    fee_state: &FeeState,
+    proposer: &Address,
+    burned_total: &mut u64,
 ) -> Result<BlockResult, BlockError> {
     let mut receipts: Vec<Receipt> = Vec::new();
     let mut gas_total: u64 = 0;
@@ -482,8 +525,8 @@ pub fn process_block(
     // 1) Process "transactions" (commit/avail only)
     for (i, tx) in block.transactions.iter().enumerate() {
         let rcpt_res = match tx {
-            Tx::Commit(c) => process_commit(c, balances, commitments, block.block_number, &mut events, fee_state),
-            Tx::Avail(a)  => process_avail(a, commitments, available, block.block_number, &mut events, balances, fee_state),
+            Tx::Commit(c) => process_commit(c, balances, commitments, block.block_number, &mut events, fee_state, proposer, burned_total),
+            Tx::Avail(a)  => process_avail(a, commitments, available, block.block_number, &mut events, balances, fee_state, proposer, burned_total),
         };
 
         match rcpt_res {
@@ -506,7 +549,7 @@ pub fn process_block(
     reveals_sorted.sort_by(|a, b| a.sender.cmp(&b.sender).then(a.tx.nonce.cmp(&b.tx.nonce)));
 
     for r in &reveals_sorted {
-        let rcpt = process_reveal(r, balances, nonces, block.block_number, commitments, &mut events, fee_state)?;
+        let rcpt = process_reveal(r, balances, nonces, block.block_number, commitments, &mut events, fee_state, proposer, burned_total)?;
         reveals_included = reveals_included + 1;
         gas_total += rcpt.gas_used;
         receipt_hashes.push(hash_bytes_sha256(&receipt_bytes(&rcpt)));
@@ -547,6 +590,7 @@ pub fn process_block(
     let header = BlockHeader {
         parent_hash: *parent_hash,
         height: block.block_number,
+        proposer: proposer.clone(),
         txs_root,
         receipts_root,
         gas_used: gas_total,
@@ -725,7 +769,9 @@ mod tests {
         let fee_state = FeeState::from_defaults();
 
         let tx = Transaction::transfer(ALICE, BOB, 30,0);
-        let rcpt = process_transaction(&tx, &mut balances, &mut nonces, &fee_state).expect("valid but reverts");
+        let proposer = crate::state::ZERO_ADDRESS.to_string();
+        let mut burned_total = 0;
+        let rcpt = process_transaction(&tx, &mut balances, &mut nonces, &fee_state, &proposer, &mut burned_total).expect("valid but reverts");
         assert_eq!(rcpt.outcome, ExecOutcome::Revert);
         assert!(rcpt.error.is_some());
         assert_eq!(balances[ALICE], 19);
@@ -744,8 +790,10 @@ mod tests {
         let tx = Transaction::transfer(ALICE, BOB, 1, 0);
     
         let fee_state = FeeState::from_defaults();
+        let proposer = crate::state::ZERO_ADDRESS.to_string();
+        let mut burned_total = 0;
 
-        match process_transaction(&tx, &mut balances, &mut nonces, &fee_state) {
+        match process_transaction(&tx, &mut balances, &mut nonces, &fee_state, &proposer, &mut burned_total) {
             Err(TxError::IntrinsicInvalid(msg)) => {
                 assert!(msg.contains("insufficient funds"));
             }
@@ -777,8 +825,10 @@ mod tests {
         let tx = Transaction::new(ALICE, BOB, 1, 0, al);
 
         let fee_state = FeeState::from_defaults();
+        let proposer = crate::state::ZERO_ADDRESS.to_string();
+        let mut burned_total = 0;
 
-        match process_transaction(&tx, &mut balances, &mut nonces, &fee_state) {
+        match process_transaction(&tx, &mut balances, &mut nonces, &fee_state, &proposer, &mut burned_total) {
             Err(TxError::IntrinsicInvalid(msg)) => {
                 assert!(msg.contains("recipient balance write"));
             }
@@ -810,8 +860,10 @@ mod tests {
         let tx = Transaction::new(ALICE, BOB, 1, 0, al);
 
         let fee_state = FeeState::from_defaults();
+        let proposer = crate::state::ZERO_ADDRESS.to_string();
+        let mut burned_total = 0;
 
-        match process_transaction(&tx, &mut balances, &mut nonces, &fee_state) {
+        match process_transaction(&tx, &mut balances, &mut nonces, &fee_state, &proposer, &mut burned_total) {
             Err(_) => {
                 panic!("Unexpected Error")
             },
@@ -886,8 +938,18 @@ mod tests {
     
         // Early: height = ready_at - 1
         let early_h = ready_at - 1;
+        let proposer = crate::state::ZERO_ADDRESS.to_string();
+        let mut burned_total = 0;
         let err1 = crate::stf::process_avail(
-            &a, &mut commitments, &mut available, early_h, &mut events, &mut balances, &fee_state
+            &a,
+            &mut commitments,
+            &mut available,
+            early_h,
+            &mut events,
+            &mut balances,
+            &fee_state,
+            &proposer,
+            &mut burned_total,
         ).expect_err("early avail must be rejected");
         match err1 {
             crate::stf::TxError::IntrinsicInvalid(m) => {
@@ -898,7 +960,15 @@ mod tests {
         // Late: height = deadline + 1
         let late_h = deadline + 1;
         let err2 = crate::stf::process_avail(
-            &a, &mut commitments, &mut available, late_h, &mut events, &mut balances, &fee_state
+            &a,
+            &mut commitments,
+            &mut available,
+            late_h,
+            &mut events,
+            &mut balances,
+            &fee_state,
+            &proposer,
+            &mut burned_total,
         ).expect_err("late avail must be rejected");
         match err2 {
             crate::stf::TxError::IntrinsicInvalid(m) => {
