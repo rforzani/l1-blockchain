@@ -2,19 +2,20 @@
 
 use crate::fees::{update_exec_base, FeeState, FEE_PARAMS};
 use crate::stf::{process_block, BlockResult, BlockError};
-use crate::state::{Available, Balances, Commitments, Nonces, CHAIN_ID, DECRYPTION_DELAY, REVEAL_WINDOW};
+use crate::state::{Available, Balances, Commitments, Nonces, CHAIN_ID, DECRYPTION_DELAY, REVEAL_WINDOW, ZERO_ADDRESS};
 use crate::types::{Block, Hash};
 use crate::verify::verify_block_roots;
 
 pub struct Chain {
     pub tip_hash: Hash,
     pub height: u64,
-    pub fee_state: FeeState
+    pub fee_state: FeeState,
+    pub burned_total: u64,
 }
 
 impl Chain {
     pub fn new() -> Self {
-        Self { tip_hash: [0u8;32], height: 0, fee_state: FeeState::from_defaults() }
+        Self { tip_hash: [0u8;32], height: 0, fee_state: FeeState::from_defaults(), burned_total: 0 }
     }
 
     // Returns BlockResult on success (so caller can inspect roots, receipts, etc.)
@@ -40,7 +41,18 @@ impl Chain {
         let mut sim_available = available.clone();
 
         // 2) process with current tip as parent
-        let res = process_block(block, &mut sim_balances, &mut sim_nonces, &mut sim_commitments, &mut sim_available, &self.tip_hash, &self.fee_state)?;
+        let proposer = ZERO_ADDRESS.to_string();
+        let res = process_block(
+            block,
+            &mut sim_balances,
+            &mut sim_nonces,
+            &mut sim_commitments,
+            &mut sim_available,
+            &self.tip_hash,
+            &self.fee_state,
+            &proposer,
+            &mut self.burned_total,
+        )?;
 
         // Parent guard: the block we just built must link to our tip
         if res.header.parent_hash != self.tip_hash {
@@ -374,6 +386,8 @@ fn tamper_block_no_state_change() {
     let fee_state = FeeState::from_defaults();
 
     // Build (builder path)
+    let proposer = ZERO_ADDRESS.to_string();
+    let mut burned_total = 0;
     let res = process_block(
         &block,
         &mut balances,
@@ -381,7 +395,9 @@ fn tamper_block_no_state_change() {
         &mut commitments,
         &mut available,
         &parent,
-        &fee_state
+        &fee_state,
+        &proposer,
+        &mut burned_total,
     ).expect("ok");
 
     // Sanity: commit fee burned, nonce unchanged
