@@ -13,7 +13,6 @@ use crate::state::CHAIN_ID;
 use crate::types::{RevealTx, Tx};
 pub mod queues;
 use queues::{AvailQueue, CommitQueue, RevealQueue};
-pub mod select;
 mod tests;
 
 #[derive(Clone, Debug)]
