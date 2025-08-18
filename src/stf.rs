@@ -60,7 +60,8 @@ pub struct BlockResult {
     pub receipts_root: Hash,
     pub header: BlockHeader,
     pub block_hash: Hash,
-    pub events: Vec<Event>
+    pub events: Vec<Event>,
+    pub exec_reveals_used: u32,
 }
 
 pub fn process_transaction(
@@ -448,6 +449,7 @@ pub fn process_block(
 ) -> Result<BlockResult, BlockError> {
     let mut receipts: Vec<Receipt> = Vec::new();
     let mut gas_total: u64 = 0;
+    let mut reveals_included: u32 = 0;
 
     let mut txs_hashes: Vec<Hash> = Vec::new();
     let mut receipt_hashes: Vec<Hash> = Vec::new();
@@ -505,6 +507,7 @@ pub fn process_block(
 
     for r in &reveals_sorted {
         let rcpt = process_reveal(r, balances, nonces, block.block_number, commitments, &mut events, fee_state)?;
+        reveals_included = reveals_included + 1;
         gas_total += rcpt.gas_used;
         receipt_hashes.push(hash_bytes_sha256(&receipt_bytes(&rcpt)));
         receipts.push(rcpt);
@@ -556,7 +559,7 @@ pub fn process_block(
     };
     let block_hash = hash_bytes_sha256(&header_bytes(&header));
 
-    Ok(BlockResult { receipts, gas_total, txs_root, receipts_root, header, block_hash, events })
+    Ok(BlockResult { receipts, gas_total, txs_root, receipts_root, header, block_hash, events, exec_reveals_used: reveals_included })
 }
 
 #[cfg(test)]

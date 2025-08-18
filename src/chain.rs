@@ -1,6 +1,6 @@
 //src/chain.rs
 
-use crate::fees::FeeState;
+use crate::fees::{update_exec_base, FeeState, FEE_PARAMS};
 use crate::stf::{process_block, BlockResult, BlockError};
 use crate::state::{Available, Balances, Commitments, Nonces, CHAIN_ID, DECRYPTION_DELAY, REVEAL_WINDOW};
 use crate::types::{Block, Hash};
@@ -60,9 +60,19 @@ impl Chain {
         *commitments = sim_commitments;
         *available = sim_available;
 
+        let next_exec = update_exec_base(
+            self.fee_state.exec_base,
+            res.exec_reveals_used,
+            FEE_PARAMS.exec_target_reveals_per_block,
+            FEE_PARAMS.exec_max_change_denominator,
+            FEE_PARAMS.exec_min_base,
+            FEE_PARAMS.exec_damping_bps,
+        );
+
         // 3) updsate self state
         self.tip_hash = res.block_hash;
         self.height = block.block_number;
+        self.fee_state.exec_base = next_exec;
         Ok(res)
     }
 }
