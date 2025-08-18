@@ -100,3 +100,114 @@ pub fn update_exec_base(
 
     next.max(min_base as i128) as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cap_step(prev: u64) -> u64 {
+        let base = prev.max(FEE_PARAMS.exec_min_base);
+        let step = base / FEE_PARAMS.exec_max_change_denominator as u64;
+        if step == 0 { 1 } else { step }
+    }
+
+    #[test]
+    fn stays_same_at_target() {
+        let prev = 100;
+        let target = FEE_PARAMS.exec_target_reveals_per_block;
+        let next = update_exec_base(
+            prev,
+            target,
+            target,
+            FEE_PARAMS.exec_max_change_denominator,
+            FEE_PARAMS.exec_min_base,
+            FEE_PARAMS.exec_damping_bps,
+        );
+        assert_eq!(next, prev);
+    }
+
+    #[test]
+    fn increases_when_over_target() {
+        let prev = FEE_PARAMS.exec_max_change_denominator as u64;
+        let reveals = FEE_PARAMS.exec_target_reveals_per_block * 2;
+        let next = update_exec_base(
+            prev,
+            reveals,
+            FEE_PARAMS.exec_target_reveals_per_block,
+            FEE_PARAMS.exec_max_change_denominator,
+            FEE_PARAMS.exec_min_base,
+            FEE_PARAMS.exec_damping_bps,
+        );
+        assert!(next > prev);
+        assert!(next <= prev + cap_step(prev));
+    }
+
+    #[test]
+    fn decreases_when_under_target() {
+        let prev = FEE_PARAMS.exec_max_change_denominator as u64;
+        let reveals = 0;
+        let next = update_exec_base(
+            prev,
+            reveals,
+            FEE_PARAMS.exec_target_reveals_per_block,
+            FEE_PARAMS.exec_max_change_denominator,
+            FEE_PARAMS.exec_min_base,
+            FEE_PARAMS.exec_damping_bps,
+        );
+        assert!(next < prev);
+        assert!(next >= FEE_PARAMS.exec_min_base);
+        assert!(prev - next <= cap_step(prev));
+    }
+
+    #[test]
+    fn respects_floor() {
+        let prev = FEE_PARAMS.exec_min_base;
+        let reveals = 0;
+        let next = update_exec_base(
+            prev,
+            reveals,
+            FEE_PARAMS.exec_target_reveals_per_block,
+            FEE_PARAMS.exec_max_change_denominator,
+            FEE_PARAMS.exec_min_base,
+            FEE_PARAMS.exec_damping_bps,
+        );
+        assert_eq!(next, FEE_PARAMS.exec_min_base);
+    }
+
+    #[test]
+    fn target_zero_guard() {
+        let prev = 100;
+        let next = update_exec_base(
+            prev,
+            10,
+            0,
+            FEE_PARAMS.exec_max_change_denominator,
+            FEE_PARAMS.exec_min_base,
+            FEE_PARAMS.exec_damping_bps,
+        );
+        assert!(next >= FEE_PARAMS.exec_min_base);
+    }
+
+    #[test]
+    fn damping_effect_smoke_test() {
+        let prev = 100;
+        let reveals = FEE_PARAMS.exec_target_reveals_per_block * 2;
+        let next_nodamp = update_exec_base(
+            prev,
+            reveals,
+            FEE_PARAMS.exec_target_reveals_per_block,
+            FEE_PARAMS.exec_max_change_denominator,
+            FEE_PARAMS.exec_min_base,
+            10_000,
+        );
+        let next_damped = update_exec_base(
+            prev,
+            reveals,
+            FEE_PARAMS.exec_target_reveals_per_block,
+            FEE_PARAMS.exec_max_change_denominator,
+            FEE_PARAMS.exec_min_base,
+            FEE_PARAMS.exec_damping_bps,
+        );
+        assert!(next_damped - prev <= next_nodamp - prev);
+    }
+}
