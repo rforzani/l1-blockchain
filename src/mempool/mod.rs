@@ -2,15 +2,13 @@
 
 #![allow(dead_code)]
 
-use std::{
-    collections::HashSet,
-    sync::{Arc, RwLock},
-};
+use std::sync::{Arc, RwLock};
 
 use crate::codec::{access_list_bytes, tx_bytes};
 use crate::crypto::commitment_hash;
 use crate::state::CHAIN_ID;
-use crate::types::{RevealTx, Tx};
+use crate::types::{RevealTx, Tx, Address};
+use crate::fees::{FeeState, lane_base, Lane};
 pub mod queues;
 use queues::{AvailQueue, CommitQueue, RevealQueue};
 mod tests;
@@ -32,7 +30,11 @@ pub struct TxId(pub [u8; 32]);
 pub struct CommitmentId(pub [u8; 32]);
 
 /// Errors that can happen when adding a tx to the mempool (admission).
-#[derive(Clone, Debug)]
+pub trait BalanceView {
+    fn balance_of(&self, who: &Address) -> u64;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdmissionError {
     InvalidSignature,
     BadAccessList,
@@ -43,7 +45,22 @@ pub enum AdmissionError {
     Stale,
     NotYetValid,
     MismatchedCommitment,
+    InsufficientBalance { want: u64, have: u64, lane: &'static str },
     WrongTxType, // <-- if insert_* gets the wrong variant
+}
+
+#[inline]
+fn ensure_affordable(
+    view: &dyn BalanceView,
+    who: &Address,
+    want: u64,
+    lane: &'static str,
+) -> Result<(), AdmissionError> {
+    let have = view.balance_of(who);
+    if have < want {
+        return Err(AdmissionError::InsufficientBalance { want, have, lane });
+    }
+    Ok(())
 }
 
 /// What the selector returns to the block builder.
@@ -103,18 +120,24 @@ pub trait Mempool: Send + Sync {
         tx: Tx,
         current_height: u64,
         fee_bid: u128,
+        view: &dyn BalanceView,
+        fee_state: &FeeState,
     ) -> Result<TxId, AdmissionError>;
     fn insert_avail(
         &self,
         tx: Tx,
         current_height: u64,
         fee_bid: u128,
+        view: &dyn BalanceView,
+        fee_state: &FeeState,
     ) -> Result<TxId, AdmissionError>;
     fn insert_reveal(
         &self,
         tx: RevealTx,
         current_height: u64,
         fee_bid: u128,
+        view: &dyn BalanceView,
+        fee_state: &FeeState,
     ) -> Result<TxId, AdmissionError>;
 
     fn select_block(
@@ -185,19 +208,19 @@ impl Mempool for MempoolImpl {
         tx: Tx,
         current_height: u64,
         fee_bid: u128,
+        view: &dyn BalanceView,
+        fee_state: &FeeState,
     ) -> Result<TxId, AdmissionError> {
-        match tx {
-            Tx::Commit(c) => {
-                let mut commits = self.commits.write().unwrap();
-                commits.insert_commit_minimal(
-                    &c,
-                    current_height,
-                    fee_bid,
-                    self.config.max_pending_commits_per_account,
-                )
-            }
-            _ => Err(AdmissionError::WrongTxType),
-        }
+        let Tx::Commit(c) = tx else { return Err(AdmissionError::WrongTxType) };
+        let want = lane_base(fee_state, Lane::Commit);
+        ensure_affordable(view, &c.sender, want, "commit")?;
+        let mut commits = self.commits.write().unwrap();
+        commits.insert_commit_minimal(
+            &c,
+            current_height,
+            fee_bid,
+            self.config.max_pending_commits_per_account,
+        )
     }
 
     fn insert_avail(
@@ -205,14 +228,14 @@ impl Mempool for MempoolImpl {
         tx: Tx,
         current_height: u64,
         fee_bid: u128,
+        view: &dyn BalanceView,
+        fee_state: &FeeState,
     ) -> Result<TxId, AdmissionError> {
-        match tx {
-            Tx::Avail(a) => {
-                let mut avails = self.avails.write().unwrap();
-                avails.insert_avail_minimal(&a, current_height, fee_bid)
-            }
-            _ => Err(AdmissionError::WrongTxType),
-        }
+        let Tx::Avail(a) = tx else { return Err(AdmissionError::WrongTxType) };
+        let want = lane_base(fee_state, Lane::Avail);
+        ensure_affordable(view, &a.sender, want, "avail")?;
+        let mut avails = self.avails.write().unwrap();
+        avails.insert_avail_minimal(&a, current_height, fee_bid)
     }
 
     fn insert_reveal(
@@ -220,7 +243,11 @@ impl Mempool for MempoolImpl {
         r: RevealTx,
         current_height: u64,
         fee_bid: u128,
+        view: &dyn BalanceView,
+        fee_state: &FeeState,
     ) -> Result<TxId, AdmissionError> {
+        let want = lane_base(fee_state, Lane::Exec); // reveals pay exec base
+        ensure_affordable(view, &r.sender, want, "exec")?;
         let tx_ser = tx_bytes(&r.tx);
         let al_bytes = access_list_bytes(&r.tx.access_list);
         let cmt = commitment_hash(&tx_ser, &al_bytes, &r.salt, CHAIN_ID);

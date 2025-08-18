@@ -5,15 +5,22 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::mempool::{
     BlockSelectionLimits, CommitmentId, Mempool, MempoolConfig, MempoolImpl, SelectError, TxId,
+    BalanceView,
 };
 use crate::codec::{tx_bytes, access_list_bytes};
 use crate::crypto::{hash_bytes_sha256, commitment_hash};
 use crate::state::CHAIN_ID;
 use crate::types::{
-    Tx, CommitTx, AvailTx, RevealTx, Transaction, AccessList, StateKey, Hash,
+    Tx, CommitTx, AvailTx, RevealTx, Transaction, AccessList, StateKey, Hash, Address,
 };
+use crate::fees::FeeState;
 
 // -------------------------- tiny helpers for building txs --------------------------
+
+struct TestBalanceView;
+impl BalanceView for TestBalanceView {
+    fn balance_of(&self, _who: &Address) -> u64 { u64::MAX }
+}
 
 fn cfg() -> MempoolConfig {
     MempoolConfig {
@@ -155,7 +162,7 @@ fn commit_admission_happy_path() {
     let mp = MempoolImpl::new(cfg());
     let sender = addr(1);
     let (c, _tx, _salt, _cm) = make_commit(&sender, 0);
-    let id = mp.insert_commit(Tx::Commit(c), 100, 1).expect("commit admitted");
+    let id = mp.insert_commit(Tx::Commit(c), 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).expect("commit admitted");
     // smoke-check: TxId is 32 bytes (we can at least destructure it)
     let TxId(bytes) = id;
     assert_eq!(bytes.len(), 32);
@@ -169,7 +176,7 @@ fn commit_bad_access_list_rejected() {
     // Break AL: remove required entries to trigger BadAccessList
     c_bad.access_list.reads.clear();
     c_bad.access_list.writes.clear();
-    let err = mp.insert_commit(Tx::Commit(c_bad), 100, 1).unwrap_err();
+    let err = mp.insert_commit(Tx::Commit(c_bad), 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap_err();
     matches_bad_access_list(err);
 }
 
@@ -180,8 +187,8 @@ fn commit_duplicate_rejected() {
     let (c1, _tx, _salt, cm) = make_commit(&sender, 0);
     let mut c2 = c1.clone();
     c2.commitment = cm; // same commitment
-    mp.insert_commit(Tx::Commit(c1), 100, 1).expect("first commit");
-    let err = mp.insert_commit(Tx::Commit(c2), 100, 1).unwrap_err();
+    mp.insert_commit(Tx::Commit(c1), 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).expect("first commit");
+    let err = mp.insert_commit(Tx::Commit(c2), 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap_err();
     assert!(matches!(err, crate::mempool::AdmissionError::Duplicate));
 }
 
@@ -195,12 +202,12 @@ fn commit_pending_cap_enforced() {
     // Two commits should pass
     for n in 0..2 {
         let (c, _, _, _) = make_commit(&sender, n);
-        mp.insert_commit(Tx::Commit(c), 100, 1).expect("admit");
+        mp.insert_commit(Tx::Commit(c), 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).expect("admit");
     }
 
     // Third should hit the cap
     let (c3, _, _, _) = make_commit(&sender, 2);
-    let err = mp.insert_commit(Tx::Commit(c3), 100, 1).unwrap_err();
+    let err = mp.insert_commit(Tx::Commit(c3), 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap_err();
     assert!(matches!(err, crate::mempool::AdmissionError::MempoolFullForAccount));
 }
 
@@ -217,7 +224,7 @@ fn reveal_sender_mismatch_rejected() {
         tx,
         salt: [9u8; 32],
     };
-    let err = mp.insert_reveal(r, 100, 1).unwrap_err();
+    let err = mp.insert_reveal(r, 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap_err();
     assert!(matches!(err, crate::mempool::AdmissionError::InvalidSignature));
 }
 
@@ -228,13 +235,13 @@ fn reveal_commitment_mismatch_rejected() {
 
     // Build a matching commit with salt=[7;32]
     let (c, tx, _salt7, _cm) = make_commit(&sender, 0);
-    mp.insert_commit(Tx::Commit(c), 100, 1).expect("commit admitted");
+    mp.insert_commit(Tx::Commit(c), 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).expect("commit admitted");
 
     // Reveal uses a different salt to force mismatch
     let mut salt8 = [0u8; 32];
     salt8[0] = 8;
     let r_bad = make_reveal(&sender, tx, salt8);
-    let err = mp.insert_reveal(r_bad, 101, 1).unwrap_err();
+    let err = mp.insert_reveal(r_bad, 101, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap_err();
     assert!(matches!(err, crate::mempool::AdmissionError::MismatchedCommitment));
 }
 
@@ -246,8 +253,8 @@ fn mark_included_evicts_and_decrements() {
     // insert 2 commits for same sender
     let (c1, _, _, _) = make_commit(&sender, 0);
     let (c2, _, _, _) = make_commit(&sender, 1);
-    let id1 = mp.insert_commit(Tx::Commit(c1), 100, 10).unwrap();
-    let id2 = mp.insert_commit(Tx::Commit(c2), 100, 20).unwrap();
+    let id1 = mp.insert_commit(Tx::Commit(c1), 100, 10, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
+    let id2 = mp.insert_commit(Tx::Commit(c2), 100, 20, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
 
     // before: pending count should be 2
     {
@@ -276,8 +283,8 @@ fn queues_index_coherence() {
 
     let (c1, _, _, cm1) = make_commit(&sender, 0);
     let (c2, _, _, cm2) = make_commit(&sender, 1);
-    mp.insert_commit(Tx::Commit(c1), 100, 10).unwrap();
-    mp.insert_commit(Tx::Commit(c2), 100, 20).unwrap();
+    mp.insert_commit(Tx::Commit(c1), 100, 10, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
+    mp.insert_commit(Tx::Commit(c2), 100, 20, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
 
     // Use debug accessor to inspect internal queues.
     let (commits, _avails, _reveals) = mp.debug_read();
@@ -307,9 +314,9 @@ fn selection_missing_reveal_payload_logged_and_skipped() {
     let mp = MempoolImpl::new(cfg());
     let sender = addr(60);
     let (c, tx, salt, cm) = make_commit(&sender, 0);
-    mp.insert_commit(Tx::Commit(c), 100, 1).unwrap();
+    mp.insert_commit(Tx::Commit(c), 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
     let r = make_reveal(&sender, tx, salt);
-    let rid = mp.insert_reveal(r, 100, 1).unwrap();
+    let rid = mp.insert_reveal(r, 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
 
     {
         let mut reveals = mp.reveals.write().unwrap();
@@ -334,8 +341,8 @@ fn avail_ready_index_and_eviction() {
     let a1 = make_avail(&sender1, cm1);
     let a2 = make_avail(&sender2, cm2);
 
-    let id1 = mp.insert_avail(Tx::Avail(a1.clone()), 100, 1).unwrap();
-    let id2 = mp.insert_avail(Tx::Avail(a2.clone()), 100, 1).unwrap();
+    let id1 = mp.insert_avail(Tx::Avail(a1.clone()), 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
+    let id2 = mp.insert_avail(Tx::Avail(a2.clone()), 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
 
     {
         let (_commits, avails, _reveals) = mp.debug_read();
@@ -367,8 +374,8 @@ fn avail_selection_deterministic_and_non_destructive() {
     let a_high = make_avail(&sender, cm1);
     let a_low = make_avail(&sender, cm2);
 
-    mp.insert_avail(Tx::Avail(a_high.clone()), 0, 10).unwrap();
-    mp.insert_avail(Tx::Avail(a_low.clone()), 0, 5).unwrap();
+    mp.insert_avail(Tx::Avail(a_high.clone()), 0, 10, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
+    mp.insert_avail(Tx::Avail(a_low.clone()), 0, 5, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
 
     let state = SV { height: 0, il: vec![], ..Default::default() };
     let lim = limits();
@@ -396,12 +403,12 @@ fn evict_stale_drops_old_entries_and_updates_pending_count() {
     let (c1, _tx1, _salt1, _cm1) = make_commit(&sender, 0);
     let (c2,  tx2,  salt2, _cm2) = make_commit(&sender, 1);
 
-    let id1 = mp.insert_commit(Tx::Commit(c1), 100, 1).unwrap();
-    let id2 = mp.insert_commit(Tx::Commit(c2),  96, 1).unwrap();
+    let id1 = mp.insert_commit(Tx::Commit(c1), 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
+    let id2 = mp.insert_commit(Tx::Commit(c2),  96, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
 
     // Matching reveal for c2 (uses the same tx2 + salt2), and make it old enough to purge.
     let r2 = make_reveal(&sender, tx2, salt2);
-    let _rid2 = mp.insert_reveal(r2, 95, 1).unwrap();
+    let _rid2 = mp.insert_reveal(r2, 95, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
 
     // Before purge: pending commits = 2, one reveal present
     {
@@ -440,9 +447,9 @@ fn il_reveal_at_wrong_nonce_fails() {
     let mp = MempoolImpl::new(cfg());
     let sender = addr(70);
     let (c, tx, salt, cm) = make_commit(&sender, 0);
-    mp.insert_commit(Tx::Commit(c), 0, 1).unwrap();
+    mp.insert_commit(Tx::Commit(c), 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
     let r = make_reveal(&sender, tx, salt);
-    mp.insert_reveal(r, 0, 1).unwrap();
+    mp.insert_reveal(r, 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
 
     let mut reveal_nonces = HashMap::new();
     reveal_nonces.insert(sender.clone(), 1);
@@ -463,7 +470,7 @@ fn avail_outside_window_skipped() {
     let sender = addr(71);
     let (_c, _tx, _salt, cm) = make_commit(&sender, 0);
     let a = make_avail(&sender, cm);
-    mp.insert_avail(Tx::Avail(a), 20, 1).unwrap();
+    mp.insert_avail(Tx::Avail(a), 20, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
 
     let sv = SV { height: 10, il: vec![], ..Default::default() };
     let block = mp.select_block(&sv, limits()).unwrap();
@@ -475,11 +482,11 @@ fn avail_duplicate_skipped_when_reveal_forced() {
     let mp = MempoolImpl::new(cfg());
     let sender = addr(72);
     let (c, tx, salt, cm) = make_commit(&sender, 0);
-    let commit_id = mp.insert_commit(Tx::Commit(c), 0, 1).unwrap();
+    let commit_id = mp.insert_commit(Tx::Commit(c), 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
     let a = make_avail(&sender, cm);
-    mp.insert_avail(Tx::Avail(a.clone()), 0, 1).unwrap();
+    mp.insert_avail(Tx::Avail(a.clone()), 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
     let r = make_reveal(&sender, tx, salt);
-    mp.insert_reveal(r.clone(), 0, 1).unwrap();
+    mp.insert_reveal(r.clone(), 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
     mp.mark_included(&[commit_id], 1);
 
     let sv = SV { height: 0, il: vec![CommitmentId(cm)], ..Default::default() };
@@ -493,7 +500,7 @@ fn commit_skipped_when_sender_at_pending_cap() {
     let mp = MempoolImpl::new(cfg());
     let sender = addr(73);
     let (c, _tx, _salt, _cm) = make_commit(&sender, 0);
-    mp.insert_commit(Tx::Commit(c), 0, 1).unwrap();
+    mp.insert_commit(Tx::Commit(c), 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
     let mut pending_room = HashMap::new();
     pending_room.insert(sender.clone(), 0);
     let sv = SV { height: 0, il: vec![], pending_room, ..Default::default() };
@@ -507,12 +514,12 @@ fn extra_reveal_nonce_continuity_enforced() {
     let sender = addr(74);
     let (c0, tx0, salt0, _cm0) = make_commit(&sender, 0);
     let (c1, tx1, salt1, _cm1) = make_commit(&sender, 1);
-    let id0 = mp.insert_commit(Tx::Commit(c0), 0, 1).unwrap();
-    let id1 = mp.insert_commit(Tx::Commit(c1), 0, 1).unwrap();
+    let id0 = mp.insert_commit(Tx::Commit(c0), 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
+    let id1 = mp.insert_commit(Tx::Commit(c1), 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
     let r1 = make_reveal(&sender, tx1, salt1);
-    mp.insert_reveal(r1, 0, 10).unwrap();
+    mp.insert_reveal(r1, 0, 10, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
     let r0 = make_reveal(&sender, tx0, salt0);
-    mp.insert_reveal(r0.clone(), 0, 1).unwrap();
+    mp.insert_reveal(r0.clone(), 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
     mp.mark_included(&[id0, id1], 1);
 
     let mut reveal_nonces = HashMap::new();
@@ -547,11 +554,11 @@ fn concurrent_insert_select_benchmark() {
         for i in 0..200 {
             let sender = addr((i % 10) as u8);
             let (c, tx, salt, cm) = make_commit(&sender, i as u64);
-            let _ = insert_mp.insert_commit(Tx::Commit(c), 0, 1);
+            let _ = insert_mp.insert_commit(Tx::Commit(c), 0, 1, &TestBalanceView{}, &FeeState::from_defaults());
             let a = make_avail(&sender, cm);
-            let _ = insert_mp.insert_avail(Tx::Avail(a), 0, 1);
+            let _ = insert_mp.insert_avail(Tx::Avail(a), 0, 1, &TestBalanceView{}, &FeeState::from_defaults());
             let r = make_reveal(&sender, tx, salt);
-            let _ = insert_mp.insert_reveal(r, 0, 1);
+            let _ = insert_mp.insert_reveal(r, 0, 1, &TestBalanceView{}, &FeeState::from_defaults());
         }
     });
 

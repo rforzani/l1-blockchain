@@ -10,10 +10,11 @@ use l1_blockchain::codec::{access_list_bytes, tx_bytes};
 use l1_blockchain::crypto::commitment_hash;
 use l1_blockchain::mempool::{
     AdmissionError, BlockSelectionLimits, CommitmentId, Mempool, MempoolConfig, MempoolImpl,
-    StateView,
+    StateView, BalanceView,
 };
 use l1_blockchain::state::CHAIN_ID;
-use l1_blockchain::types::{AccessList, AvailTx, CommitTx, RevealTx, Transaction, Tx};
+use l1_blockchain::types::{AccessList, AvailTx, CommitTx, RevealTx, Transaction, Tx, Address};
+use l1_blockchain::fees::FeeState;
 
 // -------------------- Small helpers for this test --------------------
 
@@ -21,6 +22,11 @@ use l1_blockchain::types::{AccessList, AvailTx, CommitTx, RevealTx, Transaction,
 struct SV {
     height: u64,
     il: Vec<CommitmentId>,
+}
+
+struct TestBalanceView;
+impl BalanceView for TestBalanceView {
+    fn balance_of(&self, _who: &Address) -> u64 { u64::MAX }
 }
 
 impl StateView for SV {
@@ -154,9 +160,9 @@ proptest! {
         for (idx, kind) in ops1 {
             let (ref c, ref a, ref r, _) = triples[idx];
             match kind {
-                0 => { mp1.insert_commit(c.clone(), 0, 1).unwrap(); }
-                1 => { mp1.insert_avail(a.clone(), 0, 1).unwrap(); }
-                _ => { mp1.insert_reveal(r.clone(), 0, 1).unwrap(); }
+                0 => { mp1.insert_commit(c.clone(), 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap(); }
+                1 => { mp1.insert_avail(a.clone(), 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap(); }
+                _ => { mp1.insert_reveal(r.clone(), 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap(); }
             }
         }
 
@@ -164,9 +170,9 @@ proptest! {
         for (idx, kind) in ops2 {
             let (ref c, ref a, ref r, _) = triples[idx];
             match kind {
-                0 => { mp2.insert_commit(c.clone(), 0, 1).unwrap(); }
-                1 => { mp2.insert_avail(a.clone(), 0, 1).unwrap(); }
-                _ => { mp2.insert_reveal(r.clone(), 0, 1).unwrap(); }
+                0 => { mp2.insert_commit(c.clone(), 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap(); }
+                1 => { mp2.insert_avail(a.clone(), 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap(); }
+                _ => { mp2.insert_reveal(r.clone(), 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap(); }
             }
         }
 
@@ -270,10 +276,10 @@ proptest! {
         let a1 = AvailTx { commitment: commitments[1], sender: sender.clone(), pubkey: [0u8;32], sig: [0u8;64] };
         let a2 = AvailTx { commitment: commitments[2], sender: sender.clone(), pubkey: [0u8;32], sig: [0u8;64] };
 
-        mem.insert_avail(Tx::Avail(a0.clone()), height, fees[0]).unwrap();
-        mem.insert_avail(Tx::Avail(a1.clone()), height, fees[1]).unwrap();
+        mem.insert_avail(Tx::Avail(a0.clone()), height, fees[0], &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
+        mem.insert_avail(Tx::Avail(a1.clone()), height, fees[1], &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
         // not ready yet
-        mem.insert_avail(Tx::Avail(a2.clone()), height + 1, fees[2]).unwrap();
+        mem.insert_avail(Tx::Avail(a2.clone()), height + 1, fees[2], &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
 
         let state = SV { height, il: vec![] };
         let limits = BlockSelectionLimits { max_reveals: 0, max_avails: 10, max_commits: 0 };
@@ -342,8 +348,8 @@ fn insert_commit_and_reveal(
         sig: [0u8; 64],
     };
 
-    mem.insert_commit(Tx::Commit(commit), height, fee_bid)?;
-    mem.insert_reveal(r, height, fee_bid)?;
+    mem.insert_commit(Tx::Commit(commit), height, fee_bid, &TestBalanceView{}, &FeeState::from_defaults())?;
+    mem.insert_reveal(r, height, fee_bid, &TestBalanceView{}, &FeeState::from_defaults())?;
     Ok(CommitmentId(cmt))
 }
 
@@ -370,7 +376,7 @@ fn insert_commit_only(
         sig: [0u8; 64],
     };
 
-    mem.insert_commit(Tx::Commit(commit), height, fee_bid)?;
+    mem.insert_commit(Tx::Commit(commit), height, fee_bid, &TestBalanceView{}, &FeeState::from_defaults())?;
     Ok(CommitmentId(cmt))
 }
 
@@ -486,7 +492,7 @@ proptest! {
                     if *dup {
                         // attempt to insert a duplicate reveal for the same (sender, nonce, commitment)
                         let dup_rev = make_reveal_tx(sender.clone(), i as u64, *salt);
-                        let _ = mem.insert_reveal(dup_rev, height, fee_bid);
+                        let _ = mem.insert_reveal(dup_rev, height, fee_bid, &TestBalanceView{}, &FeeState::from_defaults());
                     }
                     il.push(id);
                 }

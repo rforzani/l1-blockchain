@@ -64,6 +64,7 @@ impl FeeState {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
 pub enum Lane { Exec, Commit, Avail }
 
 #[inline]
