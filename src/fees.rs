@@ -129,6 +129,14 @@ pub fn update_exec_base(
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, collections::HashSet};
+
+    use ed25519_dalek::{ed25519::signature::SignerMut, SigningKey, VerifyingKey};
+
+    use crate::{codec::{access_list_bytes, string_bytes}, crypto::{addr_from_pubkey, addr_hex, commit_signing_preimage}, state::{Available, Balances, Commitments, Nonces, CHAIN_ID, ZERO_ADDRESS}, stf::process_block, types::{AccessList, Block, CommitTx, Hash, StateKey, Tx}};
+
+    use crate::chain::Chain;
+
     use super::*;
 
     fn cap_step(prev: u64) -> u64 {
@@ -259,5 +267,100 @@ mod tests {
         assert_eq!(proposer, 150);
         assert_eq!(treasury, 50);
         assert_eq!(burn, 800);
+    }
+
+    #[test]
+    fn proposer_gets_commit_fee_share_and_burn_tracked() {
+        // Deterministic keypair for sender
+        let mut sk = SigningKey::from_bytes(&[7u8;32]);
+        let vk = VerifyingKey::from(&sk);
+        let pk_bytes = vk.to_bytes();
+        let sender = addr_hex(&addr_from_pubkey(&pk_bytes));
+        // Proposer address (Chain::apply_block uses ZERO_ADDRESS)
+        let proposer = ZERO_ADDRESS.to_string();
+
+        // Initial state
+        let mut balances: Balances = HashMap::from([
+            (sender.clone(), 200u64),
+            (proposer.clone(), 0u64),
+        ]);
+        let mut nonces: Nonces = Nonces::default();
+        let mut commitments: Commitments = Commitments::default();
+        let mut available: Available = Available::default();
+
+        // Chain with higher commit fee so proposer share > 0
+        let mut chain = Chain::new();
+        chain.fee_state.commit_base = 100;
+        let commit_fee = chain.fee_state.commit_base;
+        let (burn_share, proposer_share, _tres) = split_amount(commit_fee);
+
+        // Access list required for commit
+        let al = AccessList {
+            reads: vec![StateKey::Balance(sender.clone()), StateKey::Nonce(sender.clone())],
+            writes: vec![StateKey::Balance(sender.clone()), StateKey::Nonce(sender.clone())],
+        };
+
+        // Commitment and signature
+        let commitment: Hash = [1u8;32];
+        let sender_bytes = string_bytes(&sender);
+        let al_bytes = access_list_bytes(&al);
+        let pre_c = commit_signing_preimage(&commitment, &[0u8;32], &sender_bytes, &al_bytes, CHAIN_ID);
+        let sig_c = sk.sign(&pre_c).to_bytes();
+
+        let block = Block::new(
+            vec![Tx::Commit(CommitTx {
+                commitment,
+                sender: sender.clone(),
+                ciphertext_hash: [0u8;32],
+                access_list: al,
+                pubkey: pk_bytes,
+                sig: sig_c,
+            })],
+            1,
+        );
+
+        chain
+            .apply_block(&block, &mut balances, &mut nonces, &mut commitments, &mut available)
+            .expect("block should apply");
+
+        assert_eq!(balances[&proposer], proposer_share);
+        assert_eq!(chain.burned_total, burn_share);
+        assert_eq!(balances[&sender], 200 - commit_fee);
+    }
+
+    #[test]
+    fn block_hash_changes_with_proposer() {
+        let block = Block::new(Vec::new(), 1);
+        let parent = [0u8;32];
+        let fee_state = FeeState::from_defaults();
+
+        // Same proposer -> same hash
+        let proposer1 = "p1".to_string();
+        let mut burned_a = 0u64;
+        let mut balances_a: Balances = HashMap::new();
+        let mut nonces_a: Nonces = HashMap::new();
+        let mut commits_a: Commitments = HashMap::new();
+        let mut avail_a: Available = HashSet::new();
+        let res1 = process_block(&block, &mut balances_a, &mut nonces_a, &mut commits_a, &mut avail_a, &parent, &fee_state, &proposer1, &mut burned_a).unwrap();
+
+        let mut burned_b = 0u64;
+        let mut balances_b: Balances = HashMap::new();
+        let mut nonces_b: Nonces = HashMap::new();
+        let mut commits_b: Commitments = HashMap::new();
+        let mut avail_b: Available = HashSet::new();
+        let res2 = process_block(&block, &mut balances_b, &mut nonces_b, &mut commits_b, &mut avail_b, &parent, &fee_state, &proposer1, &mut burned_b).unwrap();
+
+        assert_eq!(res1.block_hash, res2.block_hash);
+
+        // Different proposer -> different hash
+        let proposer2 = "p2".to_string();
+        let mut burned_c = 0u64;
+        let mut balances_c: Balances = HashMap::new();
+        let mut nonces_c: Nonces = HashMap::new();
+        let mut commits_c: Commitments = HashMap::new();
+        let mut avail_c: Available = HashSet::new();
+        let res3 = process_block(&block, &mut balances_c, &mut nonces_c, &mut commits_c, &mut avail_c, &parent, &fee_state, &proposer2, &mut burned_c).unwrap();
+
+        assert_ne!(res1.block_hash, res3.block_hash);
     }
 }
