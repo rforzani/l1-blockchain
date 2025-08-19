@@ -32,8 +32,7 @@ pub struct BuiltBlock {
 #[derive(Debug)]
 pub enum ProduceError {
     Selection(SelectError),
-    HeaderBuild(String),
-    StateUnavailable,
+    HeaderBuild(String)
 }
 
 pub struct Node {
