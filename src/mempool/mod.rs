@@ -70,6 +70,10 @@ pub struct BlockCandidate {
     pub txs: Vec<Tx>,
     /// Reveals go into the block's "reveals" area (separate ordering).
     pub reveals: Vec<RevealTx>,
+
+    pub commit_ids: Vec<TxId>,
+    pub avail_ids:  Vec<TxId>,
+    pub reveal_ids: Vec<TxId>,
 }
 
 /// Per-block caps (slot-based for now; we'll add gas later).
@@ -176,6 +180,18 @@ impl MempoolImpl {
             avails: RwLock::new(AvailQueue::default()),
             reveals: RwLock::new(RevealQueue::default()),
         })
+    }
+
+    pub fn pending_commits_for_sender(&self, sender: &str) -> u32 {
+        let commits = self.commits.read().unwrap();
+        match commits.pending_per_owner.get(sender).copied() {
+            Some(v) => u32::try_from(v).unwrap_or(u32::MAX), // saturate if ever > u32::MAX
+            None => 0,
+        }
+    }
+
+    pub fn config(&self) -> &MempoolConfig {
+        &self.config
     }
 
     #[cfg(test)]
@@ -335,9 +351,10 @@ impl Mempool for MempoolImpl {
         use std::collections::{HashMap, HashSet};
 
         let mut next_required: HashMap<String, u64> = HashMap::new();
-        let mut selected_ids: HashSet<crate::mempool::TxId> = HashSet::new(); // NEW
+        let mut selected_ids: HashSet<crate::mempool::TxId> = HashSet::new();
         let mut selected_reveals: Vec<crate::types::RevealTx> = Vec::with_capacity(il.len());
         let mut missing_due_to_nonce: Vec<crate::mempool::CommitmentId> = Vec::new();
+        let mut reveal_ids: Vec<TxId> = Vec::new();
 
         for c in &il {
             // Deterministically inspect the candidate reveals for this commitment.
@@ -363,6 +380,7 @@ impl Mempool for MempoolImpl {
                     Some((r, _cmt)) => {
                         selected_reveals.push(r.clone());
                         selected_ids.insert(*txid);
+                        reveal_ids.push(*txid);
                         *next_required.get_mut(sender0.as_str()).unwrap() = req + 1;
                     }
                     None => {
@@ -431,6 +449,7 @@ impl Mempool for MempoolImpl {
                 if let Some((reveal, _cmt)) = reveals.payload_by_id.get(txid) {
                     selected_reveals.push(reveal.clone());
                     selected_ids.insert(*txid);
+                    reveal_ids.push(*txid);
                     *next_required.get_mut(&meta.sender).unwrap() = req + 1;
                     remaining -= 1;
                 }
@@ -444,6 +463,7 @@ impl Mempool for MempoolImpl {
 
         let mut txs: Vec<Tx> = Vec::new();
         let mut avails_added: u32 = 0;
+        let mut avail_ids : Vec<TxId> = Vec::new();
 
         // Gather all avails whose ready_at is <= height.
         let mut ready_ids = HashSet::new();
@@ -482,12 +502,14 @@ impl Mempool for MempoolImpl {
             if let Some(avail) = avails.payload_by_id.get(txid) {
                 txs.push(Tx::Avail(avail.clone()));
                 avails_added += 1;
+                avail_ids.push(*txid);
             }
         }
 
         // --- Commits: fee-desc order, deterministic tiebreakers ---
 
         let mut commits_added: u32 = 0;
+        let mut commit_ids : Vec<TxId> = Vec::new();
 
         if limits.max_commits > 0 {
             // fee_order key = (neg_fee, sender). Iteration is highest-fee-first by construction.
@@ -504,6 +526,7 @@ impl Mempool for MempoolImpl {
                     }
 
                     txs.push(Tx::Commit(commit_tx.clone()));
+                    commit_ids.push(*txid);
                     commits_added += 1;
                 }
             }
@@ -512,6 +535,9 @@ impl Mempool for MempoolImpl {
         Ok(BlockCandidate {
             txs,
             reveals: selected_reveals,
+            commit_ids: commit_ids,
+            avail_ids: avail_ids,
+            reveal_ids: reveal_ids            
         })
     }
 
