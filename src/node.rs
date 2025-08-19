@@ -36,12 +36,12 @@ pub enum ProduceError {
 }
 
 pub struct Node {
-    pub chain: Chain,
-    pub balances: Balances,
-    pub nonces: Nonces,
-    pub commitments: Commitments,
-    pub available: Available,
-    pub mempool: Arc<MempoolImpl>,
+    chain: Chain,
+    balances: Balances,
+    nonces: Nonces,
+    commitments: Commitments,
+    available: Available,
+    mempool: Arc<MempoolImpl>,
 }
 
 struct NodeStateView<'a> {
@@ -96,6 +96,30 @@ impl Node {
             available: Default::default(),
             mempool,
         }
+    }
+
+    pub fn height(&self) -> u64 {
+        self.chain.height
+    }
+
+    pub fn fee_state(&self) -> &crate::fees::FeeState {
+        &self.chain.fee_state
+    }
+
+    pub fn set_commit_fee_base(&mut self, base: u64) {
+        self.chain.fee_state.commit_base = base;
+    }
+
+    pub fn burned_total(&self) -> u64 {
+        self.chain.burned_total
+    }
+
+    pub fn balance_of(&self, who: &str) -> u64 {
+        *self.balances.get(who).unwrap_or(&0)
+    }
+
+    pub fn set_balance(&mut self, who: String, amount: u64) {
+        self.balances.insert(who, amount);
     }
 
     /// Build exactly one block from the current head and mempool.
