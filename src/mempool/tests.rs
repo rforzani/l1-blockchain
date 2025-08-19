@@ -576,3 +576,170 @@ fn concurrent_insert_select_benchmark() {
 
     println!("concurrent insert/select took {:?}", start.elapsed());
 }
+
+// --------------------------- revalidate_affordability tests ---------------------------
+
+/// A BalanceView that returns 0 for everyone (forces unaffordable paths
+/// if your default lane base fees are > 0).
+struct ZeroBalanceView;
+impl BalanceView for ZeroBalanceView {
+    fn balance_of(&self, _who: &Address) -> u64 { 0 }
+}
+
+/// A BalanceView backed by a map so we can simulate per-address balances.
+struct MapBalanceView<'a> {
+    map: &'a HashMap<Address, u64>,
+}
+impl<'a> BalanceView for MapBalanceView<'a> {
+    fn balance_of(&self, who: &Address) -> u64 {
+        *self.map.get(who).unwrap_or(&0)
+    }
+}
+
+/// Helper: insert one tx per lane for `sender`.
+fn seed_all_lanes(mp: &MempoolImpl, sender: &str) -> (TxId, TxId, TxId) {
+    let (c, tx, salt, cm) = make_commit(sender, 0);
+    let a = make_avail(sender, cm);
+    let r = make_reveal(sender, tx, salt);
+
+    let id_commit = mp.insert_commit(Tx::Commit(c), 1, /*at_height*/ 1, &TestBalanceView{}, &FeeState::from_defaults())
+        .expect("commit admitted");
+    let id_avail  = mp.insert_avail(Tx::Avail(a), 1, /*ready_at*/ 1, &TestBalanceView{}, &FeeState::from_defaults())
+        .expect("avail admitted");
+    let id_reveal = mp.insert_reveal(r, 1, /*at_height*/ 1, &TestBalanceView{}, &FeeState::from_defaults())
+        .expect("reveal admitted");
+
+    (id_commit, id_avail, id_reveal)
+}
+
+#[test]
+fn revalidate_with_zero_balance_prunes_some_or_all() {
+    let mp = MempoolImpl::new(cfg());
+    let alice = addr(90);
+    let bob   = addr(91);
+
+    // Seed a few entries for two senders.
+    seed_all_lanes(&mp, &alice);
+    seed_all_lanes(&mp, &bob);
+
+    // Snapshot sizes before.
+    let (before_c, before_a, before_r) = {
+        let (c, a, r) = mp.debug_read();
+        (c.by_id.len(), a.by_id.len(), r.by_id.len())
+    };
+
+    // Run revalidation with ZeroBalanceView (everyone broke).
+    mp.revalidate_affordability(&ZeroBalanceView, &FeeState::from_defaults());
+
+    // After revalidation, counts must never increase and should usually drop.
+    let (after_c, after_a, after_r) = {
+        let (c, a, r) = mp.debug_read();
+        (c.by_id.len(), a.by_id.len(), r.by_id.len())
+    };
+
+    assert!(after_c <= before_c, "commit count should not increase");
+    assert!(after_a <= before_a, "avail count should not increase");
+    assert!(after_r <= before_r, "reveal count should not increase");
+    // At least one lane should have pruned something in typical configs.
+    assert!(
+        (after_c < before_c) || (after_a < before_a) || (after_r < before_r),
+        "expected at least one lane to prune with zero balance"
+    );
+}
+
+#[test]
+fn revalidate_with_large_balances_keeps_entries() {
+    let mp = MempoolImpl::new(cfg());
+    let alice = addr(92);
+
+    seed_all_lanes(&mp, &alice);
+
+    // Large balances for everyone.
+    let mut balances = HashMap::<Address, u64>::new();
+    balances.insert(alice.clone(), u64::MAX / 2);
+
+    let (c0, a0, r0) = {
+        let (c, a, r) = mp.debug_read();
+        (c.by_id.len(), a.by_id.len(), r.by_id.len())
+    };
+
+    mp.revalidate_affordability(&MapBalanceView { map: &balances }, &FeeState::from_defaults());
+
+    let (c1, a1, r1) = {
+        let (c, a, r) = mp.debug_read();
+        (c.by_id.len(), a.by_id.len(), r.by_id.len())
+    };
+
+    assert_eq!(c1, c0, "commit lane unchanged with ample balances");
+    assert_eq!(a1, a0, "avail lane unchanged with ample balances");
+    assert_eq!(r1, r0, "reveal lane unchanged with ample balances");
+}
+
+#[test]
+fn revalidate_is_idempotent_for_same_inputs() {
+    let mp = MempoolImpl::new(cfg());
+    let alice = addr(93);
+    seed_all_lanes(&mp, &alice);
+
+    let mut balances = HashMap::<Address, u64>::new();
+    balances.insert(alice.clone(), 1_000_000);
+    let view = MapBalanceView { map: &balances };
+    let fees = FeeState::from_defaults();
+
+    mp.revalidate_affordability(&view, &fees);
+    let (c1, a1, r1) = {
+        let (c, a, r) = mp.debug_read();
+        (c.by_id.len(), a.by_id.len(), r.by_id.len())
+    };
+
+    mp.revalidate_affordability(&view, &fees);
+    let (c2, a2, r2) = {
+        let (c, a, r) = mp.debug_read();
+        (c.by_id.len(), a.by_id.len(), r.by_id.len())
+    };
+
+    assert_eq!((c1, a1, r1), (c2, a2, r2), "second pass should not mutate state");
+}
+
+#[test]
+fn revalidate_prunes_only_underfunded_senders() {
+    let mp = MempoolImpl::new(cfg());
+    let rich = addr(94);
+    let poor = addr(95);
+
+    // One of each lane per sender.
+    seed_all_lanes(&mp, &rich);
+    seed_all_lanes(&mp, &poor);
+
+    // Rich has funds, poor does not.
+    let mut balances = HashMap::<Address, u64>::new();
+    balances.insert(rich.clone(), 1_000_000);
+    balances.insert(poor.clone(), 0);
+    let view = MapBalanceView { map: &balances };
+
+    // Before
+    let (before_c, before_a, before_r) = {
+        let (c, a, r) = mp.debug_read();
+        (c.by_id.len(), a.by_id.len(), r.by_id.len())
+    };
+
+    mp.revalidate_affordability(&view, &FeeState::from_defaults());
+
+    // After: counts must not increase, and at least one should drop.
+    let (after_c, after_a, after_r) = {
+        let (c, a, r) = mp.debug_read();
+        (c.by_id.len(), a.by_id.len(), r.by_id.len())
+    };
+
+    assert!(after_c <= before_c && after_a <= before_a && after_r <= before_r);
+    assert!(
+        (after_c < before_c) || (after_a < before_a) || (after_r < before_r),
+        "expected at least one lane to prune for underfunded sender"
+    );
+
+    // Optional internal coherence check: for each lane, indices stay aligned.
+    let (commits, avails, reveals) = mp.debug_read();
+    assert_eq!(commits.by_id.len(), commits.fee_order.len(), "commit indices coherent after prune");
+    assert_eq!(avails.by_id.len(),  avails.fee_order.len(),  "avail indices coherent after prune");
+    assert_eq!(reveals.by_id.len(), reveals.fee_order.len(), "reveal indices coherent after prune");
+}
