@@ -117,8 +117,8 @@ impl Node {
         // 3) Assemble the block header/body
         let block = Block {
             block_number: self.chain.height + 1,
-            transactions: cand.txs.clone(),
-            reveals: cand.reveals.clone(),
+            transactions: cand.txs,
+            reveals: cand.reveals,
         };
     
         // 4) Return the block plus the precise IDs for mark_included.
