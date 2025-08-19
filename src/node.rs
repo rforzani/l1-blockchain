@@ -82,8 +82,6 @@ impl<'a> StateView for NodeStateView<'a> {
     }
 
     fn pending_commit_room(&self, sender: &str) -> u32 {
-        // Keep selection honest w.r.t per-account pending cap using mempool’s own counter.
-        // (Add the two tiny read-only accessors below if you don't already have them.)
         let used = self.mempool.pending_commits_for_sender(sender);
         self.mempool.config().max_pending_commits_per_account.saturating_sub(used)
     }
