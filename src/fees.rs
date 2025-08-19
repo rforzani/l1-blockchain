@@ -326,14 +326,12 @@ mod tests {
         let mut node = Node::new(Arc::clone(&mempool));
 
         // Initial state
-        node.balances = HashMap::from([
-            (sender.clone(), 200u64),
-            (proposer.clone(), 0u64),
-        ]);
+        node.set_balance(sender.clone(), 200u64);
+        node.set_balance(proposer.clone(), 0u64);
 
         // Chain with higher commit fee so proposer share > 0
-        node.chain.fee_state.commit_base = 100;
-        let commit_fee = node.chain.fee_state.commit_base;
+        node.set_commit_fee_base(100);
+        let commit_fee = node.fee_state().commit_base;
         let (burn_share, proposer_share, _tres) = split_amount(commit_fee);
 
         // Access list required for commit
@@ -361,10 +359,10 @@ mod tests {
         mempool
             .insert_commit(
                 Tx::Commit(commit_tx),
-                node.chain.height,
+                node.height(),
                 commit_fee as u128,
                 &TestBalanceView,
-                &node.chain.fee_state,
+                node.fee_state(),
             )
             .expect("commit admitted");
 
@@ -376,9 +374,9 @@ mod tests {
             })
             .expect("block should apply");
 
-        assert_eq!(node.balances[&proposer], proposer_share);
-        assert_eq!(node.chain.burned_total, burn_share);
-        assert_eq!(node.balances[&sender], 200 - commit_fee);
+        assert_eq!(node.balance_of(&proposer), proposer_share);
+        assert_eq!(node.burned_total(), burn_share);
+        assert_eq!(node.balance_of(&sender), 200 - commit_fee);
     }
 
     #[test]
