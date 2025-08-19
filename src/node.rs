@@ -134,26 +134,6 @@ impl Node {
         })
     }
 
-    /// Apply a block, then clean the mempool using the latest fees & balances.
-    pub fn apply_block_and_maintain(&mut self, block: &Block) -> Result<BlockResult, BlockError> {
-        let res = self.chain.apply_block(
-            block,
-            &mut self.balances,
-            &mut self.nonces,
-            &mut self.commitments,
-            &mut self.available,
-        )?;
-
-        // 1) Drop entries that can no longer afford the *current* base fees
-        let view = StateBalanceView { balances: &self.balances };
-        self.mempool.revalidate_affordability(&view, &self.chain.fee_state);
-
-        // 2) Usual upkeep (TTL, reveal windows, etc.)
-        self.mempool.evict_stale(self.chain.height);
-
-        Ok(res)
-    }
-
     pub fn produce_and_apply_once(
         &mut self,
         limits: BlockSelectionLimits,

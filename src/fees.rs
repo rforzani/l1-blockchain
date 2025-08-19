@@ -162,12 +162,17 @@ mod tests {
 
     use ed25519_dalek::{ed25519::signature::SignerMut, SigningKey, VerifyingKey};
 
-    use crate::{codec::{access_list_bytes, string_bytes}, crypto::{addr_from_pubkey, addr_hex, commit_signing_preimage}, state::{Available, Balances, Commitments, Nonces, CHAIN_ID, ZERO_ADDRESS}, stf::process_block, types::{AccessList, Block, CommitTx, Hash, StateKey, Tx}};
+    use crate::{codec::{access_list_bytes, string_bytes}, crypto::{addr_from_pubkey, addr_hex, commit_signing_preimage}, state::{Available, Balances, Commitments, Nonces, CHAIN_ID, ZERO_ADDRESS}, stf::process_block, types::{AccessList, Block, CommitTx, Hash, StateKey, Tx, Address}};
 
     use crate::node::Node;
-    use crate::mempool::{MempoolImpl, MempoolConfig};
+    use crate::mempool::{BalanceView, BlockSelectionLimits, Mempool, MempoolImpl, MempoolConfig};
 
     use super::*;
+
+    struct TestBalanceView;
+    impl BalanceView for TestBalanceView {
+        fn balance_of(&self, _who: &Address) -> u64 { u64::MAX }
+    }
 
     fn cap_step(prev: u64) -> u64 {
         let base = prev.max(FEE_PARAMS.exec_min_base);
@@ -344,20 +349,31 @@ mod tests {
         let pre_c = commit_signing_preimage(&commitment, &[0u8;32], &sender_bytes, &al_bytes, CHAIN_ID);
         let sig_c = sk.sign(&pre_c).to_bytes();
 
-        let block = Block::new(
-            vec![Tx::Commit(CommitTx {
-                commitment,
-                sender: sender.clone(),
-                ciphertext_hash: [0u8;32],
-                access_list: al,
-                pubkey: pk_bytes,
-                sig: sig_c,
-            })],
-            1,
-        );
+        let commit_tx = CommitTx {
+            commitment,
+            sender: sender.clone(),
+            ciphertext_hash: [0u8;32],
+            access_list: al,
+            pubkey: pk_bytes,
+            sig: sig_c,
+        };
+
+        mempool
+            .insert_commit(
+                Tx::Commit(commit_tx),
+                node.chain.height,
+                commit_fee as u128,
+                &TestBalanceView,
+                &node.chain.fee_state,
+            )
+            .expect("commit admitted");
 
         node
-            .apply_block_and_maintain(&block)
+            .produce_and_apply_once(BlockSelectionLimits {
+                max_avails: 1024,
+                max_reveals: 2048,
+                max_commits: 4096,
+            })
             .expect("block should apply");
 
         assert_eq!(node.balances[&proposer], proposer_share);
