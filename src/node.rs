@@ -1,9 +1,9 @@
 // src/node.rs
 use crate::mempool::{BalanceView, BlockSelectionLimits, CommitmentId, Mempool, MempoolImpl, SelectError, StateView, TxId};
 use crate::state::{Balances, Nonces, Commitments, Available};
-use crate::chain::{Chain};
+use crate::chain::Chain;
 use crate::types::Block;
-use crate::stf::{BlockResult, BlockError};
+use crate::stf::BlockResult;
 use std::sync::Arc;
 
 pub struct StateBalanceView<'a> {
@@ -46,39 +46,39 @@ pub struct Node {
 }
 
 struct NodeStateView<'a> {
-    height: u64,
+    chain: &'a Chain,
     nonces: &'a Nonces,
     mempool: &'a MempoolImpl,
 }
 
 impl<'a> StateView for NodeStateView<'a> {
     fn current_height(&self) -> u64 {
-        self.height
+        self.chain.height
     }
 
-    fn commitments_due_and_available(&self, _h: u64) -> Vec<CommitmentId> {
-        // TODO: hook real inclusion list when you have it.
-        Vec::new()
+    fn commitments_due_and_available(&self, h: u64) -> Vec<CommitmentId> {
+        self
+            .chain
+            .commitments_due_and_available(h)
+            .into_iter()
+            .map(CommitmentId)
+            .collect()
     }
 
     fn reveal_nonce_required(&self, sender: &str) -> u64 {
-        // Pull from your node-held on-chain nonces map.
         *self.nonces.get(sender).unwrap_or(&0)
     }
 
-    fn commit_on_chain(&self, _c: CommitmentId) -> bool {
-        // TODO: ask Chain when implemented. Tests run fine with `true` for now.
-        true
+    fn commit_on_chain(&self, c: CommitmentId) -> bool {
+        self.chain.commit_on_chain(&c.0)
     }
 
-    fn avail_on_chain(&self, _c: CommitmentId) -> bool {
-        // TODO: implement when Avail indexing lands. Default `false`.
-        false
+    fn avail_on_chain(&self, c: CommitmentId) -> bool {
+        self.chain.avail_on_chain(&c.0)
     }
 
-    fn avail_allowed_at(&self, _height: u64, _c: CommitmentId) -> bool {
-        // If you later enforce availability windows on-chain, wire it here.
-        true
+    fn avail_allowed_at(&self, height: u64, c: CommitmentId) -> bool {
+        self.chain.avail_allowed_at(height, &c.0)
     }
 
     fn pending_commit_room(&self, sender: &str) -> u32 {
@@ -106,7 +106,7 @@ impl Node {
     pub fn produce_one_block(&self, limits: BlockSelectionLimits) -> Result<BuiltBlock, ProduceError> {
         // 1) Build a minimal state view from what Node already has.
         let sv = NodeStateView {
-            height: self.chain.height,
+            chain: &self.chain,
             nonces: &self.nonces,
             mempool: &self.mempool,
         };
