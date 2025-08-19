@@ -158,13 +158,14 @@ pub fn update_exec_base(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, collections::HashSet};
+    use std::{collections::HashMap, collections::HashSet, sync::Arc};
 
     use ed25519_dalek::{ed25519::signature::SignerMut, SigningKey, VerifyingKey};
 
     use crate::{codec::{access_list_bytes, string_bytes}, crypto::{addr_from_pubkey, addr_hex, commit_signing_preimage}, state::{Available, Balances, Commitments, Nonces, CHAIN_ID, ZERO_ADDRESS}, stf::process_block, types::{AccessList, Block, CommitTx, Hash, StateKey, Tx}};
 
-    use crate::chain::Chain;
+    use crate::node::Node;
+    use crate::mempool::{MempoolImpl, MempoolConfig};
 
     use super::*;
 
@@ -308,19 +309,26 @@ mod tests {
         // Proposer address (Chain::apply_block uses ZERO_ADDRESS)
         let proposer = ZERO_ADDRESS.to_string();
 
+        // Shared mempool + node
+        let mempool: Arc<MempoolImpl> = MempoolImpl::new(MempoolConfig {
+            max_avails_per_block: 1024,
+            max_reveals_per_block: 2048,
+            max_commits_per_block: 4096,
+            max_pending_commits_per_account: 2,
+            commit_ttl_blocks: 100,
+            reveal_window_blocks: 50,
+        });
+        let mut node = Node::new(Arc::clone(&mempool));
+
         // Initial state
-        let mut balances: Balances = HashMap::from([
+        node.balances = HashMap::from([
             (sender.clone(), 200u64),
             (proposer.clone(), 0u64),
         ]);
-        let mut nonces: Nonces = Nonces::default();
-        let mut commitments: Commitments = Commitments::default();
-        let mut available: Available = Available::default();
 
         // Chain with higher commit fee so proposer share > 0
-        let mut chain = Chain::new();
-        chain.fee_state.commit_base = 100;
-        let commit_fee = chain.fee_state.commit_base;
+        node.chain.fee_state.commit_base = 100;
+        let commit_fee = node.chain.fee_state.commit_base;
         let (burn_share, proposer_share, _tres) = split_amount(commit_fee);
 
         // Access list required for commit
@@ -348,13 +356,13 @@ mod tests {
             1,
         );
 
-        chain
-            .apply_block(&block, &mut balances, &mut nonces, &mut commitments, &mut available)
+        node
+            .apply_block_and_maintain(&block)
             .expect("block should apply");
 
-        assert_eq!(balances[&proposer], proposer_share);
-        assert_eq!(chain.burned_total, burn_share);
-        assert_eq!(balances[&sender], 200 - commit_fee);
+        assert_eq!(node.balances[&proposer], proposer_share);
+        assert_eq!(node.chain.burned_total, burn_share);
+        assert_eq!(node.balances[&sender], 200 - commit_fee);
     }
 
     #[test]
