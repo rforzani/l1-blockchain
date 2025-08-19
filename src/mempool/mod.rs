@@ -162,6 +162,12 @@ pub struct MempoolImpl {
     reveals: RwLock<RevealQueue>,
 }
 
+/// Minimal view of a queued item exposed to revalidation predicates.
+pub struct QueuedItem<'a> {
+    pub lane: Lane,
+    pub sender: &'a Address,
+}
+
 impl MempoolImpl {
     pub fn new(config: MempoolConfig) -> Arc<Self> {
         Arc::new(Self {
@@ -199,6 +205,38 @@ impl MempoolImpl {
             self.avails.write().unwrap(),
             self.reveals.write().unwrap(),
         )
+    }
+
+    /// Generic revalidation that lets the caller decide what "valid" means.
+    /// The predicate receives a lightweight item view with lane and sender.
+    pub fn revalidate<F>(&self, mut keep: F)
+    where
+        F: FnMut(QueuedItem<'_>) -> bool,
+    {
+        {
+            let mut q = self.commits.write().unwrap();
+            q.retain_by(|sender| keep(QueuedItem { lane: Lane::Commit, sender }));
+        }
+        {
+            let mut q = self.avails.write().unwrap();
+            q.retain_by(|sender| keep(QueuedItem { lane: Lane::Avail, sender }));
+        }
+        {
+            let mut q = self.reveals.write().unwrap();
+            q.retain_by(|sender| keep(QueuedItem { lane: Lane::Exec, sender }));
+        }
+    }
+
+    /// Convenience wrapper that drops entries whose owners can't afford the current base fees.
+    pub fn revalidate_affordability(&self, view: &dyn BalanceView, fs: &FeeState) {
+        self.revalidate(|it| {
+            let want = match it.lane {
+                Lane::Commit => fs.commit_base,
+                Lane::Avail  => fs.avail_base,
+                Lane::Exec   => fs.exec_base,
+            };
+            view.balance_of(it.sender) >= want
+        });
     }
 }
 

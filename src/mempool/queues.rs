@@ -192,6 +192,22 @@ impl CommitQueue {
         self.payload_by_id.insert(id, c.clone());
         Ok(id)
     }
+
+    /// Retain only those entries whose sender passes `keep(sender)`.
+    /// Uses `evict_by_id` to preserve index coherence.
+    pub fn retain_by<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&Address) -> bool,
+    {
+        let ids_to_remove: Vec<TxId> = self
+            .by_id
+            .iter()
+            .filter_map(|(id, item)| if keep(&item.sender) { None } else { Some(*id) })
+            .collect();
+        for id in ids_to_remove {
+            let _ = self.evict_by_id(&id);
+        }
+    }
 }
 
 impl AvailQueue {
@@ -232,6 +248,22 @@ impl AvailQueue {
         self.by_id.insert(id, item);
         self.payload_by_id.insert(id, a.clone());
         Ok(id)
+    }
+
+    /// Retain only those entries whose sender passes `keep(sender)`.
+    /// Uses `evict_by_id` to preserve index coherence.
+    pub fn retain_by<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&Address) -> bool,
+    {
+        let ids_to_remove: Vec<TxId> = self
+            .by_id
+            .iter()
+            .filter_map(|(id, item)| if keep(&item.sender) { None } else { Some(*id) })
+            .collect();
+        for id in ids_to_remove {
+            let _ = self.evict_by_id(&id);
+        }
     }
 }
 
@@ -289,6 +321,22 @@ impl RevealQueue {
         self.by_id.insert(id, item);
         self.payload_by_id.insert(id, (r.clone(), CommitmentId(*cmt)));
         id
+    }
+
+    /// Retain only those entries whose sender passes `keep(sender)`.
+    /// Uses `evict_by_id` to preserve index coherence.
+    pub fn retain_by<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&Address) -> bool,
+    {
+        let ids_to_remove: Vec<TxId> = self
+            .by_id
+            .iter()
+            .filter_map(|(id, item)| if keep(&item.sender) { None } else { Some(*id) })
+            .collect();
+        for id in ids_to_remove {
+            let _ = self.evict_by_id(&id);
+        }
     }
 }
 
