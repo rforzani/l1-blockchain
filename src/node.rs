@@ -125,18 +125,23 @@ impl Node {
     /// Build exactly one block from the current head and mempool.
     /// Reads chain/mempool, does not mutate state.
     pub fn produce_one_block(&self, limits: BlockSelectionLimits) -> Result<BuiltBlock, ProduceError> {
+        // 0) Prune stale items before building any view or selecting.
+        if self.chain.height > 0 {
+            self.mempool.evict_stale(self.chain.height);
+        }
+
         // 1) Build a minimal state view from what Node already has.
         let sv = NodeStateView {
             chain: &self.chain,
             nonces: &self.nonces,
             mempool: &self.mempool,
         };
-    
+
         // 2) Ask mempool to select candidates.
         let cand = self.mempool
             .select_block(&sv, limits)
             .map_err(ProduceError::Selection)?;
-    
+
         // 3) Assemble the block header/body
         let block = Block {
             block_number: self.chain.height + 1,
@@ -185,5 +190,131 @@ impl Node {
         self.mempool.evict_stale(self.chain.height);
 
         Ok((built, res))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::{access_list_bytes, tx_bytes};
+    use crate::crypto::{commitment_hash, hash_bytes_sha256};
+    use crate::fees::FeeState;
+    use crate::mempool::{BalanceView, Mempool, MempoolConfig, MempoolImpl};
+    use crate::state::CHAIN_ID;
+    use crate::types::{AccessList, Address, CommitTx, Hash, RevealTx, StateKey, Transaction, Tx};
+
+    struct TestBalanceView;
+    impl BalanceView for TestBalanceView {
+        fn balance_of(&self, _who: &Address) -> u64 { u64::MAX }
+    }
+
+    fn cfg() -> MempoolConfig {
+        MempoolConfig {
+            max_avails_per_block: 10,
+            max_reveals_per_block: 10,
+            max_commits_per_block: 10,
+            max_pending_commits_per_account: 10,
+            commit_ttl_blocks: 2,
+            reveal_window_blocks: 2,
+        }
+    }
+
+    fn limits() -> BlockSelectionLimits {
+        BlockSelectionLimits { max_avails: 10, max_reveals: 10, max_commits: 10 }
+    }
+
+    fn addr(i: u8) -> String {
+        format!("0x{:02x}{:02x}000000000000000000000000000000000000", i, i)
+    }
+
+    fn al_for_sender(sender: &str) -> AccessList {
+        AccessList {
+            reads: vec![
+                StateKey::Balance(sender.to_string()),
+                StateKey::Nonce(sender.to_string()),
+            ],
+            writes: vec![
+                StateKey::Balance(sender.to_string()),
+                StateKey::Nonce(sender.to_string()),
+            ],
+        }
+    }
+
+    fn make_tx(from: &str, to: &str, value: u64, nonce: u64) -> Transaction {
+        Transaction {
+            from: from.to_string(),
+            to: to.to_string(),
+            amount: value,
+            nonce,
+            access_list: al_for_sender(from),
+        }
+    }
+
+    fn compute_commitment(tx: &Transaction, salt: &Hash) -> Hash {
+        let tx_ser = tx_bytes(tx);
+        let al_bytes = access_list_bytes(&tx.access_list);
+        commitment_hash(&tx_ser, &al_bytes, salt, CHAIN_ID)
+    }
+
+    fn make_commit(from: &str, nonce: u64) -> (CommitTx, Transaction, Hash) {
+        let to = addr(200);
+        let tx = make_tx(from, &to, 1, nonce);
+        let mut salt = [0u8; 32];
+        salt[0] = 7;
+        salt[1] = 7;
+        let commitment = compute_commitment(&tx, &salt);
+        let commit = CommitTx {
+            commitment,
+            sender: from.to_string(),
+            access_list: tx.access_list.clone(),
+            ciphertext_hash: hash_bytes_sha256(b"placeholder-ciphertext"),
+            pubkey: [0u8; 32],
+            sig: [0u8; 64],
+        };
+        (commit, tx, salt)
+    }
+
+    fn make_reveal(from: &str, tx: Transaction, salt: Hash) -> RevealTx {
+        RevealTx { tx, salt, sender: from.to_string() }
+    }
+
+    #[test]
+    fn stale_entries_not_selected() {
+        let mp = MempoolImpl::new(cfg());
+        let mut node = Node::new(mp.clone());
+        let fs = FeeState::from_defaults();
+
+        // Stale commit + reveal pair inserted at height 0
+        let sender_old = addr(1);
+        let (c_old, tx_old, salt_old) = make_commit(&sender_old, 0);
+        let id_c_old = mp
+            .insert_commit(Tx::Commit(c_old), 0, 1, &TestBalanceView, &fs)
+            .unwrap();
+        let r_old = make_reveal(&sender_old, tx_old, salt_old);
+        let id_r_old = mp
+            .insert_reveal(r_old, 0, 1, &TestBalanceView, &fs)
+            .unwrap();
+
+        // Fresh commit + reveal pair inserted at height 2
+        let sender_new = addr(2);
+        let (c_new, tx_new, salt_new) = make_commit(&sender_new, 0);
+        let id_c_new = mp
+            .insert_commit(Tx::Commit(c_new), 2, 1, &TestBalanceView, &fs)
+            .unwrap();
+        let r_new = make_reveal(&sender_new, tx_new, salt_new);
+        let id_r_new = mp
+            .insert_reveal(r_new, 2, 1, &TestBalanceView, &fs)
+            .unwrap();
+
+        // Set chain height so first pair is just past TTL/window
+        node.chain.height = 3;
+
+        let built = node.produce_one_block(limits()).expect("produce");
+
+        // Only the fresh pair should be selected
+        assert_eq!(built.selected_ids.commit, vec![id_c_new]);
+        assert_eq!(built.selected_ids.reveal, vec![id_r_new]);
+        assert!(!built.selected_ids.commit.contains(&id_c_old));
+        assert!(!built.selected_ids.reveal.contains(&id_r_old));
     }
 }
