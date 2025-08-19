@@ -8,6 +8,7 @@ mod gas;
 mod codec;
 mod mempool;
 mod fees;
+mod node;
 mod chain;
 mod verify;
 
