@@ -153,4 +153,36 @@ impl Node {
 
         Ok(res)
     }
+
+    pub fn produce_and_apply_once(
+        &mut self,
+        limits: BlockSelectionLimits,
+    ) -> Result<(BuiltBlock, BlockResult), ProduceError> {
+        let built = self.produce_one_block(limits)?;
+        // Apply
+        let res = self.chain.apply_block(
+            &built.block,
+            &mut self.balances,
+            &mut self.nonces,
+            &mut self.commitments,
+            &mut self.available,
+        ).map_err(|e| ProduceError::HeaderBuild(format!("apply failed: {e:?}")))?;
+
+        // Mark included BEFORE maintenance
+        let all_ids: Vec<TxId> = built
+            .selected_ids
+            .commit.iter()
+            .chain(&built.selected_ids.avail)
+            .chain(&built.selected_ids.reveal)
+            .cloned()
+            .collect();
+        self.mempool.mark_included(&all_ids, self.chain.height);
+
+        // Maintenance (affordability + TTL) with POST-APPLY balances/fees
+        let view = StateBalanceView { balances: &self.balances };
+        self.mempool.revalidate_affordability(&view, &self.chain.fee_state);
+        self.mempool.evict_stale(self.chain.height);
+
+        Ok((built, res))
+    }
 }
