@@ -610,4 +610,313 @@ pub fn process_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use crate::codec::{access_list_bytes, string_bytes, tx_bytes};
+    use crate::crypto::{addr_from_pubkey, addr_hex, commit_signing_preimage, commitment_hash};
+    use crate::state::{Balances, Commitments, Nonces};
+    use crate::types::{AccessList, Address, CommitTx, RevealTx, StateKey, Transaction};
+
+    fn derive_address(sk: &SigningKey) -> Address {
+        let pk = sk.verifying_key().to_bytes();
+        addr_hex(&addr_from_pubkey(&pk))
+    }
+
+    fn build_commit_and_reveal(
+        sk: &SigningKey,
+        tx: Transaction,
+        salt: Hash,
+        sender: &Address,
+    ) -> (CommitTx, RevealTx) {
+        let tx_ser = tx_bytes(&tx);
+        let al_bytes = access_list_bytes(&tx.access_list);
+        let cmt = commitment_hash(&tx_ser, &al_bytes, &salt, CHAIN_ID);
+        let pre = commit_signing_preimage(&cmt, &[0u8; 32], &string_bytes(sender), &al_bytes, CHAIN_ID);
+        let sig = sk.sign(&pre);
+        let commit_tx = CommitTx {
+            commitment: cmt,
+            sender: sender.clone(),
+            access_list: tx.access_list.clone(),
+            ciphertext_hash: [0u8; 32],
+            pubkey: sk.verifying_key().to_bytes(),
+            sig: sig.to_bytes(),
+        };
+        let reveal_tx = RevealTx { tx, salt, sender: sender.clone() };
+        (commit_tx, reveal_tx)
+    }
+
+    #[test]
+    fn transfer_via_commit_reveal_success() {
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let sender = derive_address(&sk);
+        let receiver = "0x00000000000000000000000000000000000000aa".to_string();
+        let proposer = "0x00000000000000000000000000000000000000bb".to_string();
+
+        let mut tx = Transaction::transfer(&sender, &receiver, 5, 0);
+        tx.access_list.canonicalize();
+        let salt = [9u8; 32];
+        let (commit_tx, reveal_tx) = build_commit_and_reveal(&sk, tx, salt, &sender);
+
+        let mut balances: Balances = Balances::new();
+        balances.insert(sender.clone(), 10);
+        let mut nonces: Nonces = Nonces::new();
+        let mut commitments: Commitments = Commitments::new();
+        let mut events = Vec::new();
+        let fee_state = FeeState::from_defaults();
+        let mut burned_total = 0u64;
+
+        process_commit(
+            &commit_tx,
+            &mut balances,
+            &mut commitments,
+            0,
+            &mut events,
+            &fee_state,
+            &proposer,
+            &mut burned_total,
+        )
+        .unwrap();
+
+        let receipt = process_reveal(
+            &reveal_tx,
+            &mut balances,
+            &mut nonces,
+            1,
+            &mut commitments,
+            &mut events,
+            &fee_state,
+            &proposer,
+            &mut burned_total,
+        )
+        .unwrap();
+
+        assert_eq!(receipt.outcome, ExecOutcome::Success);
+        assert_eq!(balances.get(&sender).copied(), Some(3));
+        assert_eq!(balances.get(&receiver).copied(), Some(5));
+        assert_eq!(nonces.get(&sender).copied(), Some(1));
+    }
+
+    #[test]
+    fn transfer_gas_paid_no_balance_revert() {
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let sender = derive_address(&sk);
+        let receiver = "0x00000000000000000000000000000000000000aa".to_string();
+        let proposer = "0x00000000000000000000000000000000000000bb".to_string();
+
+        let mut tx = Transaction::transfer(&sender, &receiver, 2, 0);
+        tx.access_list.canonicalize();
+        let salt = [9u8; 32];
+        let (commit_tx, reveal_tx) = build_commit_and_reveal(&sk, tx, salt, &sender);
+
+        let mut balances: Balances = Balances::new();
+        balances.insert(sender.clone(), 3);
+        let mut nonces: Nonces = Nonces::new();
+        let mut commitments: Commitments = Commitments::new();
+        let mut events = Vec::new();
+        let fee_state = FeeState::from_defaults();
+        let mut burned_total = 0u64;
+
+        process_commit(
+            &commit_tx,
+            &mut balances,
+            &mut commitments,
+            0,
+            &mut events,
+            &fee_state,
+            &proposer,
+            &mut burned_total,
+        )
+        .unwrap();
+
+        let receipt = process_reveal(
+            &reveal_tx,
+            &mut balances,
+            &mut nonces,
+            1,
+            &mut commitments,
+            &mut events,
+            &fee_state,
+            &proposer,
+            &mut burned_total,
+        )
+        .unwrap();
+
+        assert_eq!(receipt.outcome, ExecOutcome::Revert);
+        assert_eq!(receipt.error.as_deref(), Some("insufficient funds for transfer"));
+        assert_eq!(balances.get(&sender).copied(), Some(1));
+        assert_eq!(balances.get(&receiver).copied().unwrap_or(0), 0);
+        assert_eq!(nonces.get(&sender).copied(), Some(1));
+    }
+
+    #[test]
+    fn intrinsic_invalid_when_cannot_pay_fee() {
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let sender = derive_address(&sk);
+        let receiver = "0x00000000000000000000000000000000000000aa".to_string();
+        let proposer = "0x00000000000000000000000000000000000000bb".to_string();
+
+        let mut tx = Transaction::transfer(&sender, &receiver, 1, 0);
+        tx.access_list.canonicalize();
+        let salt = [9u8; 32];
+        let (commit_tx, reveal_tx) = build_commit_and_reveal(&sk, tx, salt, &sender);
+
+        let mut balances: Balances = Balances::new();
+        balances.insert(sender.clone(), 1); // only enough for commit
+        let mut nonces: Nonces = Nonces::new();
+        let mut commitments: Commitments = Commitments::new();
+        let mut events = Vec::new();
+        let fee_state = FeeState::from_defaults();
+        let mut burned_total = 0u64;
+
+        process_commit(
+            &commit_tx,
+            &mut balances,
+            &mut commitments,
+            0,
+            &mut events,
+            &fee_state,
+            &proposer,
+            &mut burned_total,
+        )
+        .unwrap();
+
+        let err = process_reveal(
+            &reveal_tx,
+            &mut balances,
+            &mut nonces,
+            1,
+            &mut commitments,
+            &mut events,
+            &fee_state,
+            &proposer,
+            &mut burned_total,
+        )
+        .unwrap_err();
+
+        match err {
+            TxError::IntrinsicInvalid(e) => assert_eq!(e, "insufficient funds to pay gas fee"),
+        }
+        assert_eq!(balances.get(&sender).copied(), Some(0));
+        assert!(nonces.get(&sender).is_none());
+    }
+
+    #[test]
+    fn underdeclared_accesslist_fails() {
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let sender = derive_address(&sk);
+        let receiver = "0x00000000000000000000000000000000000000aa".to_string();
+        let proposer = "0x00000000000000000000000000000000000000bb".to_string();
+
+        let mut al = AccessList {
+            reads: vec![
+                StateKey::Balance(sender.clone()),
+                StateKey::Nonce(sender.clone()),
+            ],
+            writes: vec![
+                StateKey::Balance(sender.clone()),
+                StateKey::Nonce(sender.clone()),
+            ],
+        };
+        al.canonicalize();
+
+        let tx = Transaction::new(sender.clone(), receiver.clone(), 5, 0, al.clone());
+        let salt = [9u8; 32];
+        let (commit_tx, reveal_tx) = build_commit_and_reveal(&sk, tx, salt, &sender);
+
+        let mut balances: Balances = Balances::new();
+        balances.insert(sender.clone(), 10);
+        let mut nonces: Nonces = Nonces::new();
+        let mut commitments: Commitments = Commitments::new();
+        let mut events = Vec::new();
+        let fee_state = FeeState::from_defaults();
+        let mut burned_total = 0u64;
+
+        process_commit(
+            &commit_tx,
+            &mut balances,
+            &mut commitments,
+            0,
+            &mut events,
+            &fee_state,
+            &proposer,
+            &mut burned_total,
+        )
+        .unwrap();
+
+        let err = process_reveal(
+            &reveal_tx,
+            &mut balances,
+            &mut nonces,
+            1,
+            &mut commitments,
+            &mut events,
+            &fee_state,
+            &proposer,
+            &mut burned_total,
+        )
+        .unwrap_err();
+
+        match err {
+            TxError::IntrinsicInvalid(e) => {
+                assert_eq!(e, "access list missing recipient balance write")
+            }
+        }
+        assert_eq!(balances.get(&sender).copied(), Some(9));
+        assert!(nonces.get(&sender).is_none());
+    }
+
+    #[test]
+    fn overdeclared_accesslist_succeeds() {
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let sender = derive_address(&sk);
+        let receiver = "0x00000000000000000000000000000000000000aa".to_string();
+        let extra = "0x00000000000000000000000000000000000000cc".to_string();
+        let proposer = "0x00000000000000000000000000000000000000bb".to_string();
+
+        let mut al = AccessList::for_transfer(&sender, &receiver);
+        al.reads.push(StateKey::Balance(extra.clone()));
+        al.writes.push(StateKey::Balance(extra.clone()));
+        al.canonicalize();
+
+        let tx = Transaction::new(sender.clone(), receiver.clone(), 5, 0, al.clone());
+        let salt = [9u8; 32];
+        let (commit_tx, reveal_tx) = build_commit_and_reveal(&sk, tx, salt, &sender);
+
+        let mut balances: Balances = Balances::new();
+        balances.insert(sender.clone(), 10);
+        let mut nonces: Nonces = Nonces::new();
+        let mut commitments: Commitments = Commitments::new();
+        let mut events = Vec::new();
+        let fee_state = FeeState::from_defaults();
+        let mut burned_total = 0u64;
+
+        process_commit(
+            &commit_tx,
+            &mut balances,
+            &mut commitments,
+            0,
+            &mut events,
+            &fee_state,
+            &proposer,
+            &mut burned_total,
+        )
+        .unwrap();
+
+        let receipt = process_reveal(
+            &reveal_tx,
+            &mut balances,
+            &mut nonces,
+            1,
+            &mut commitments,
+            &mut events,
+            &fee_state,
+            &proposer,
+            &mut burned_total,
+        )
+        .unwrap();
+
+        assert_eq!(receipt.outcome, ExecOutcome::Success);
+        assert_eq!(balances.get(&sender).copied(), Some(3));
+        assert_eq!(balances.get(&receiver).copied(), Some(5));
+        assert_eq!(nonces.get(&sender).copied(), Some(1));
+    }
 }
