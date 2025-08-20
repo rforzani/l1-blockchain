@@ -27,6 +27,7 @@ pub struct ApplyResult {
     pub events: Vec<Event>,
     pub exec_reveals_used: u32,
     pub commits_used: u32,
+    pub burned_total: u64,
 }
 
 impl Chain {
@@ -156,7 +157,7 @@ impl Chain {
             self.fee_state.commit_base,
             res.commits_used,
         );
-        Ok(ApplyResult { receipts: res.receipts, gas_total: res.gas_total, events: res.events, exec_reveals_used: res.exec_reveals_used, commits_used: res.commits_used })
+        Ok(ApplyResult { receipts: res.receipts, gas_total: res.gas_total, events: res.events, exec_reveals_used: res.exec_reveals_used, commits_used: res.commits_used, burned_total: self.burned_total })
     }
 
     pub fn commit_simulated_block(

@@ -192,7 +192,7 @@ impl Node {
 
         // Fee recipient: derive once from our pubkey
         let proposer_addr = addr_hex(&addr_from_pubkey(&self.proposer_pubkey));
-        let mut burned_dummy = 0u64;
+        let mut sim_burned_total = self.chain.burned_total;
 
         // Use your STF function that returns body results (roots, receipts, gas, counts, events)
         let body = process_block(
@@ -203,7 +203,7 @@ impl Node {
             &mut sim_available,
             &self.chain.fee_state,
             &proposer_addr,
-            &mut burned_dummy,
+            &mut sim_burned_total,
         ).map_err(|e| ProduceError::HeaderBuild(format!("body simulation failed: {e:?}")))?;
 
         // 5) Fill header with the computed roots and gas
@@ -212,6 +212,7 @@ impl Node {
         block.header.reveal_set_root = body.reveal_set_root;
         block.header.il_root         = body.il_root;
         block.header.gas_used        = body.gas_total;
+        
 
         // 6) Sign the header and attach signature
         let preimage = header_signing_bytes(&block.header);
@@ -224,6 +225,7 @@ impl Node {
             events: body.events.clone(),
             exec_reveals_used: body.exec_reveals_used,
             commits_used: body.commits_used,
+            burned_total: sim_burned_total
         };
 
         Ok((
@@ -240,7 +242,7 @@ impl Node {
             sim_nonces,
             sim_commitments,
             sim_available,
-            burned_dummy,
+            sim_burned_total,
         ))
     }
 
