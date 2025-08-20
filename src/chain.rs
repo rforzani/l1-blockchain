@@ -1,9 +1,11 @@
 //src/chain.rs
 
+use crate::codec::{header_bytes, header_signing_bytes};
+use crate::crypto::{addr_from_pubkey, addr_hex, hash_bytes_sha256, verify_ed25519};
 use crate::fees::{update_commit_base, update_exec_base, FeeState, FEE_PARAMS};
 use crate::stf::{process_block, BlockResult, BlockError};
 use crate::state::{Available, Balances, Commitments, Nonces, DECRYPTION_DELAY, REVEAL_WINDOW, ZERO_ADDRESS};
-use crate::types::{Block, Hash, Event};
+use crate::types::{Block, Event, Hash, Receipt};
 use crate::verify::verify_block_roots;
 use std::collections::{HashMap, HashSet, BTreeMap};
 
@@ -16,6 +18,14 @@ pub struct Chain {
     avail_included: HashSet<Hash>,
     avail_due: BTreeMap<u64, Vec<Hash>>,
     commit_deadline: HashMap<Hash, u64>,
+}
+
+pub struct ApplyResult {
+    pub receipts: Vec<Receipt>,
+    pub gas_total: u64,
+    pub events: Vec<Event>,
+    pub exec_reveals_used: u32,
+    pub commits_used: u32,
 }
 
 impl Chain {
@@ -32,7 +42,6 @@ impl Chain {
         }
     }
 
-    // Returns BlockResult on success (so caller can inspect roots, receipts, etc.)
     pub fn apply_block(
         &mut self,
         block: &Block,
@@ -40,13 +49,37 @@ impl Chain {
         nonces: &mut Nonces,
         commitments: &mut Commitments,
         available: &mut Available,
-    ) -> Result<BlockResult, BlockError> {
-        // 1) basic height check
-        if block.block_number != self.height + 1 {
+    ) -> Result<ApplyResult, BlockError> {
+        // basic height check
+        if block.header.height != self.height + 1 {
             return Err(BlockError::BadHeight {
                 expected: self.height + 1,
-                got: block.block_number,
+                got: block.header.height,
             });
+        }
+
+        // Parent guard: the block we just built must link to our tip
+        if block.header.parent_hash != self.tip_hash {
+            return Err(BlockError::HeaderMismatch(
+                format!(
+                    "parent mismatch: expected {}, got {}",
+                    hex::encode(self.tip_hash),
+                    hex::encode(block.header.parent_hash),
+                )
+            ));
+        }
+
+        // Signature verification
+        {
+            let preimage = header_signing_bytes(&block.header);
+            let ok = verify_ed25519(
+                &block.header.proposer_pubkey,
+                &block.header.signature,
+                &preimage,
+            );
+            if !ok {
+                return Err(BlockError::IntrinsicInvalid("bad block signature".into()));
+            }
         }
 
         let mut sim_balances = balances.clone();
@@ -54,32 +87,22 @@ impl Chain {
         let mut sim_commitments = commitments.clone();
         let mut sim_available = available.clone();
 
-        // 2) process with current tip as parent
-        let proposer = ZERO_ADDRESS.to_string();
+        let proposer_addr = addr_hex(&addr_from_pubkey(&block.header.proposer_pubkey));
+
+        // process with current tip as parent
         let res = process_block(
             block,
             &mut sim_balances,
             &mut sim_nonces,
             &mut sim_commitments,
             &mut sim_available,
-            &self.tip_hash,
             &self.fee_state,
-            &proposer,
+            &proposer_addr,
             &mut self.burned_total,
         )?;
 
-        // Parent guard: the block we just built must link to our tip
-        if res.header.parent_hash != self.tip_hash {
-            return Err(BlockError::HeaderMismatch(
-                format!(
-                    "parent mismatch: expected {}, got {}",
-                    hex::encode(self.tip_hash),
-                    hex::encode(res.header.parent_hash),
-                )
-            ));
-        }
-
-        verify_block_roots(&res.header, block, &res.receipts).map_err(|e| BlockError::RootMismatch(e))?;
+        verify_block_roots(&block.header, block, &res.receipts)
+            .map_err(BlockError::RootMismatch)?;
 
         *balances = sim_balances;
         *nonces = sim_nonces;
@@ -89,7 +112,7 @@ impl Chain {
         for ev in &res.events {
             match ev {
                 Event::CommitStored { commitment, .. } => {
-                    self.commit_included_at.insert(*commitment, block.block_number);
+                    self.commit_included_at.insert(*commitment, block.header.height);
                 }
                 Event::AvailabilityRecorded { commitment } => {
                     if let Some(&inc) = self.commit_included_at.get(commitment) {
@@ -122,15 +145,15 @@ impl Chain {
             FEE_PARAMS.exec_damping_bps,
         );
 
-        // 3) updsate self state
-        self.tip_hash = res.block_hash;
-        self.height = block.block_number;
+        // 3) update self state
+        self.tip_hash = hash_bytes_sha256(&header_bytes(&block.header));
+        self.height = block.header.height;
         self.fee_state.exec_base = next_exec;
         self.fee_state.commit_base = update_commit_base(
             self.fee_state.commit_base,
             res.commits_used,
         );
-        Ok(res)
+        Ok(ApplyResult { receipts: res.receipts, gas_total: res.gas_total, events: res.events, exec_reveals_used: res.exec_reveals_used, commits_used: res.commits_used })
     }
 
     /// Check if a commitment has been included on-chain.
@@ -165,7 +188,7 @@ impl Chain {
 mod tests {
     use super::*;
     use crate::state::CHAIN_ID;
-    
+
     #[test]
     fn apply_block1_advances_tip() {
         use std::collections::HashMap;
@@ -469,7 +492,6 @@ mod tests {
             &mut nonces,
             &mut commitments,
             &mut available,
-            &parent,
             &fee_state,
             &proposer,
             &mut burned_total,

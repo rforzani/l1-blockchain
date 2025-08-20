@@ -392,14 +392,14 @@ mod tests {
         let mut nonces_a: Nonces = HashMap::new();
         let mut commits_a: Commitments = HashMap::new();
         let mut avail_a: Available = HashSet::new();
-        let res1 = process_block(&block, &mut balances_a, &mut nonces_a, &mut commits_a, &mut avail_a, &parent, &fee_state, &proposer1, &mut burned_a).unwrap();
+        let res1 = process_block(&block, &mut balances_a, &mut nonces_a, &mut commits_a, &mut avail_a, &fee_state, &proposer1, &mut burned_a).unwrap();
 
         let mut burned_b = 0u64;
         let mut balances_b: Balances = HashMap::new();
         let mut nonces_b: Nonces = HashMap::new();
         let mut commits_b: Commitments = HashMap::new();
         let mut avail_b: Available = HashSet::new();
-        let res2 = process_block(&block, &mut balances_b, &mut nonces_b, &mut commits_b, &mut avail_b, &parent, &fee_state, &proposer1, &mut burned_b).unwrap();
+        let res2 = process_block(&block, &mut balances_b, &mut nonces_b, &mut commits_b, &mut avail_b, &fee_state, &proposer1, &mut burned_b).unwrap();
 
         assert_eq!(res1.block_hash, res2.block_hash);
 
@@ -410,7 +410,7 @@ mod tests {
         let mut nonces_c: Nonces = HashMap::new();
         let mut commits_c: Commitments = HashMap::new();
         let mut avail_c: Available = HashSet::new();
-        let res3 = process_block(&block, &mut balances_c, &mut nonces_c, &mut commits_c, &mut avail_c, &parent, &fee_state, &proposer2, &mut burned_c).unwrap();
+        let res3 = process_block(&block, &mut balances_c, &mut nonces_c, &mut commits_c, &mut avail_c,  &fee_state, &proposer2, &mut burned_c).unwrap();
 
         assert_ne!(res1.block_hash, res3.block_hash);
     }

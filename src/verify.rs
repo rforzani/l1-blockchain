@@ -122,7 +122,6 @@ fn verify_block_roots_catches_tamper() {
         &mut nonces,
         &mut comm,
         &mut avail,
-        &parent,
         &fee_state,
         &proposer,
         &mut burned_total,

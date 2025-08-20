@@ -115,13 +115,13 @@ fn put_access_list(v: &mut Vec<u8>, al: &AccessList) {
     put_keys(v, &writes);
 }
 
-pub fn header_bytes(h: &BlockHeader) -> Vec<u8> {
+pub fn header_signing_bytes(h: &BlockHeader) -> Vec<u8> {
     let mut v = vec![CODEC_VERSION];
     v.extend_from_slice(DOM_HDR);
     
     v.extend_from_slice(&h.parent_hash);
     put_u64(&mut v, h.height);
-    put_str(&mut v, &h.proposer);
+    v.extend_from_slice(&h.proposer_pubkey);
     v.extend_from_slice(&h.txs_root);
     v.extend_from_slice(&h.receipts_root);
     put_u64(&mut v, h.gas_used);
@@ -131,6 +131,29 @@ pub fn header_bytes(h: &BlockHeader) -> Vec<u8> {
     put_u64(&mut v, h.exec_base_fee);
     put_u64(&mut v, h.commit_base_fee);
     put_u64(&mut v, h.avail_base_fee);
+    put_u64(&mut v, h.timestamp);
+
+    v
+}
+
+pub fn header_bytes(h: &BlockHeader) -> Vec<u8> {
+    let mut v = vec![CODEC_VERSION];
+    v.extend_from_slice(DOM_HDR);
+    
+    v.extend_from_slice(&h.parent_hash);
+    put_u64(&mut v, h.height);
+    v.extend_from_slice(&h.proposer_pubkey);
+    v.extend_from_slice(&h.txs_root);
+    v.extend_from_slice(&h.receipts_root);
+    put_u64(&mut v, h.gas_used);
+    v.extend_from_slice(&h.randomness);       
+    v.extend_from_slice(&h.reveal_set_root);
+    v.extend_from_slice(&h.il_root);
+    put_u64(&mut v, h.exec_base_fee);
+    put_u64(&mut v, h.commit_base_fee);
+    put_u64(&mut v, h.avail_base_fee);
+    put_u64(&mut v, h.timestamp);
+    v.extend_from_slice(&h.signature);
 
     v
 }

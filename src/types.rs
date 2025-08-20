@@ -27,15 +27,15 @@ impl Transaction {
 pub struct Block {
     pub transactions: Vec<Tx>,
     pub reveals: Vec<RevealTx>,
-    pub block_number: u64,
+    pub header: BlockHeader
 }
 
 impl Block {
-    pub fn new_with_reveals(txs: Vec<Tx>, reveals: Vec<RevealTx>, n: u64) -> Self {
-        Self { transactions: txs, reveals, block_number: n }
+    pub fn new_with_reveals(txs: Vec<Tx>, reveals: Vec<RevealTx>, header: BlockHeader) -> Self {
+        Self { transactions: txs, reveals, header }
     }
-    pub fn new(txs: Vec<Tx>, n: u64) -> Self {
-        Self::new_with_reveals(txs, Vec::new(), n) // keep old call sites working
+    pub fn new(txs: Vec<Tx>, header: BlockHeader) -> Self {
+        Self::new_with_reveals(txs, Vec::new(), header)
     }
 }
 
@@ -58,7 +58,7 @@ pub type Hash = [u8; 32];
 pub struct BlockHeader {
     pub parent_hash: Hash,
     pub height: u64,
-    pub proposer: Address,
+    pub proposer_pubkey: [u8; 32],
     pub txs_root: Hash,
     pub receipts_root: Hash,
     pub gas_used: u64,
@@ -67,7 +67,9 @@ pub struct BlockHeader {
     pub il_root: Hash,
     pub exec_base_fee: u64,
     pub commit_base_fee: u64,
-    pub avail_base_fee: u64
+    pub avail_base_fee: u64,
+    pub timestamp: u64,
+    pub signature: [u8; 64]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

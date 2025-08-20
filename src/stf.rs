@@ -65,6 +65,18 @@ pub struct BlockResult {
     pub commits_used: u32,
 }
 
+pub struct BodyResult {
+    pub receipts: Vec<Receipt>,
+    pub gas_total: u64,
+    pub txs_root: Hash,
+    pub receipts_root: Hash,
+    pub reveal_set_root: Hash,
+    pub il_root: Hash,
+    pub events: Vec<Event>,
+    pub exec_reveals_used: u32,
+    pub commits_used: u32,
+}
+
 pub fn process_transaction(
     tx: &Transaction,
     balances: &mut Balances,
@@ -486,11 +498,10 @@ pub fn process_block(
     nonces: &mut Nonces,
     commitments: &mut Commitments,
     available: &mut Available,
-    parent_hash: &Hash,
     fee_state: &FeeState,
     proposer: &Address,
     burned_total: &mut u64,
-) -> Result<BlockResult, BlockError> {
+) -> Result<BodyResult, BlockError> {
     let mut receipts: Vec<Receipt> = Vec::new();
     let mut gas_total: u64 = 0;
     let mut reveals_included: u32 = 0;
@@ -518,7 +529,7 @@ pub fn process_block(
         if meta.consumed { continue; }
         let ready_at = meta.included_at + DECRYPTION_DELAY;
         let deadline = ready_at + REVEAL_WINDOW;
-        if block.block_number == deadline && available.contains(cmt) {
+        if block.header.height == deadline && available.contains(cmt) {
             il_due.push(*cmt);
         }
     }
@@ -529,8 +540,8 @@ pub fn process_block(
         let is_commit = matches!(tx, Tx::Commit(_));
 
         let rcpt_res = match tx {
-            Tx::Commit(c) => process_commit(c, balances, commitments, block.block_number, &mut events, fee_state, proposer, burned_total),
-            Tx::Avail(a)  => process_avail(a, commitments, available, block.block_number, &mut events, balances, fee_state, proposer, burned_total),
+            Tx::Commit(c) => process_commit(c, balances, commitments, block.header.height, &mut events, fee_state, proposer, burned_total),
+            Tx::Avail(a)  => process_avail(a, commitments, available, block.header.height, &mut events, balances, fee_state, proposer, burned_total),
         };
 
         match rcpt_res {
@@ -545,7 +556,7 @@ pub fn process_block(
             }
             Err(TxError::IntrinsicInvalid(e)) => {
                 return Err(BlockError::IntrinsicInvalid(format!(
-                    "block={} tx_index={} error={}", block.block_number, i + 1, e
+                    "block={} tx_index={} error={}", block.header.height, i + 1, e
                 )));
             }
         }
@@ -556,7 +567,7 @@ pub fn process_block(
     reveals_sorted.sort_by(|a, b| a.sender.cmp(&b.sender).then(a.tx.nonce.cmp(&b.tx.nonce)));
 
     for r in &reveals_sorted {
-        let rcpt = process_reveal(r, balances, nonces, block.block_number, commitments, &mut events, fee_state, proposer, burned_total)?;
+        let rcpt = process_reveal(r, balances, nonces, block.header.height, commitments, &mut events, fee_state, proposer, burned_total)?;
         reveals_included += 1;
         gas_total += rcpt.gas_used;
         receipt_hashes.push(hash_bytes_sha256(&receipt_bytes(&rcpt)));
@@ -593,24 +604,7 @@ pub fn process_block(
     let il_leaves: Vec<Hash> = il_due.iter().map(|c| hash_bytes_sha256(c)).collect();
     let il_root = merkle_root(&il_leaves);
 
-    // 5) Header & hash
-    let header = BlockHeader {
-        parent_hash: *parent_hash,
-        height: block.block_number,
-        proposer: proposer.clone(),
-        txs_root,
-        receipts_root,
-        gas_used: gas_total,
-        randomness: *parent_hash,
-        reveal_set_root,
-        il_root,
-        exec_base_fee: fee_state.exec_base,
-        commit_base_fee: fee_state.commit_base,
-        avail_base_fee: fee_state.avail_base
-    };
-    let block_hash = hash_bytes_sha256(&header_bytes(&header));
-
-    Ok(BlockResult { receipts, gas_total, txs_root, receipts_root, header, block_hash, events, exec_reveals_used: reveals_included, commits_used: commits_included })
+    Ok(BodyResult { receipts, il_root, reveal_set_root, gas_total, txs_root, receipts_root, events, exec_reveals_used: reveals_included, commits_used: commits_included })
 }
 
 #[cfg(test)]
