@@ -57,3 +57,8 @@ pub fn verify_block_roots(header: &BlockHeader, block: &Block, receipts: &[Recei
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+}
