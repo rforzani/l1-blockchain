@@ -158,7 +158,15 @@ pub fn update_exec_base(
 
 #[cfg(test)]
 mod tests {
-    use crate::fees::{split_amount, update_exec_base, FeeSplitBps, FEE_PARAMS};
+    use crate::fees::{split_amount, update_exec_base, FeeSplitBps, FEE_PARAMS, FeeState};
+    use crate::stf::process_commit;
+    use crate::state::{Balances, Commitments, CHAIN_ID};
+    use crate::types::{Transaction, CommitTx, BlockHeader, Hash};
+    use crate::codec::{tx_bytes, access_list_bytes, string_bytes, header_bytes};
+    use crate::crypto::{
+        addr_from_pubkey, addr_hex, commitment_hash, commit_signing_preimage, hash_bytes_sha256,
+    };
+    use ed25519_dalek::{SigningKey, Signer};
 
     fn cap_step(prev: u64) -> u64 {
         let base = prev.max(FEE_PARAMS.exec_min_base);
@@ -288,5 +296,102 @@ mod tests {
         assert_eq!(proposer, 150);
         assert_eq!(treasury, 50);
         assert_eq!(burn, 800);
+    }
+
+    fn addr(i: u8) -> String {
+        format!(
+            "0x{:02x}{:02x}000000000000000000000000000000000000",
+            i, i
+        )
+    }
+
+    fn make_commit(
+        signer: &SigningKey,
+        tx: &Transaction,
+        salt: Hash,
+    ) -> CommitTx {
+        let tx_ser = tx_bytes(tx);
+        let al_bytes = access_list_bytes(&tx.access_list);
+        let commitment = commitment_hash(&tx_ser, &al_bytes, &salt, CHAIN_ID);
+        let ciphertext_hash = hash_bytes_sha256(b"ciphertext");
+        let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
+        let sender_bytes = string_bytes(&sender);
+        let preimage = commit_signing_preimage(
+            &commitment,
+            &ciphertext_hash,
+            &sender_bytes,
+            &al_bytes,
+            CHAIN_ID,
+        );
+        let sig = signer.sign(&preimage).to_bytes();
+        CommitTx {
+            commitment,
+            sender,
+            access_list: tx.access_list.clone(),
+            ciphertext_hash,
+            pubkey: signer.verifying_key().to_bytes(),
+            sig,
+        }
+    }
+
+    #[test]
+    fn proposer_gets_commit_fee_share_and_burn_tracked() {
+        let sender_signer = SigningKey::from_bytes(&[1u8; 32]);
+        let proposer_signer = SigningKey::from_bytes(&[2u8; 32]);
+        let sender_addr = addr_hex(&addr_from_pubkey(&sender_signer.verifying_key().to_bytes()));
+        let proposer_addr = addr_hex(&addr_from_pubkey(&proposer_signer.verifying_key().to_bytes()));
+
+        let mut balances = Balances::default();
+        balances.insert(sender_addr.clone(), 200);
+        balances.insert(proposer_addr.clone(), 0);
+        let mut commitments = Commitments::default();
+
+        let tx = Transaction::transfer(&sender_addr, &addr(3), 5, 0);
+        let commit_tx = make_commit(&sender_signer, &tx, [9u8; 32]);
+
+        let mut events = Vec::new();
+        let mut fee_state = FeeState::from_defaults();
+        fee_state.commit_base = 100;
+        let mut burned_total = 0u64;
+
+        process_commit(
+            &commit_tx,
+            &mut balances,
+            &mut commitments,
+            0,
+            &mut events,
+            &fee_state,
+            &proposer_addr,
+            &mut burned_total,
+        )
+        .unwrap();
+
+        assert_eq!(*balances.get(&sender_addr).unwrap(), 100);
+        assert_eq!(*balances.get(&proposer_addr).unwrap(), 5);
+        assert_eq!(burned_total, 95);
+    }
+
+    #[test]
+    fn block_hash_changes_with_proposer() {
+        let mut header = BlockHeader {
+            parent_hash: [1u8; 32],
+            height: 1,
+            proposer_pubkey: [3u8; 32],
+            txs_root: [0u8; 32],
+            receipts_root: [0u8; 32],
+            gas_used: 0,
+            randomness: [0u8; 32],
+            reveal_set_root: [0u8; 32],
+            il_root: [0u8; 32],
+            exec_base_fee: 0,
+            commit_base_fee: 0,
+            avail_base_fee: 0,
+            timestamp: 0,
+            signature: [0u8; 64],
+        };
+        let h1 = hash_bytes_sha256(&header_bytes(&header));
+        header.proposer_pubkey = [4u8; 32];
+        let h2 = hash_bytes_sha256(&header_bytes(&header));
+        assert_ne!(h1, h2);
     }
 }
