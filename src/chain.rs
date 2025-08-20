@@ -197,9 +197,9 @@ mod tests {
         hash_bytes_sha256, addr_from_pubkey, addr_hex, commitment_hash,
         commit_signing_preimage, avail_signing_preimage,
     };
-    use crate::state::{Balances, Nonces, Commitments, Available, CHAIN_ID};
+    use crate::state::{Balances, Nonces, Commitments, Available, CHAIN_ID, MAX_AVAILS_PER_BLOCK, MAX_PENDING_COMMITS_PER_ACCOUNT};
     use crate::types::{
-        Block, BlockHeader, Tx, CommitTx, AvailTx, RevealTx, Transaction, AccessList, Hash,
+        Block, BlockHeader, Tx, CommitTx, AvailTx, RevealTx, Transaction, Hash,
     };
 
     fn build_block(
@@ -639,5 +639,150 @@ mod tests {
         assert_eq!(balances.get(&recv1).copied().unwrap(), 10);
         assert_eq!(balances.get(&recv2).copied().unwrap(), 20);
         assert!(chain.commitments_due_and_available(5).is_empty());
+    }
+
+    #[test]
+    fn too_many_avails_in_block_is_invalid() {
+        let signer = SigningKey::from_bytes(&[7u8; 32]);
+        let mut chain = Chain::new();
+        let mut balances = Balances::default();
+        let mut nonces = Nonces::default();
+        let mut commitments = Commitments::default();
+        let mut available = Available::default();
+
+        let mut txs = Vec::with_capacity(MAX_AVAILS_PER_BLOCK + 1);
+        for _ in 0..=MAX_AVAILS_PER_BLOCK {
+            txs.push(Tx::Avail(AvailTx {
+                commitment: [0u8; 32],
+                sender: String::new(),
+                pubkey: [0u8; 32],
+                sig: [0u8; 64],
+            }));
+        }
+
+        let mut block = Block {
+            header: BlockHeader {
+                parent_hash: chain.tip_hash,
+                height: chain.height + 1,
+                proposer_pubkey: signer.verifying_key().to_bytes(),
+                txs_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                randomness: chain.tip_hash,
+                reveal_set_root: [0u8; 32],
+                il_root: [0u8; 32],
+                exec_base_fee: chain.fee_state.exec_base,
+                commit_base_fee: chain.fee_state.commit_base,
+                avail_base_fee: chain.fee_state.avail_base,
+                timestamp: 0,
+                signature: [0u8; 64],
+            },
+            transactions: txs,
+            reveals: vec![],
+        };
+
+        let preimage = header_signing_bytes(&block.header);
+        block.header.signature = signer.sign(&preimage).to_bytes();
+
+        let res = chain.apply_block(&block, &mut balances, &mut nonces, &mut commitments, &mut available);
+        assert!(matches!(res, Err(BlockError::IntrinsicInvalid(msg)) if msg.contains("too many Avails in block")));
+        assert_eq!(chain.height, 0);
+    }
+
+    #[test]
+    fn too_many_pending_commits_for_owner_is_rejected() {
+        let signer = SigningKey::from_bytes(&[8u8; 32]);
+        let mut chain = Chain::new();
+        let mut balances = Balances::default();
+        let mut nonces = Nonces::default();
+        let mut commitments = Commitments::default();
+        let mut available = Available::default();
+
+        let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
+        balances.insert(sender.clone(), 2_000);
+
+        let tx = Transaction::transfer(&sender, &addr(1), 1, 0);
+        let mut txs = Vec::with_capacity(MAX_PENDING_COMMITS_PER_ACCOUNT + 1);
+        for i in 0..=MAX_PENDING_COMMITS_PER_ACCOUNT {
+            let mut salt = [0u8; 32];
+            salt[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let (c, _ch) = make_commit(&signer, &tx, salt);
+            txs.push(Tx::Commit(c));
+        }
+
+        let mut block = Block {
+            header: BlockHeader {
+                parent_hash: chain.tip_hash,
+                height: chain.height + 1,
+                proposer_pubkey: signer.verifying_key().to_bytes(),
+                txs_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                randomness: chain.tip_hash,
+                reveal_set_root: [0u8; 32],
+                il_root: [0u8; 32],
+                exec_base_fee: chain.fee_state.exec_base,
+                commit_base_fee: chain.fee_state.commit_base,
+                avail_base_fee: chain.fee_state.avail_base,
+                timestamp: 0,
+                signature: [0u8; 64],
+            },
+            transactions: txs,
+            reveals: vec![],
+        };
+
+        let preimage = header_signing_bytes(&block.header);
+        block.header.signature = signer.sign(&preimage).to_bytes();
+
+        let res = chain.apply_block(&block, &mut balances, &mut nonces, &mut commitments, &mut available);
+        assert!(matches!(res, Err(BlockError::IntrinsicInvalid(msg)) if msg.contains("too many pending commits for owner")));
+        assert!(commitments.is_empty());
+        assert_eq!(chain.height, 0);
+    }
+
+    #[test]
+    fn duplicate_commit_in_same_block_is_rejected() {
+        let signer = SigningKey::from_bytes(&[9u8; 32]);
+        let mut chain = Chain::new();
+        let mut balances = Balances::default();
+        let mut nonces = Nonces::default();
+        let mut commitments = Commitments::default();
+        let mut available = Available::default();
+
+        let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
+        balances.insert(sender.clone(), 100);
+
+        let tx = Transaction::transfer(&sender, &addr(1), 1, 0);
+        let salt = [1u8; 32];
+        let (commit, _c_hash) = make_commit(&signer, &tx, salt);
+
+        let mut block = Block {
+            header: BlockHeader {
+                parent_hash: chain.tip_hash,
+                height: chain.height + 1,
+                proposer_pubkey: signer.verifying_key().to_bytes(),
+                txs_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                randomness: chain.tip_hash,
+                reveal_set_root: [0u8; 32],
+                il_root: [0u8; 32],
+                exec_base_fee: chain.fee_state.exec_base,
+                commit_base_fee: chain.fee_state.commit_base,
+                avail_base_fee: chain.fee_state.avail_base,
+                timestamp: 0,
+                signature: [0u8; 64],
+            },
+            transactions: vec![Tx::Commit(commit.clone()), Tx::Commit(commit.clone())],
+            reveals: vec![],
+        };
+
+        let preimage = header_signing_bytes(&block.header);
+        block.header.signature = signer.sign(&preimage).to_bytes();
+
+        let res = chain.apply_block(&block, &mut balances, &mut nonces, &mut commitments, &mut available);
+        assert!(matches!(res, Err(BlockError::IntrinsicInvalid(msg)) if msg.contains("duplicate commitment")));
+        assert!(commitments.is_empty());
+        assert_eq!(chain.height, 0);
     }
 }
