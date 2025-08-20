@@ -266,5 +266,80 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mempool::{MempoolConfig, BlockSelectionLimits, BalanceView};
+    use crate::fees::FeeState;
+    use crate::types::{Transaction, Tx, CommitTx, RevealTx, Hash, Address};
+    use crate::codec::{tx_bytes, access_list_bytes};
+    use crate::crypto::commitment_hash;
 
+    struct TestBalanceView;
+    impl BalanceView for TestBalanceView {
+        fn balance_of(&self, _who: &Address) -> u64 { u64::MAX }
+    }
+
+    fn addr(i: u8) -> String {
+        format!("0x{:02x}{:02x}000000000000000000000000000000000000", i, i)
+    }
+
+    fn make_pair(sender: &str, nonce: u64) -> (CommitTx, RevealTx) {
+        let tx = Transaction::transfer(sender, &addr(200), 1, nonce);
+        let mut salt = [0u8; 32];
+        salt[0] = 7; salt[1] = 7;
+        let tx_ser = tx_bytes(&tx);
+        let al_bytes = access_list_bytes(&tx.access_list);
+        let commitment = commitment_hash(&tx_ser, &al_bytes, &salt, crate::state::CHAIN_ID);
+        let commit = CommitTx {
+            commitment,
+            sender: sender.to_string(),
+            access_list: tx.access_list.clone(),
+            ciphertext_hash: [0u8; 32],
+            pubkey: [0u8; 32],
+            sig: [0u8; 64],
+        };
+        let reveal = RevealTx { tx, salt, sender: sender.to_string() };
+        (commit, reveal)
+    }
+
+    #[test]
+    fn stale_entries_not_selected() {
+        let cfg = MempoolConfig {
+            max_avails_per_block: 10,
+            max_reveals_per_block: 10,
+            max_commits_per_block: 10,
+            max_pending_commits_per_account: 10,
+            commit_ttl_blocks: 2,
+            reveal_window_blocks: 2,
+        };
+        let mp = MempoolImpl::new(cfg);
+        let mut node = Node::new(mp.clone(), SigningKey::from_bytes(&[1u8; 32]));
+
+        let bv = TestBalanceView;
+
+        // stale pair at height 0
+        let sender1 = addr(1);
+        let (c1, r1) = make_pair(&sender1, 0);
+        mp.insert_commit(Tx::Commit(c1), 0, 1, &bv, &FeeState::from_defaults()).unwrap();
+        mp.insert_reveal(r1, 0, 1, &bv, &FeeState::from_defaults()).unwrap();
+
+        // fresh pair at height 2
+        let sender2 = addr(2);
+        let (c2, r2) = make_pair(&sender2, 0);
+        mp.insert_commit(Tx::Commit(c2.clone()), 2, 1, &bv, &FeeState::from_defaults()).unwrap();
+        mp.insert_reveal(r2.clone(), 2, 1, &bv, &FeeState::from_defaults()).unwrap();
+
+        // chain height so first pair is stale
+        node.chain.height = 3;
+        node.mempool.evict_stale(node.chain.height);
+
+        let sv = NodeStateView { chain: &node.chain, nonces: &node.nonces, mempool: &node.mempool };
+        let limits = BlockSelectionLimits { max_avails: 10, max_reveals: 10, max_commits: 10 };
+        let cand = node.mempool.select_block(&sv, limits).expect("select");
+        assert_eq!(cand.txs.len(), 1);
+        assert_eq!(cand.reveals.len(), 1);
+        match &cand.txs[0] {
+            Tx::Commit(c) => assert_eq!(c.sender, sender2),
+            _ => panic!("unexpected tx variant"),
+        }
+        assert_eq!(cand.reveals[0].sender, sender2);
+    }
 }
