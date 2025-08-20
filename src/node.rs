@@ -8,8 +8,6 @@ use std::sync::Arc;
 use ed25519_dalek::{SigningKey, Signer};
 use crate::crypto::{addr_from_pubkey, addr_hex};
 use crate::codec::header_signing_bytes;
-use crate::codec::{receipt_bytes, tx_enum_bytes};
-use crate::crypto::hash_bytes_sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct StateBalanceView<'a> {
@@ -139,9 +137,10 @@ impl Node {
         self.balances.insert(who, amount);
     }
 
- /// Build exactly one block from the current head and mempool.
-    /// Reads chain/mempool, does not mutate state.
-    pub fn produce_one_block(&self, limits: BlockSelectionLimits) -> Result<BuiltBlock, ProduceError> {
+    fn simulate_block(
+        &self,
+        limits: BlockSelectionLimits,
+    ) -> Result<(BuiltBlock, ApplyResult, Balances, Nonces, Commitments, Available, u64), ProduceError> {
         // 0) Prune stale items before building any view or selecting.
         if self.chain.height > 0 {
             self.mempool.evict_stale(self.chain.height);
@@ -219,32 +218,63 @@ impl Node {
         let sig      = self.signer.sign(&preimage).to_bytes();
         block.header.signature = sig;
 
-        // 7) Return the fully-formed block + selected IDs (for mark_included after apply)
-        Ok(BuiltBlock {
-            block,
-            selected_ids: SelectedIds {
-                commit: cand.commit_ids,
-                avail:  cand.avail_ids,
-                reveal: cand.reveal_ids,
+        let apply = ApplyResult {
+            receipts: body.receipts.clone(),
+            gas_total: body.gas_total,
+            events: body.events.clone(),
+            exec_reveals_used: body.exec_reveals_used,
+            commits_used: body.commits_used,
+        };
+
+        Ok((
+            BuiltBlock {
+                block,
+                selected_ids: SelectedIds {
+                    commit: cand.commit_ids,
+                    avail:  cand.avail_ids,
+                    reveal: cand.reveal_ids,
+                },
             },
-        })
+            apply,
+            sim_balances,
+            sim_nonces,
+            sim_commitments,
+            sim_available,
+            burned_dummy,
+        ))
     }
 
-    pub fn produce_and_apply_once(
+    pub fn produce_block(
         &mut self,
         limits: BlockSelectionLimits,
     ) -> Result<(BuiltBlock, ApplyResult), ProduceError> {
-        let built = self.produce_one_block(limits)?;
-        // Apply
-        let res = self.chain.apply_block(
-            &built.block,
-            &mut self.balances,
-            &mut self.nonces,
-            &mut self.commitments,
-            &mut self.available,
-        ).map_err(|e| ProduceError::HeaderBuild(format!("apply failed: {e:?}")))?;
+        let (
+            built,
+            apply,
+            balances,
+            nonces,
+            commitments,
+            available,
+            burned_total,
+        ) = self.simulate_block(limits)?;
 
-        // Mark included BEFORE maintenance
+        let res = self.chain
+            .commit_simulated_block(
+                &built.block,
+                apply.clone(),
+                balances.clone(),
+                nonces.clone(),
+                commitments.clone(),
+                available.clone(),
+            )
+            .map_err(|e| ProduceError::HeaderBuild(format!("commit failed: {e:?}")))?;
+
+        self.balances = balances;
+        self.nonces = nonces;
+        self.commitments = commitments;
+        self.available = available;
+        let _ = burned_total; // state already applied via commit_simulated_block
+
         let all_ids: Vec<TxId> = built
             .selected_ids
             .commit.iter()
@@ -254,23 +284,41 @@ impl Node {
             .collect();
         self.mempool.mark_included(&all_ids, self.chain.height);
 
-        // Maintenance (affordability + TTL) with POST-APPLY balances/fees
         let view = StateBalanceView { balances: &self.balances };
         self.mempool.revalidate_affordability(&view, &self.chain.fee_state);
         self.mempool.evict_stale(self.chain.height);
 
         Ok((built, res))
     }
+
+    #[deprecated(note = "use produce_block")]
+    pub fn produce_one_block(
+        &self,
+        limits: BlockSelectionLimits,
+    ) -> Result<BuiltBlock, ProduceError> {
+        let (built, _, _, _, _, _, _) = self.simulate_block(limits)?;
+        Ok(built)
+    }
+
+    #[deprecated(note = "use produce_block")]
+    pub fn produce_and_apply_once(
+        &mut self,
+        limits: BlockSelectionLimits,
+    ) -> Result<(BuiltBlock, ApplyResult), ProduceError> {
+        self.produce_block(limits)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mempool::{MempoolConfig, BlockSelectionLimits, BalanceView};
-    use crate::fees::FeeState;
-    use crate::types::{Transaction, Tx, CommitTx, RevealTx, Hash, Address};
-    use crate::codec::{tx_bytes, access_list_bytes};
-    use crate::crypto::commitment_hash;
+use crate::mempool::{MempoolConfig, BlockSelectionLimits, BalanceView};
+use crate::fees::FeeState;
+use crate::types::{Transaction, Tx, CommitTx, RevealTx, Address};
+use crate::stf::PROCESS_BLOCK_CALLS;
+use std::sync::atomic::Ordering;
+    use crate::codec::{tx_bytes, access_list_bytes, string_bytes};
+    use crate::crypto::{commitment_hash, commit_signing_preimage, addr_from_pubkey, addr_hex};
 
     struct TestBalanceView;
     impl BalanceView for TestBalanceView {
@@ -281,22 +329,32 @@ mod tests {
         format!("0x{:02x}{:02x}000000000000000000000000000000000000", i, i)
     }
 
-    fn make_pair(sender: &str, nonce: u64) -> (CommitTx, RevealTx) {
-        let tx = Transaction::transfer(sender, &addr(200), 1, nonce);
+    fn make_pair(signer: &SigningKey, nonce: u64) -> (CommitTx, RevealTx) {
+        let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
+        let tx = Transaction::transfer(&sender, &addr(200), 1, nonce);
         let mut salt = [0u8; 32];
         salt[0] = 7; salt[1] = 7;
         let tx_ser = tx_bytes(&tx);
         let al_bytes = access_list_bytes(&tx.access_list);
         let commitment = commitment_hash(&tx_ser, &al_bytes, &salt, crate::state::CHAIN_ID);
+        let sender_bytes = string_bytes(&sender);
+        let preimage = commit_signing_preimage(
+            &commitment,
+            &[0u8; 32],
+            &sender_bytes,
+            &al_bytes,
+            crate::state::CHAIN_ID,
+        );
+        let sig = signer.sign(&preimage).to_bytes();
         let commit = CommitTx {
             commitment,
-            sender: sender.to_string(),
+            sender: sender.clone(),
             access_list: tx.access_list.clone(),
             ciphertext_hash: [0u8; 32],
-            pubkey: [0u8; 32],
-            sig: [0u8; 64],
+            pubkey: signer.verifying_key().to_bytes(),
+            sig,
         };
-        let reveal = RevealTx { tx, salt, sender: sender.to_string() };
+        let reveal = RevealTx { tx, salt, sender };
         (commit, reveal)
     }
 
@@ -316,14 +374,16 @@ mod tests {
         let bv = TestBalanceView;
 
         // stale pair at height 0
-        let sender1 = addr(1);
-        let (c1, r1) = make_pair(&sender1, 0);
+        let sk1 = SigningKey::from_bytes(&[2u8; 32]);
+        let _sender1 = addr_hex(&addr_from_pubkey(&sk1.verifying_key().to_bytes()));
+        let (c1, r1) = make_pair(&sk1, 0);
         mp.insert_commit(Tx::Commit(c1), 0, 1, &bv, &FeeState::from_defaults()).unwrap();
         mp.insert_reveal(r1, 0, 1, &bv, &FeeState::from_defaults()).unwrap();
 
         // fresh pair at height 2
-        let sender2 = addr(2);
-        let (c2, r2) = make_pair(&sender2, 0);
+        let sk2 = SigningKey::from_bytes(&[3u8; 32]);
+        let sender2 = addr_hex(&addr_from_pubkey(&sk2.verifying_key().to_bytes()));
+        let (c2, r2) = make_pair(&sk2, 0);
         mp.insert_commit(Tx::Commit(c2.clone()), 2, 1, &bv, &FeeState::from_defaults()).unwrap();
         mp.insert_reveal(r2.clone(), 2, 1, &bv, &FeeState::from_defaults()).unwrap();
 
@@ -341,5 +401,54 @@ mod tests {
             _ => panic!("unexpected tx variant"),
         }
         assert_eq!(cand.reveals[0].sender, sender2);
+    }
+
+    #[test]
+    fn commit_simulated_block_updates_state() {
+        let cfg = MempoolConfig {
+            max_avails_per_block: 10,
+            max_reveals_per_block: 10,
+            max_commits_per_block: 10,
+            max_pending_commits_per_account: 10,
+            commit_ttl_blocks: 2,
+            reveal_window_blocks: 2,
+        };
+        let mp = MempoolImpl::new(cfg);
+        let mut node = Node::new(mp.clone(), SigningKey::from_bytes(&[2u8; 32]));
+        let bv = TestBalanceView;
+        let tx_sk = SigningKey::from_bytes(&[4u8; 32]);
+        let sender = addr_hex(&addr_from_pubkey(&tx_sk.verifying_key().to_bytes()));
+        node.set_balance(sender.clone(), 1000);
+        let (c, _r) = make_pair(&tx_sk, 0);
+        mp.insert_commit(Tx::Commit(c.clone()), 0, 1, &bv, &FeeState::from_defaults()).unwrap();
+        let limits = BlockSelectionLimits { max_avails: 10, max_reveals: 10, max_commits: 10 };
+        node.produce_block(limits).expect("produce");
+        assert_eq!(node.height(), 1);
+        assert_eq!(node.balance_of(&sender), 999);
+        assert!(node.chain.commit_on_chain(&c.commitment));
+    }
+
+    #[test]
+    fn process_block_called_once() {
+        let cfg = MempoolConfig {
+            max_avails_per_block: 10,
+            max_reveals_per_block: 10,
+            max_commits_per_block: 10,
+            max_pending_commits_per_account: 10,
+            commit_ttl_blocks: 2,
+            reveal_window_blocks: 2,
+        };
+        let mp = MempoolImpl::new(cfg);
+        let mut node = Node::new(mp.clone(), SigningKey::from_bytes(&[3u8; 32]));
+        let bv = TestBalanceView;
+        let tx_sk = SigningKey::from_bytes(&[5u8; 32]);
+        let sender = addr_hex(&addr_from_pubkey(&tx_sk.verifying_key().to_bytes()));
+        node.set_balance(sender.clone(), 1000);
+        let (c, _r) = make_pair(&tx_sk, 0);
+        mp.insert_commit(Tx::Commit(c), 0, 1, &bv, &FeeState::from_defaults()).unwrap();
+        PROCESS_BLOCK_CALLS.store(0, Ordering::SeqCst);
+        let limits = BlockSelectionLimits { max_avails: 10, max_reveals: 10, max_commits: 10 };
+        node.produce_block(limits).unwrap();
+        assert_eq!(PROCESS_BLOCK_CALLS.load(Ordering::SeqCst), 1);
     }
 }

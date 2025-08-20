@@ -20,6 +20,7 @@ pub struct Chain {
     commit_deadline: HashMap<Hash, u64>,
 }
 
+#[derive(Clone)]
 pub struct ApplyResult {
     pub receipts: Vec<Receipt>,
     pub gas_total: u64,
@@ -156,6 +157,87 @@ impl Chain {
             res.commits_used,
         );
         Ok(ApplyResult { receipts: res.receipts, gas_total: res.gas_total, events: res.events, exec_reveals_used: res.exec_reveals_used, commits_used: res.commits_used })
+    }
+
+    pub fn commit_simulated_block(
+        &mut self,
+        block: &Block,
+        apply: ApplyResult,
+        _balances: Balances,
+        _nonces: Nonces,
+        _commitments: Commitments,
+        _available: Available,
+    ) -> Result<ApplyResult, BlockError> {
+        if block.header.height != self.height + 1 {
+            return Err(BlockError::BadHeight { expected: self.height + 1, got: block.header.height });
+        }
+
+        if block.header.parent_hash != self.tip_hash {
+            return Err(BlockError::HeaderMismatch(
+                format!(
+                    "parent mismatch: expected {}, got {}",
+                    hex::encode(self.tip_hash),
+                    hex::encode(block.header.parent_hash),
+                )
+            ));
+        }
+
+        {
+            let preimage = header_signing_bytes(&block.header);
+            let ok = verify_ed25519(&block.header.proposer_pubkey, &block.header.signature, &preimage);
+            if !ok {
+                return Err(BlockError::IntrinsicInvalid("bad block signature".into()));
+            }
+        }
+
+        verify_block_roots(&block.header, block, &apply.receipts)
+            .map_err(BlockError::RootMismatch)?;
+
+        for ev in &apply.events {
+            match ev {
+                Event::CommitStored { commitment, .. } => {
+                    self.commit_included_at.insert(*commitment, block.header.height);
+                }
+                Event::AvailabilityRecorded { commitment } => {
+                    if let Some(&inc) = self.commit_included_at.get(commitment) {
+                        let ready_at = inc + DECRYPTION_DELAY;
+                        let deadline = ready_at + REVEAL_WINDOW;
+                        self.avail_included.insert(*commitment);
+                        self.commit_deadline.insert(*commitment, deadline);
+                        self.avail_due.entry(deadline).or_default().push(*commitment);
+                    }
+                }
+                Event::CommitConsumed { commitment } | Event::CommitExpired { commitment } => {
+                    if let Some(deadline) = self.commit_deadline.remove(commitment) {
+                        if let Some(vec) = self.avail_due.get_mut(&deadline) {
+                            vec.retain(|c| c != commitment);
+                            if vec.is_empty() {
+                                self.avail_due.remove(&deadline);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let next_exec = update_exec_base(
+            self.fee_state.exec_base,
+            apply.exec_reveals_used,
+            FEE_PARAMS.exec_target_reveals_per_block,
+            FEE_PARAMS.exec_max_change_denominator,
+            FEE_PARAMS.exec_min_base,
+            FEE_PARAMS.exec_damping_bps,
+        );
+
+        self.tip_hash = hash_bytes_sha256(&header_bytes(&block.header));
+        self.height = block.header.height;
+        self.fee_state.exec_base = next_exec;
+        self.fee_state.commit_base = update_commit_base(
+            self.fee_state.commit_base,
+            apply.commits_used,
+        );
+        self.burned_total = self.burned_total.saturating_add(apply.gas_total);
+        Ok(apply)
     }
 
     /// Check if a commitment has been included on-chain.
