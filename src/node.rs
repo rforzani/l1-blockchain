@@ -293,22 +293,6 @@ impl Node {
         Ok((built, res))
     }
 
-    #[deprecated(note = "use produce_block")]
-    pub fn produce_one_block(
-        &self,
-        limits: BlockSelectionLimits,
-    ) -> Result<BuiltBlock, ProduceError> {
-        let (built, _, _, _, _, _, _) = self.simulate_block(limits)?;
-        Ok(built)
-    }
-
-    #[deprecated(note = "use produce_block")]
-    pub fn produce_and_apply_once(
-        &mut self,
-        limits: BlockSelectionLimits,
-    ) -> Result<(BuiltBlock, ApplyResult), ProduceError> {
-        self.produce_block(limits)
-    }
 }
 
 #[cfg(test)]
