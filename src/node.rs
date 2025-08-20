@@ -318,7 +318,6 @@ use crate::mempool::{MempoolConfig, BlockSelectionLimits, BalanceView};
 use crate::fees::FeeState;
 use crate::types::{Transaction, Tx, CommitTx, RevealTx, Address};
 use crate::stf::PROCESS_BLOCK_CALLS;
-use std::sync::atomic::Ordering;
     use crate::codec::{tx_bytes, access_list_bytes, string_bytes};
     use crate::crypto::{commitment_hash, commit_signing_preimage, addr_from_pubkey, addr_hex};
 
@@ -448,9 +447,9 @@ use std::sync::atomic::Ordering;
         node.set_balance(sender.clone(), 1000);
         let (c, _r) = make_pair(&tx_sk, 0);
         mp.insert_commit(Tx::Commit(c), 0, 1, &bv, &FeeState::from_defaults()).unwrap();
-        PROCESS_BLOCK_CALLS.store(0, Ordering::SeqCst);
+        PROCESS_BLOCK_CALLS.with(|c| c.set(0));
         let limits = BlockSelectionLimits { max_avails: 10, max_reveals: 10, max_commits: 10 };
         node.produce_block(limits).unwrap();
-        assert_eq!(PROCESS_BLOCK_CALLS.load(Ordering::SeqCst), 1);
+        PROCESS_BLOCK_CALLS.with(|c| assert_eq!(c.get(), 1));
     }
 }

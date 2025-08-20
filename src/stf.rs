@@ -17,10 +17,14 @@ use crate::types::{Block, Receipt, ExecOutcome, Hash, BlockHeader, Transaction, 
 use std::collections::HashSet;
 use std::fmt;
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
+#[cfg(test)]
+use std::thread_local;
 
 #[cfg(test)]
-pub static PROCESS_BLOCK_CALLS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    pub static PROCESS_BLOCK_CALLS: Cell<usize> = Cell::new(0);
+}
 
 #[derive(Debug)]
 pub enum TxError {
@@ -508,7 +512,7 @@ pub fn process_block(
     burned_total: &mut u64,
 ) -> Result<BodyResult, BlockError> {
     #[cfg(test)]
-    PROCESS_BLOCK_CALLS.fetch_add(1, Ordering::SeqCst);
+    PROCESS_BLOCK_CALLS.with(|c| c.set(c.get() + 1));
     let mut receipts: Vec<Receipt> = Vec::new();
     let mut gas_total: u64 = 0;
     let mut reveals_included: u32 = 0;
