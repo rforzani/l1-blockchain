@@ -1,9 +1,11 @@
+use crate::consensus::dev_loop::DevNode;
+use crate::fees::FeeState;
 // src/node.rs
 use crate::mempool::{BalanceView, BlockSelectionLimits, CommitmentId, Mempool, MempoolImpl, SelectError, StateView, TxId};
 use crate::state::{Balances, Nonces, Commitments, Available};
 use crate::chain::{ApplyResult, Chain};
 use crate::stf::process_block;
-use crate::types::Block;
+use crate::types::{Address, Block, Hash};
 use std::sync::Arc;
 use ed25519_dalek::{SigningKey, Signer};
 use crate::crypto::{addr_from_pubkey, addr_hex};
@@ -117,7 +119,15 @@ impl Node {
         self.chain.height
     }
 
-    pub fn fee_state(&self) -> &crate::fees::FeeState {
+    pub fn tip_hash(&self) -> Hash {
+        self.chain.tip_hash
+    }
+
+    pub fn proposer_pubkey(&self) -> [u8; 32] {
+        self.proposer_pubkey
+    }
+
+    pub fn fee_state(&self) -> &FeeState {
         &self.chain.fee_state
     }
 
@@ -295,13 +305,21 @@ impl Node {
 
 }
 
+impl DevNode for Node {
+    fn height(&self) -> u64 { self.height() }
+
+    fn produce_block(&mut self, limits: BlockSelectionLimits) -> Result<(BuiltBlock, ApplyResult), ProduceError> { self.produce_block(limits) }
+    
+    fn now_unix(&self) -> u64 { Node::now_ts() } 
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::mempool::{MempoolConfig, BlockSelectionLimits, BalanceView};
-use crate::fees::FeeState;
-use crate::types::{Transaction, Tx, CommitTx, RevealTx, Address};
-use crate::stf::PROCESS_BLOCK_CALLS;
+    use crate::mempool::{MempoolConfig, BlockSelectionLimits, BalanceView};
+    use crate::fees::FeeState;
+    use crate::types::{Transaction, Tx, CommitTx, RevealTx, Address};
+    use crate::stf::PROCESS_BLOCK_CALLS;
     use crate::codec::{tx_bytes, access_list_bytes, string_bytes};
     use crate::crypto::{commitment_hash, commit_signing_preimage, addr_from_pubkey, addr_hex};
 

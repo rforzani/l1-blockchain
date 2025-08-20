@@ -7,6 +7,7 @@ mod crypto;
 mod gas;
 mod codec;
 mod mempool;
+mod consensus;
 mod fees;
 mod node;
 mod chain;

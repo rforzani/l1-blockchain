@@ -27,7 +27,7 @@ impl Transaction {
 pub struct Block {
     pub transactions: Vec<Tx>,
     pub reveals: Vec<RevealTx>,
-    pub header: BlockHeader
+    pub header: BlockHeader,
 }
 
 impl Block {

@@ -1,7 +1,5 @@
 // src/mempool/mod.rs
 
-#![allow(dead_code)]
-
 use std::sync::{Arc, RwLock};
 
 use crate::codec::{access_list_bytes, tx_bytes};
