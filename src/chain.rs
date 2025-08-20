@@ -90,6 +90,7 @@ impl Chain {
         let proposer_addr = addr_hex(&addr_from_pubkey(&block.header.proposer_pubkey));
 
         // process with current tip as parent
+        let mut sim_burned_total = self.burned_total;
         let res = process_block(
             block,
             &mut sim_balances,
@@ -98,7 +99,7 @@ impl Chain {
             &mut sim_available,
             &self.fee_state,
             &proposer_addr,
-            &mut self.burned_total,
+            &mut sim_burned_total,
         )?;
 
         verify_block_roots(&block.header, block, &res.receipts)
@@ -108,6 +109,7 @@ impl Chain {
         *nonces = sim_nonces;
         *commitments = sim_commitments;
         *available = sim_available;
+        self.burned_total = sim_burned_total;
 
         for ev in &res.events {
             match ev {
@@ -188,18 +190,27 @@ impl Chain {
 mod tests {
     use super::*;
     use ed25519_dalek::{SigningKey, Signer};
-    use crate::codec::{header_bytes, header_signing_bytes};
-    use crate::crypto::{hash_bytes_sha256, addr_from_pubkey, addr_hex};
-    use crate::state::{Balances, Nonces, Commitments, Available};
-    use crate::types::{Block, BlockHeader};
+    use crate::codec::{
+        header_bytes, header_signing_bytes, tx_bytes, access_list_bytes, string_bytes,
+    };
+    use crate::crypto::{
+        hash_bytes_sha256, addr_from_pubkey, addr_hex, commitment_hash,
+        commit_signing_preimage, avail_signing_preimage,
+    };
+    use crate::state::{Balances, Nonces, Commitments, Available, CHAIN_ID};
+    use crate::types::{
+        Block, BlockHeader, Tx, CommitTx, AvailTx, RevealTx, Transaction, AccessList, Hash,
+    };
 
-    fn build_empty_block(
+    fn build_block(
         chain: &Chain,
         signer: &SigningKey,
         balances: &Balances,
         nonces: &Nonces,
         commitments: &Commitments,
         available: &Available,
+        transactions: Vec<Tx>,
+        reveals: Vec<RevealTx>,
     ) -> Block {
         let mut block = Block {
             header: BlockHeader {
@@ -218,8 +229,8 @@ mod tests {
                 timestamp: 0,
                 signature: [0u8; 64],
             },
-            transactions: Vec::new(),
-            reveals: Vec::new(),
+            transactions,
+            reveals,
         };
 
         let mut sim_balances = balances.clone();
@@ -250,6 +261,86 @@ mod tests {
         block.header.signature = sig;
 
         block
+    }
+
+    fn build_empty_block(
+        chain: &Chain,
+        signer: &SigningKey,
+        balances: &Balances,
+        nonces: &Nonces,
+        commitments: &Commitments,
+        available: &Available,
+    ) -> Block {
+        build_block(
+            chain,
+            signer,
+            balances,
+            nonces,
+            commitments,
+            available,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn addr(i: u8) -> String {
+        format!(
+            "0x{:02x}{:02x}000000000000000000000000000000000000",
+            i, i
+        )
+    }
+
+    fn make_commit(
+        signer: &SigningKey,
+        tx: &Transaction,
+        salt: Hash,
+    ) -> (CommitTx, Hash) {
+        let tx_ser = tx_bytes(tx);
+        let al_bytes = access_list_bytes(&tx.access_list);
+        let commitment = commitment_hash(&tx_ser, &al_bytes, &salt, CHAIN_ID);
+        let ciphertext_hash = hash_bytes_sha256(b"ciphertext");
+        let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
+        let sender_bytes = string_bytes(&sender);
+        let preimage = commit_signing_preimage(
+            &commitment,
+            &ciphertext_hash,
+            &sender_bytes,
+            &al_bytes,
+            CHAIN_ID,
+        );
+        let sig = signer.sign(&preimage).to_bytes();
+        (
+            CommitTx {
+                commitment,
+                sender,
+                access_list: tx.access_list.clone(),
+                ciphertext_hash,
+                pubkey: signer.verifying_key().to_bytes(),
+                sig,
+            },
+            commitment,
+        )
+    }
+
+    fn make_avail(signer: &SigningKey, commitment: Hash) -> AvailTx {
+        let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
+        let sender_bytes = string_bytes(&sender);
+        let preimage = avail_signing_preimage(&commitment, &sender_bytes, CHAIN_ID);
+        let sig = signer.sign(&preimage).to_bytes();
+        AvailTx {
+            commitment,
+            sender,
+            pubkey: signer.verifying_key().to_bytes(),
+            sig,
+        }
+    }
+
+    fn make_reveal(tx: Transaction, salt: Hash, sender: &str) -> RevealTx {
+        RevealTx {
+            tx,
+            salt,
+            sender: sender.to_string(),
+        }
     }
 
     #[test]
@@ -325,5 +416,228 @@ mod tests {
             chain.tip_hash,
             hash_bytes_sha256(&header_bytes(&block1.header))
         );
+    }
+
+    #[test]
+    fn tamper_block_no_state_change() {
+        let signer = SigningKey::from_bytes(&[4u8; 32]);
+        let mut chain = Chain::new();
+        let mut balances = Balances::default();
+        let mut nonces = Nonces::default();
+        let mut commitments = Commitments::default();
+        let mut available = Available::default();
+
+        let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
+        balances.insert(sender.clone(), 1000);
+
+        let tx1 = Transaction::transfer(&sender, &addr(1), 10, 0);
+        let salt1 = [1u8; 32];
+        let (commit1, _c1) = make_commit(&signer, &tx1, salt1);
+
+        let block = build_block(
+            &chain,
+            &signer,
+            &balances,
+            &nonces,
+            &commitments,
+            &available,
+            vec![Tx::Commit(commit1.clone())],
+            vec![],
+        );
+
+        let tx2 = Transaction::transfer(&sender, &addr(2), 5, 1);
+        let salt2 = [2u8; 32];
+        let (commit2, _c2) = make_commit(&signer, &tx2, salt2);
+        let mut tampered = block.clone();
+        tampered.transactions.push(Tx::Commit(commit2));
+
+        let burned_before = chain.burned_total;
+        let res = chain.apply_block(
+            &tampered,
+            &mut balances,
+            &mut nonces,
+            &mut commitments,
+            &mut available,
+        );
+        assert!(matches!(res, Err(BlockError::RootMismatch(_))));
+        assert_eq!(chain.height, 0);
+        assert_eq!(chain.burned_total, burned_before);
+        assert!(commitments.is_empty());
+        assert_eq!(*balances.get(&sender).unwrap(), 1000);
+    }
+
+    #[test]
+    fn inclusion_list_due_must_be_included() {
+        let signer = SigningKey::from_bytes(&[5u8; 32]);
+        let mut chain = Chain::new();
+        let mut balances = Balances::default();
+        let mut nonces = Nonces::default();
+        let mut commitments = Commitments::default();
+        let mut available = Available::default();
+
+        let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
+        let receiver = addr(1);
+        balances.insert(sender.clone(), 1000);
+        balances.insert(receiver.clone(), 0);
+
+        let tx = Transaction::transfer(&sender, &receiver, 10, 0);
+        let salt = [1u8; 32];
+        let (commit, c_hash) = make_commit(&signer, &tx, salt);
+        let block1 = build_block(
+            &chain,
+            &signer,
+            &balances,
+            &nonces,
+            &commitments,
+            &available,
+            vec![Tx::Commit(commit)],
+            vec![],
+        );
+        chain
+            .apply_block(&block1, &mut balances, &mut nonces, &mut commitments, &mut available)
+            .unwrap();
+
+        let avail_tx = make_avail(&signer, c_hash);
+        let block2 = build_block(
+            &chain,
+            &signer,
+            &balances,
+            &nonces,
+            &commitments,
+            &available,
+            vec![Tx::Avail(avail_tx)],
+            vec![],
+        );
+        chain
+            .apply_block(&block2, &mut balances, &mut nonces, &mut commitments, &mut available)
+            .unwrap();
+
+        for _ in 0..2 {
+            let b = build_block(
+                &chain,
+                &signer,
+                &balances,
+                &nonces,
+                &commitments,
+                &available,
+                vec![],
+                vec![],
+            );
+            chain
+                .apply_block(&b, &mut balances, &mut nonces, &mut commitments, &mut available)
+                .unwrap();
+        }
+        assert_eq!(chain.height, 4);
+
+        let block5 = build_block(
+            &chain,
+            &signer,
+            &Balances::default(),
+            &Nonces::default(),
+            &Commitments::default(),
+            &Available::default(),
+            vec![],
+            vec![],
+        );
+        let res = chain.apply_block(
+            &block5,
+            &mut balances,
+            &mut nonces,
+            &mut commitments,
+            &mut available,
+        );
+        assert!(matches!(res, Err(BlockError::IntrinsicInvalid(msg)) if msg.contains("missing required reveal")));
+        assert_eq!(chain.height, 4);
+    }
+
+    #[test]
+    fn reveal_bundle_executes_multiple_reveals_and_satisfies_inclusion_list() {
+        let signer = SigningKey::from_bytes(&[6u8; 32]);
+        let mut chain = Chain::new();
+        let mut balances = Balances::default();
+        let mut nonces = Nonces::default();
+        let mut commitments = Commitments::default();
+        let mut available = Available::default();
+
+        let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
+        let recv1 = addr(1);
+        let recv2 = addr(2);
+        balances.insert(sender.clone(), 1000);
+        balances.insert(recv1.clone(), 0);
+        balances.insert(recv2.clone(), 0);
+
+        let tx1 = Transaction::transfer(&sender, &recv1, 10, 0);
+        let salt1 = [11u8; 32];
+        let (commit1, c1) = make_commit(&signer, &tx1, salt1);
+        let tx2 = Transaction::transfer(&sender, &recv2, 20, 1);
+        let salt2 = [22u8; 32];
+        let (commit2, c2) = make_commit(&signer, &tx2, salt2);
+
+        let block1 = build_block(
+            &chain,
+            &signer,
+            &balances,
+            &nonces,
+            &commitments,
+            &available,
+            vec![Tx::Commit(commit1.clone()), Tx::Commit(commit2.clone())],
+            vec![],
+        );
+        chain
+            .apply_block(&block1, &mut balances, &mut nonces, &mut commitments, &mut available)
+            .unwrap();
+
+        let avail1 = make_avail(&signer, c1);
+        let avail2 = make_avail(&signer, c2);
+        let block2 = build_block(
+            &chain,
+            &signer,
+            &balances,
+            &nonces,
+            &commitments,
+            &available,
+            vec![Tx::Avail(avail1), Tx::Avail(avail2)],
+            vec![],
+        );
+        chain
+            .apply_block(&block2, &mut balances, &mut nonces, &mut commitments, &mut available)
+            .unwrap();
+
+        for _ in 0..2 {
+            let b = build_block(
+                &chain,
+                &signer,
+                &balances,
+                &nonces,
+                &commitments,
+                &available,
+                vec![],
+                vec![],
+            );
+            chain
+                .apply_block(&b, &mut balances, &mut nonces, &mut commitments, &mut available)
+                .unwrap();
+        }
+
+        let r1 = make_reveal(tx1.clone(), salt1, &sender);
+        let r2 = make_reveal(tx2.clone(), salt2, &sender);
+        let block5 = build_block(
+            &chain,
+            &signer,
+            &balances,
+            &nonces,
+            &commitments,
+            &available,
+            vec![],
+            vec![r1, r2],
+        );
+        let res = chain
+            .apply_block(&block5, &mut balances, &mut nonces, &mut commitments, &mut available)
+            .unwrap();
+        assert_eq!(chain.height, 5);
+        assert_eq!(res.receipts.len(), 2);
+        assert_eq!(balances.get(&recv1).copied().unwrap(), 10);
+        assert_eq!(balances.get(&recv2).copied().unwrap(), 20);
+        assert!(chain.commitments_due_and_available(5).is_empty());
     }
 }
