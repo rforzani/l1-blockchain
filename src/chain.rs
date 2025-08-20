@@ -785,4 +785,160 @@ mod tests {
         assert!(commitments.is_empty());
         assert_eq!(chain.height, 0);
     }
+
+    #[test]
+    fn inclusion_list_due_but_missing_reveal_rejects_block() {
+        let signer = SigningKey::from_bytes(&[10u8; 32]);
+        let mut chain = Chain::new();
+        let mut balances = Balances::default();
+        let mut nonces = Nonces::default();
+        let mut commitments = Commitments::default();
+        let mut available = Available::default();
+
+        let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
+        let receiver = addr(1);
+        balances.insert(sender.clone(), 1000);
+        balances.insert(receiver.clone(), 0);
+
+        // include a commit
+        let tx = Transaction::transfer(&sender, &receiver, 10, 0);
+        let salt = [1u8; 32];
+        let (commit, c_hash) = make_commit(&signer, &tx, salt);
+        let block1 = build_block(
+            &chain,
+            &signer,
+            &balances,
+            &nonces,
+            &commitments,
+            &available,
+            vec![Tx::Commit(commit)],
+            vec![],
+        );
+        chain
+            .apply_block(&block1, &mut balances, &mut nonces, &mut commitments, &mut available)
+            .unwrap();
+
+        // include availability
+        let avail_tx = make_avail(&signer, c_hash);
+        let block2 = build_block(
+            &chain,
+            &signer,
+            &balances,
+            &nonces,
+            &commitments,
+            &available,
+            vec![Tx::Avail(avail_tx)],
+            vec![],
+        );
+        chain
+            .apply_block(&block2, &mut balances, &mut nonces, &mut commitments, &mut available)
+            .unwrap();
+
+        // advance chain until reveal is due
+        for _ in 0..2 {
+            let b = build_block(
+                &chain,
+                &signer,
+                &balances,
+                &nonces,
+                &commitments,
+                &available,
+                vec![],
+                vec![],
+            );
+            chain
+                .apply_block(&b, &mut balances, &mut nonces, &mut commitments, &mut available)
+                .unwrap();
+        }
+        assert_eq!(chain.height, 4);
+
+        // build a block without the required reveal
+        let mut block5 = Block {
+            header: BlockHeader {
+                parent_hash: chain.tip_hash,
+                height: chain.height + 1,
+                proposer_pubkey: signer.verifying_key().to_bytes(),
+                txs_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                randomness: chain.tip_hash,
+                reveal_set_root: [0u8; 32],
+                il_root: [0u8; 32],
+                exec_base_fee: chain.fee_state.exec_base,
+                commit_base_fee: chain.fee_state.commit_base,
+                avail_base_fee: chain.fee_state.avail_base,
+                timestamp: 0,
+                signature: [0u8; 64],
+            },
+            transactions: vec![],
+            reveals: vec![],
+        };
+
+        let preimage = header_signing_bytes(&block5.header);
+        block5.header.signature = signer.sign(&preimage).to_bytes();
+
+        let res = chain.apply_block(
+            &block5,
+            &mut balances,
+            &mut nonces,
+            &mut commitments,
+            &mut available,
+        );
+        assert!(matches!(res, Err(BlockError::IntrinsicInvalid(msg)) if msg.contains("missing required reveal")));
+        assert_eq!(chain.height, 4);
+    }
+
+    #[test]
+    fn availability_outside_window_rejected() {
+        let signer = SigningKey::from_bytes(&[11u8; 32]);
+        let mut chain = Chain::new();
+        let mut balances = Balances::default();
+        let mut nonces = Nonces::default();
+        let mut commitments = Commitments::default();
+        let mut available = Available::default();
+
+        let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
+        balances.insert(sender.clone(), 1_000);
+
+        let tx = Transaction::transfer(&sender, &addr(1), 10, 0);
+        let salt = [2u8; 32];
+        let (commit, c_hash) = make_commit(&signer, &tx, salt);
+        let avail = make_avail(&signer, c_hash);
+
+        // commit and avail included in the same block (avail too early)
+        let mut block = Block {
+            header: BlockHeader {
+                parent_hash: chain.tip_hash,
+                height: chain.height + 1,
+                proposer_pubkey: signer.verifying_key().to_bytes(),
+                txs_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                randomness: chain.tip_hash,
+                reveal_set_root: [0u8; 32],
+                il_root: [0u8; 32],
+                exec_base_fee: chain.fee_state.exec_base,
+                commit_base_fee: chain.fee_state.commit_base,
+                avail_base_fee: chain.fee_state.avail_base,
+                timestamp: 0,
+                signature: [0u8; 64],
+            },
+            transactions: vec![Tx::Commit(commit), Tx::Avail(avail)],
+            reveals: vec![],
+        };
+
+        let preimage = header_signing_bytes(&block.header);
+        block.header.signature = signer.sign(&preimage).to_bytes();
+
+        let res = chain.apply_block(
+            &block,
+            &mut balances,
+            &mut nonces,
+            &mut commitments,
+            &mut available,
+        );
+        assert!(matches!(res, Err(BlockError::IntrinsicInvalid(msg)) if msg.contains("avail outside valid window")));
+        assert!(available.is_empty());
+        assert_eq!(chain.height, 0);
+    }
 }
