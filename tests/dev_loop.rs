@@ -2,7 +2,8 @@ use std::sync::{Arc, Mutex};
 use l1_blockchain::consensus::dev_loop::{DevLoop, DevLoopConfig, DEFAULT_LIMITS, DevNode};
 use l1_blockchain::mempool::{BlockSelectionLimits, MempoolConfig, MempoolImpl};
 use l1_blockchain::node::{BuiltBlock, SelectedIds, ProduceError, Node};
-use l1_blockchain::chain::ApplyResult;
+use l1_blockchain::chain::{ApplyResult, Chain};
+use l1_blockchain::state::{Balances, Nonces, Commitments, Available};
 use l1_blockchain::types::{Block, BlockHeader, Tx, RevealTx};
 use ed25519_dalek::SigningKey;
 
@@ -209,4 +210,194 @@ fn no_busy_wait_under_heavy_block_assembly() {
     assert!(elapsed <= min + tolerance, "elapsed {:?} > max {:?}", elapsed, min + tolerance);
     let st = state.lock().unwrap();
     assert_eq!(st.height, slots);
+}
+
+struct ErrOnceNode {
+    inner: FakeNode,
+    errored: bool,
+}
+
+impl ErrOnceNode {
+    fn new(state: Arc<Mutex<FakeState>>) -> Self {
+        Self { inner: FakeNode::new(state), errored: false }
+    }
+}
+
+impl DevNode for ErrOnceNode {
+    fn height(&self) -> u64 { self.inner.height() }
+
+    fn produce_block(&mut self, limits: BlockSelectionLimits) -> Result<(BuiltBlock, ApplyResult), ProduceError> {
+        if !self.errored {
+            self.errored = true;
+            Err(ProduceError::HeaderBuild("injected".into()))
+        } else {
+            self.inner.produce_block(limits)
+        }
+    }
+
+    fn now_unix(&self) -> u64 { self.inner.now_unix() }
+}
+
+#[test]
+fn skip_slot_on_production_error() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let node = ErrOnceNode::new(state.clone());
+    let cfg = DevLoopConfig { slot_ms: 1, limits: DEFAULT_LIMITS };
+    let mut dl = DevLoop::new(node, cfg);
+    dl.run_for_slots(1);
+    assert_eq!(state.lock().unwrap().height, 0);
+    dl.run_for_slots(2);
+    let st = state.lock().unwrap();
+    assert_eq!(st.height, 2);
+    assert_eq!(st.ticks, 2);
+}
+
+struct BadSigNode {
+    chain: Arc<Mutex<Chain>>,
+}
+
+impl BadSigNode {
+    fn new(chain: Arc<Mutex<Chain>>) -> Self { Self { chain } }
+}
+
+impl DevNode for BadSigNode {
+    fn height(&self) -> u64 { self.chain.lock().unwrap().height }
+
+    fn produce_block(&mut self, _limits: BlockSelectionLimits) -> Result<(BuiltBlock, ApplyResult), ProduceError> {
+        let mut chain = self.chain.lock().unwrap();
+        let header = BlockHeader {
+            parent_hash: chain.tip_hash,
+            height: chain.height + 1,
+            proposer_pubkey: [0u8;32],
+            txs_root: [0u8;32],
+            receipts_root: [0u8;32],
+            gas_used: 0,
+            randomness: [0u8;32],
+            reveal_set_root: [0u8;32],
+            il_root: [0u8;32],
+            exec_base_fee: 0,
+            commit_base_fee: 0,
+            avail_base_fee: 0,
+            timestamp: 0,
+            signature: [0u8;64], // invalid signature
+        };
+        let block = Block { header, transactions: vec![], reveals: vec![] };
+        let built = BuiltBlock { block: block.clone(), selected_ids: SelectedIds { commit: vec![], avail: vec![], reveal: vec![] } };
+        let mut balances = Balances::default();
+        let mut nonces = Nonces::default();
+        let mut commitments = Commitments::default();
+        let mut available = Available::default();
+        chain
+            .apply_block(&block, &mut balances, &mut nonces, &mut commitments, &mut available)
+            .map(|apply| (built, apply))
+            .map_err(|_| ProduceError::HeaderBuild("apply failed".into()))
+    }
+
+    fn now_unix(&self) -> u64 { 0 }
+}
+
+#[test]
+fn bad_header_signature_rejected() {
+    let chain = Arc::new(Mutex::new(Chain::new()));
+    let node = BadSigNode::new(chain.clone());
+    let cfg = DevLoopConfig { slot_ms: 1, limits: DEFAULT_LIMITS };
+    let mut dl = DevLoop::new(node, cfg);
+    dl.run_for_slots(1);
+    assert_eq!(chain.lock().unwrap().height, 0);
+}
+
+struct WrongParentNode {
+    chain: Arc<Mutex<Chain>>,
+}
+
+impl WrongParentNode {
+    fn new(chain: Arc<Mutex<Chain>>) -> Self { Self { chain } }
+}
+
+impl DevNode for WrongParentNode {
+    fn height(&self) -> u64 { self.chain.lock().unwrap().height }
+
+    fn produce_block(&mut self, _limits: BlockSelectionLimits) -> Result<(BuiltBlock, ApplyResult), ProduceError> {
+        let mut chain = self.chain.lock().unwrap();
+        let header = BlockHeader {
+            parent_hash: [1u8;32], // wrong parent
+            height: chain.height + 1,
+            proposer_pubkey: [0u8;32],
+            txs_root: [0u8;32],
+            receipts_root: [0u8;32],
+            gas_used: 0,
+            randomness: [0u8;32],
+            reveal_set_root: [0u8;32],
+            il_root: [0u8;32],
+            exec_base_fee: 0,
+            commit_base_fee: 0,
+            avail_base_fee: 0,
+            timestamp: 0,
+            signature: [0u8;64],
+        };
+        let block = Block { header, transactions: vec![], reveals: vec![] };
+        let built = BuiltBlock { block: block.clone(), selected_ids: SelectedIds { commit: vec![], avail: vec![], reveal: vec![] } };
+        let mut balances = Balances::default();
+        let mut nonces = Nonces::default();
+        let mut commitments = Commitments::default();
+        let mut available = Available::default();
+        chain
+            .apply_block(&block, &mut balances, &mut nonces, &mut commitments, &mut available)
+            .map(|apply| (built, apply))
+            .map_err(|_| ProduceError::HeaderBuild("apply failed".into()))
+    }
+
+    fn now_unix(&self) -> u64 { 0 }
+}
+
+#[test]
+fn wrong_parent_linkage_rejected() {
+    let chain = Arc::new(Mutex::new(Chain::new()));
+    let node = WrongParentNode::new(chain.clone());
+    let cfg = DevLoopConfig { slot_ms: 1, limits: DEFAULT_LIMITS };
+    let mut dl = DevLoop::new(node, cfg);
+    dl.run_for_slots(1);
+    assert_eq!(chain.lock().unwrap().height, 0);
+}
+
+struct PanicOnceNode {
+    inner: FakeNode,
+    panicked: bool,
+}
+
+impl PanicOnceNode {
+    fn new(state: Arc<Mutex<FakeState>>) -> Self {
+        Self { inner: FakeNode::new(state), panicked: false }
+    }
+}
+
+impl DevNode for PanicOnceNode {
+    fn height(&self) -> u64 { self.inner.height() }
+
+    fn produce_block(&mut self, limits: BlockSelectionLimits) -> Result<(BuiltBlock, ApplyResult), ProduceError> {
+        if !self.panicked {
+            self.panicked = true;
+            panic!("boom");
+        }
+        self.inner.produce_block(limits)
+    }
+
+    fn now_unix(&self) -> u64 { self.inner.now_unix() }
+}
+
+#[test]
+fn panic_safety_no_state_corruption() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let node = PanicOnceNode::new(state.clone());
+    let cfg = DevLoopConfig { slot_ms: 1, limits: DEFAULT_LIMITS };
+    let mut dl = DevLoop::new(node, cfg);
+    let res = catch_unwind(AssertUnwindSafe(|| dl.run_for_slots(1)));
+    assert!(res.is_err());
+    assert_eq!(state.lock().unwrap().height, 0);
+    dl.run_for_slots(2);
+    let st = state.lock().unwrap();
+    assert_eq!(st.height, 2);
+    assert_eq!(st.ticks, 2);
 }
