@@ -1,4 +1,6 @@
-//src/crypto.rs
+//src/crypto/mod.rs
+
+pub mod vrf;
 
 use sha2::{Digest, Sha256};
 use crate::types::{Hash, Address};
