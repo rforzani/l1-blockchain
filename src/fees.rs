@@ -376,7 +376,6 @@ mod tests {
         let mut header = BlockHeader {
             parent_hash: [1u8; 32],
             height: 1,
-            proposer_pubkey: [3u8; 32],
             txs_root: [0u8; 32],
             receipts_root: [0u8; 32],
             gas_used: 0,

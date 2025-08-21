@@ -151,7 +151,7 @@ impl Chain {
             return Err(BlockError::NotScheduledLeader);
         }
 
-        // 4) The proposer must exist and be Active in the validator set; key must match
+        // 4) The proposer must exist and be Active in the validator set
         let v = self
             .validator_set
             .get(header.proposer_id)
@@ -161,14 +161,10 @@ impl Chain {
             return Err(BlockError::NotScheduledLeader);
         }
 
-        if v.ed25519_pubkey != header.proposer_pubkey {
-            return Err(BlockError::ProposerKeyMismatch);
-        }
-
         // 5) Verify the header signature against the canonical preimage
         let preimage = header_signing_bytes(header);
 
-        let vk = VerifyingKey::from_bytes(&header.proposer_pubkey)
+        let vk = VerifyingKey::from_bytes(&v.ed25519_pubkey)
             .map_err(|_| BlockError::BadSignature)?;
 
         // ed25519-dalek 2.x: from_bytes returns Signature directly
@@ -285,17 +281,15 @@ impl Chain {
             ));
         }
 
-        // Signature verification
-        {
-            let preimage = header_signing_bytes(&block.header);
-            let ok = verify_ed25519(
-                &block.header.proposer_pubkey,
-                &block.header.signature,
-                &preimage,
-            );
-            if !ok {
-                return Err(BlockError::IntrinsicInvalid("bad block signature".into()));
-            }
+        // Signature verification via validator set
+        let v = self
+            .validator_set
+            .get(block.header.proposer_id)
+            .ok_or(BlockError::NotScheduledLeader)?;
+        let preimage = header_signing_bytes(&block.header);
+        let ok = verify_ed25519(&v.ed25519_pubkey, &block.header.signature, &preimage);
+        if !ok {
+            return Err(BlockError::IntrinsicInvalid("bad block signature".into()));
         }
 
         let mut sim_balances = balances.clone();
@@ -303,7 +297,7 @@ impl Chain {
         let mut sim_commitments = commitments.clone();
         let mut sim_available = available.clone();
 
-        let proposer_addr = addr_hex(&addr_from_pubkey(&block.header.proposer_pubkey));
+        let proposer_addr = addr_hex(&addr_from_pubkey(&v.ed25519_pubkey));
 
         // process with current tip as parent
         let mut sim_burned_total = self.burned_total;
@@ -398,8 +392,12 @@ impl Chain {
         }
 
         {
+            let v = self
+                .validator_set
+                .get(block.header.proposer_id)
+                .ok_or(BlockError::NotScheduledLeader)?;
             let preimage = header_signing_bytes(&block.header);
-            let ok = verify_ed25519(&block.header.proposer_pubkey, &block.header.signature, &preimage);
+            let ok = verify_ed25519(&v.ed25519_pubkey, &block.header.signature, &preimage);
             if !ok {
                 return Err(BlockError::IntrinsicInvalid("bad block signature".into()));
             }
@@ -498,6 +496,7 @@ mod tests {
     use crate::types::{
         Block, BlockHeader, Tx, CommitTx, AvailTx, RevealTx, Transaction, Hash,
     };
+    use crate::pos::registry::{StakingConfig, Validator, ValidatorSet, ValidatorStatus};
 
     fn build_block(
         chain: &Chain,
@@ -513,7 +512,6 @@ mod tests {
             header: BlockHeader {
                 parent_hash: chain.tip_hash,
                 height: chain.height + 1,
-                proposer_pubkey: signer.verifying_key().to_bytes(),
                 txs_root: [0u8; 32],
                 receipts_root: [0u8; 32],
                 gas_used: 0,
@@ -537,7 +535,7 @@ mod tests {
         let mut sim_nonces = nonces.clone();
         let mut sim_commitments = commitments.clone();
         let mut sim_available = available.clone();
-        let proposer_addr = addr_hex(&addr_from_pubkey(&block.header.proposer_pubkey));
+        let proposer_addr = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
         let mut burned = 0u64;
         let body = process_block(
             &block,
@@ -643,10 +641,29 @@ mod tests {
         }
     }
 
+    fn init_chain_with_validator(chain: &mut Chain, signer: &SigningKey) {
+        let cfg = StakingConfig {
+            min_stake: 1,
+            unbonding_epochs: 1,
+            max_validators: u32::MAX,
+        };
+        let v = Validator {
+            id: 1,
+            ed25519_pubkey: signer.verifying_key().to_bytes(),
+            bls_pubkey: None,
+            stake: 1,
+            status: ValidatorStatus::Active,
+        };
+        let set = ValidatorSet::from_genesis(0, &cfg, vec![v]);
+        let seed = hash_bytes_sha256(b"l1-blockchain/test-epoch-seed:v1");
+        chain.init_genesis(set, seed);
+    }
+
     #[test]
     fn apply_block1_advances_tip() {
         let signer = SigningKey::from_bytes(&[1u8; 32]);
         let mut chain = Chain::new();
+        init_chain_with_validator(&mut chain, &signer);
         let mut balances = Balances::default();
         let mut nonces = Nonces::default();
         let mut commitments = Commitments::default();
@@ -666,6 +683,7 @@ mod tests {
     fn applying_same_height_fails() {
         let signer = SigningKey::from_bytes(&[2u8; 32]);
         let mut chain = Chain::new();
+        init_chain_with_validator(&mut chain, &signer);
         let mut balances = Balances::default();
         let mut nonces = Nonces::default();
         let mut commitments = Commitments::default();
@@ -693,6 +711,7 @@ mod tests {
     fn applying_2_blocks_works_correctly() {
         let signer = SigningKey::from_bytes(&[3u8; 32]);
         let mut chain = Chain::new();
+        init_chain_with_validator(&mut chain, &signer);
         let mut balances = Balances::default();
         let mut nonces = Nonces::default();
         let mut commitments = Commitments::default();
@@ -722,6 +741,7 @@ mod tests {
     fn tamper_block_no_state_change() {
         let signer = SigningKey::from_bytes(&[4u8; 32]);
         let mut chain = Chain::new();
+        init_chain_with_validator(&mut chain, &signer);
         let mut balances = Balances::default();
         let mut nonces = Nonces::default();
         let mut commitments = Commitments::default();
@@ -770,6 +790,7 @@ mod tests {
     fn inclusion_list_due_must_be_included() {
         let signer = SigningKey::from_bytes(&[5u8; 32]);
         let mut chain = Chain::new();
+        init_chain_with_validator(&mut chain, &signer);
         let mut balances = Balances::default();
         let mut nonces = Nonces::default();
         let mut commitments = Commitments::default();
@@ -854,6 +875,7 @@ mod tests {
     fn reveal_bundle_executes_multiple_reveals_and_satisfies_inclusion_list() {
         let signer = SigningKey::from_bytes(&[6u8; 32]);
         let mut chain = Chain::new();
+        init_chain_with_validator(&mut chain, &signer);
         let mut balances = Balances::default();
         let mut nonces = Nonces::default();
         let mut commitments = Commitments::default();
@@ -945,6 +967,7 @@ mod tests {
     fn too_many_avails_in_block_is_invalid() {
         let signer = SigningKey::from_bytes(&[7u8; 32]);
         let mut chain = Chain::new();
+        init_chain_with_validator(&mut chain, &signer);
         let mut balances = Balances::default();
         let mut nonces = Nonces::default();
         let mut commitments = Commitments::default();
@@ -964,7 +987,6 @@ mod tests {
             header: BlockHeader {
                 parent_hash: chain.tip_hash,
                 height: chain.height + 1,
-                proposer_pubkey: signer.verifying_key().to_bytes(),
                 txs_root: [0u8; 32],
                 receipts_root: [0u8; 32],
                 gas_used: 0,
@@ -996,6 +1018,7 @@ mod tests {
     fn too_many_pending_commits_for_owner_is_rejected() {
         let signer = SigningKey::from_bytes(&[8u8; 32]);
         let mut chain = Chain::new();
+        init_chain_with_validator(&mut chain, &signer);
         let mut balances = Balances::default();
         let mut nonces = Nonces::default();
         let mut commitments = Commitments::default();
@@ -1017,7 +1040,6 @@ mod tests {
             header: BlockHeader {
                 parent_hash: chain.tip_hash,
                 height: chain.height + 1,
-                proposer_pubkey: signer.verifying_key().to_bytes(),
                 txs_root: [0u8; 32],
                 receipts_root: [0u8; 32],
                 gas_used: 0,
@@ -1050,6 +1072,7 @@ mod tests {
     fn duplicate_commit_in_same_block_is_rejected() {
         let signer = SigningKey::from_bytes(&[9u8; 32]);
         let mut chain = Chain::new();
+        init_chain_with_validator(&mut chain, &signer);
         let mut balances = Balances::default();
         let mut nonces = Nonces::default();
         let mut commitments = Commitments::default();
@@ -1066,7 +1089,6 @@ mod tests {
             header: BlockHeader {
                 parent_hash: chain.tip_hash,
                 height: chain.height + 1,
-                proposer_pubkey: signer.verifying_key().to_bytes(),
                 txs_root: [0u8; 32],
                 receipts_root: [0u8; 32],
                 gas_used: 0,
@@ -1099,6 +1121,7 @@ mod tests {
     fn inclusion_list_due_but_missing_reveal_rejects_block() {
         let signer = SigningKey::from_bytes(&[10u8; 32]);
         let mut chain = Chain::new();
+        init_chain_with_validator(&mut chain, &signer);
         let mut balances = Balances::default();
         let mut nonces = Nonces::default();
         let mut commitments = Commitments::default();
@@ -1166,7 +1189,6 @@ mod tests {
             header: BlockHeader {
                 parent_hash: chain.tip_hash,
                 height: chain.height + 1,
-                proposer_pubkey: signer.verifying_key().to_bytes(),
                 txs_root: [0u8; 32],
                 receipts_root: [0u8; 32],
                 gas_used: 0,
@@ -1204,6 +1226,7 @@ mod tests {
     fn availability_outside_window_rejected() {
         let signer = SigningKey::from_bytes(&[11u8; 32]);
         let mut chain = Chain::new();
+        init_chain_with_validator(&mut chain, &signer);
         let mut balances = Balances::default();
         let mut nonces = Nonces::default();
         let mut commitments = Commitments::default();
@@ -1222,7 +1245,6 @@ mod tests {
             header: BlockHeader {
                 parent_hash: chain.tip_hash,
                 height: chain.height + 1,
-                proposer_pubkey: signer.verifying_key().to_bytes(),
                 txs_root: [0u8; 32],
                 receipts_root: [0u8; 32],
                 gas_used: 0,
