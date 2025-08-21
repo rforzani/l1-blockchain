@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 use l1_blockchain::consensus::dev_loop::{DevLoop, DevLoopConfig, DEFAULT_LIMITS, DevNode};
+use l1_blockchain::crypto::vrf::SchnorrkelVrfSigner;
 use l1_blockchain::mempool::{BlockSelectionLimits, MempoolConfig, MempoolImpl};
 use l1_blockchain::node::{BuiltBlock, SelectedIds, ProduceError, Node};
 use l1_blockchain::chain::{ApplyResult, Chain};
@@ -140,6 +141,10 @@ fn empty_mempool_produces_empty_blocks() {
 
     // make this node a valid proposer at genesis
     let mut node = Node::new(mp, signer);
+
+    let test_vrf = SchnorrkelVrfSigner::from_deterministic_seed([7u8; 32]);
+    node.set_vrf_signer(test_vrf);
+
     node.install_self_as_genesis_validator(1, 1_000_000); // production path via init_genesis
 
     let blocks = Arc::new(Mutex::new(Vec::new()));

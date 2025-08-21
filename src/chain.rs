@@ -497,7 +497,7 @@ mod tests {
     use crate::types::{
         Block, BlockHeader, Tx, CommitTx, AvailTx, RevealTx, Transaction, Hash,
     };
-    use crate::pos::registry::{StakingConfig, Validator, ValidatorSet, ValidatorStatus};
+    use crate::pos::registry::{StakingConfig, Validator, ValidatorId, ValidatorSet, ValidatorStatus};
 
     fn build_block(
         chain: &Chain,
@@ -642,20 +642,26 @@ mod tests {
         }
     }
 
-    fn init_chain_with_validator(chain: &mut Chain, signer: &SigningKey) {
-        let cfg = StakingConfig {
-            min_stake: 1,
-            unbonding_epochs: 1,
-            max_validators: u32::MAX,
-        };
+    #[cfg(test)]
+    pub fn init_chain_with_validator(chain: &mut Chain, signer: &SigningKey) {
+        use crate::crypto::vrf::SchnorrkelVrfSigner;
+
+        let cfg = StakingConfig { min_stake: 1, unbonding_epochs: 1, max_validators: u32::MAX };
+    
+        // Deterministic VRF key for tests (DO NOT use this pattern for prod key mgmt)
+        let vrf_seed = hash_bytes_sha256(b"l1-blockchain/test-vrf-seed:v1");
+        let vrf      = SchnorrkelVrfSigner::from_deterministic_seed(vrf_seed);
+    
         let v = Validator {
             id: 1,
             ed25519_pubkey: signer.verifying_key().to_bytes(),
             bls_pubkey: None,
+            vrf_pubkey: vrf.public_bytes(),   // <-- REQUIRED
             stake: 1,
             status: ValidatorStatus::Active,
         };
-        let set = ValidatorSet::from_genesis(0, &cfg, vec![v]);
+    
+        let set  = ValidatorSet::from_genesis(0, &cfg, vec![v]);
         let seed = hash_bytes_sha256(b"l1-blockchain/test-epoch-seed:v1");
         chain.init_genesis(set, seed);
     }

@@ -1,6 +1,6 @@
 // src/crypto/vrf.rs
 
-use schnorrkel::{Keypair, PublicKey, SecretKey, signing_context};
+use schnorrkel::{signing_context, ExpansionMode, Keypair, MiniSecretKey, PublicKey, SecretKey};
 use schnorrkel::vrf::{VRFProof, VRFPreOut};
 
 /// Fixed-size VRF output we commit to on-chain: we use schnorrkel's VRFPreOut bytes (32).
@@ -52,12 +52,13 @@ pub struct SchnorrkelVrfSigner {
 
 impl SchnorrkelVrfSigner {
     /// Construct from a 32-byte sr25519 secret. In production, load from secure storage/HSM.
-    pub fn from_secret_key(sk_bytes: [u8; 32]) -> Self {
-        let sk = SecretKey::from_bytes(&sk_bytes).expect("invalid sr25519 secret key");
-        let pk: PublicKey = sk.to_public();
-        Self { kp: Keypair { secret: sk, public: pk } }
+    pub fn from_secret_key(sk_seed32: [u8; 32]) -> Self {
+        let mini = MiniSecretKey::from_bytes(&sk_seed32)
+            .expect("invalid sr25519 mini secret (32 bytes expected)");
+        let kp = mini.expand_to_keypair(ExpansionMode::Uniform);
+        Self { kp }
     }
-
+        
     /// Deterministic helper (tests/dev only): derive sr25519 from a 32-byte seed.
     pub fn from_deterministic_seed(seed32: [u8; 32]) -> Self {
         Self::from_secret_key(seed32)

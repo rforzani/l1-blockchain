@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::pos::registry::{StakingConfig, Validator, ValidatorId, ValidatorSet, ValidatorStatus};
 use crate::pos::schedule::ProposerSchedule;
 use crate::pos::slots::SlotClock;
+use crate::crypto::vrf::{SchnorrkelVrfSigner, VrfPubkey};
 
 pub struct StateBalanceView<'a> {
     balances: &'a Balances,
@@ -56,9 +57,9 @@ pub struct Node {
     commitments: Commitments,
     available: Available,
     mempool: Arc<MempoolImpl>,
-    // keys for signing the block header
     signer: SigningKey,
     proposer_pubkey: [u8; 32],
+    vrf_signer: Option<SchnorrkelVrfSigner>,
 }
 
 struct NodeStateView<'a> {
@@ -115,12 +116,32 @@ impl Node {
             mempool,
             signer,
             proposer_pubkey,
+            vrf_signer: None
         }
+    }
+
+    /// Production: set a real VRF signer (sr25519) loaded from secure storage.
+    pub fn set_vrf_signer(&mut self, vrf: SchnorrkelVrfSigner) {
+        self.vrf_signer = Some(vrf);
+    }
+
+    /// Convenience: builder-style hook if you prefer chaining.
+    pub fn with_vrf_signer(mut self, vrf: SchnorrkelVrfSigner) -> Self {
+        self.vrf_signer = Some(vrf);
+        self
+    }
+
+    /// Helper used by genesis init to fetch our VRF pubkey.
+    fn my_vrf_pubkey(&self) -> [u8; 32] {
+        self.vrf_signer
+            .as_ref()
+            .expect("VRF signer not set on Node; call set_vrf_signer() before genesis")
+            .public_bytes()
     }
 
     pub fn install_self_as_genesis_validator(&mut self, id: ValidatorId, stake: u128) {
         let cfg = StakingConfig {
-            min_stake: 1,              // tests/devnets can choose any positive stake
+            min_stake: 1,
             unbonding_epochs: 1,
             max_validators: u32::MAX,
         };
@@ -129,14 +150,13 @@ impl Node {
             id,
             ed25519_pubkey: self.proposer_pubkey,
             bls_pubkey: None,
+            vrf_pubkey: self.my_vrf_pubkey(),
             stake,
             status: ValidatorStatus::Active,
         };
 
         let set = ValidatorSet::from_genesis(0, &cfg, vec![v]);
         let seed = hash_bytes_sha256(b"l1-blockchain/test-epoch-seed:v1");
-
-        // one-time bootstrap; panics if called after height > 0 or if already initialized
         self.chain.init_genesis(set, seed);
     }
 
@@ -501,7 +521,9 @@ mod tests {
         };
         let mp = MempoolImpl::new(cfg);
         let mut node = Node::new(mp.clone(), SigningKey::from_bytes(&[2u8; 32]));
-    
+        let test_vrf = SchnorrkelVrfSigner::from_deterministic_seed([7u8; 32]);
+        node.set_vrf_signer(test_vrf);
+
         // install this node as the epoch-0 validator (production path via init_genesis)
         node.install_self_as_genesis_validator(1, 1_000_000);
     
@@ -533,6 +555,9 @@ mod tests {
         let mp = MempoolImpl::new(cfg);
         let mut node = Node::new(mp.clone(), SigningKey::from_bytes(&[3u8; 32]));
     
+        let test_vrf = SchnorrkelVrfSigner::from_deterministic_seed([7u8; 32]);
+        node.set_vrf_signer(test_vrf);
+
         // NEW: make this node an active validator in the chain's validator set.
         node.install_self_as_genesis_validator(1, 1_000_000);
     
