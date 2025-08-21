@@ -34,7 +34,6 @@ impl DevNode for FakeNode {
         let header = BlockHeader {
             parent_hash: [0u8;32],
             height: st.height,
-            proposer_pubkey: [0u8;32],
             txs_root: [0u8;32],
             receipts_root: [0u8;32],
             gas_used: 0,
@@ -278,7 +277,6 @@ impl DevNode for BadSigNode {
         let header = BlockHeader {
             parent_hash: chain.tip_hash,
             height: chain.height + 1,
-            proposer_pubkey: [0u8;32],
             txs_root: [0u8;32],
             receipts_root: [0u8;32],
             gas_used: 0,
@@ -335,7 +333,6 @@ impl DevNode for WrongParentNode {
         let header = BlockHeader {
             parent_hash: [1u8;32], // wrong parent
             height: chain.height + 1,
-            proposer_pubkey: [0u8;32],
             txs_root: [0u8;32],
             receipts_root: [0u8;32],
             gas_used: 0,

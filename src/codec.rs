@@ -121,7 +121,6 @@ pub fn header_signing_bytes(h: &BlockHeader) -> Vec<u8> {
     
     v.extend_from_slice(&h.parent_hash);
     put_u64(&mut v, h.height);
-    v.extend_from_slice(&h.proposer_pubkey);
     v.extend_from_slice(&h.txs_root);
     v.extend_from_slice(&h.receipts_root);
     put_u64(&mut v, h.gas_used);
@@ -145,7 +144,6 @@ pub fn header_bytes(h: &BlockHeader) -> Vec<u8> {
     
     v.extend_from_slice(&h.parent_hash);
     put_u64(&mut v, h.height);
-    v.extend_from_slice(&h.proposer_pubkey);
     v.extend_from_slice(&h.txs_root);
     v.extend_from_slice(&h.receipts_root);
     put_u64(&mut v, h.gas_used);

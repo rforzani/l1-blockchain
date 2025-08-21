@@ -258,7 +258,6 @@ impl Node {
             header: crate::types::BlockHeader {
                 parent_hash:     self.chain.tip_hash,
                 height:          next_height,
-                proposer_pubkey: self.proposer_pubkey,
                 txs_root:        [0u8; 32], // filled after STF run
                 receipts_root:   [0u8; 32], // filled after STF run
                 gas_used:        0,         // filled after STF run
