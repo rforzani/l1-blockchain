@@ -65,4 +65,10 @@ impl SlotClock {
         let es = self.epoch_slots;
         if es == 0 { 0 } else { slot % es }
     }
+
+    #[inline]
+    pub fn bundle_start(slot: u64, bundle_len: u8) -> u64 {
+        let r = bundle_len.max(1) as u64;
+        slot - (slot % r)
+    }
 }

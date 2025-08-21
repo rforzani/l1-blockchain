@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet, BTreeMap};
 
 const DEFAULT_SLOT_MS: u64 = 1_000;     // 1s slots for dev;
 const DEFAULT_EPOCH_SLOTS: u64 = 1_024; // power-of-two for easy math
+pub const DEFAULT_BUNDLE_LEN: u8 = 4;
 
 pub struct Chain {
     pub tip_hash: Hash,

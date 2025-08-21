@@ -12,6 +12,7 @@ pub struct Validator {
     pub id: ValidatorId,
     pub ed25519_pubkey: [u8; 32],
     pub bls_pubkey: Option<[u8; 48]>,
+    pub vrf_pubkey: [u8; 32],
     pub stake: u128,
     pub status: ValidatorStatus,
 }

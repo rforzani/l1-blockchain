@@ -7,6 +7,7 @@ edition = "2024"
 sha2 = "0.10"
 hex = "0.4"
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+schnorrkel = { version = "0.11", default-features = false, features = ["alloc"] }
 tracing = "0.1"
 
 [dev-dependencies]
