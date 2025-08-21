@@ -148,3 +148,65 @@ fn empty_mempool_produces_empty_blocks() {
         assert_eq!(*h as usize, i + 1);
     }
 }
+
+struct SlowNode {
+    inner: FakeNode,
+    delay_ms: u64,
+}
+
+impl SlowNode {
+    fn new(state: Arc<Mutex<FakeState>>, delay_ms: u64) -> Self {
+        Self { inner: FakeNode::new(state), delay_ms }
+    }
+}
+
+impl DevNode for SlowNode {
+    fn height(&self) -> u64 { self.inner.height() }
+
+    fn produce_block(&mut self, limits: BlockSelectionLimits) -> Result<(BuiltBlock, ApplyResult), ProduceError> {
+        std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+        self.inner.produce_block(limits)
+    }
+
+    fn now_unix(&self) -> u64 { self.inner.now_unix() }
+}
+
+#[test]
+fn sleeps_remainder_of_slot() {
+    use std::time::{Duration, Instant};
+
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let node = FakeNode::new(state);
+    let slot_ms = 10;
+    let cfg = DevLoopConfig { slot_ms, limits: DEFAULT_LIMITS };
+    let mut dl = DevLoop::new(node, cfg);
+    let slots = 5;
+    let start = Instant::now();
+    dl.run_for_slots(slots);
+    let elapsed = start.elapsed();
+    let expected = Duration::from_millis(slot_ms * slots);
+    let tolerance = Duration::from_millis(5);
+    assert!(elapsed >= expected - tolerance, "elapsed {:?} < {:?}", elapsed, expected - tolerance);
+}
+
+#[test]
+fn no_busy_wait_under_heavy_block_assembly() {
+    use std::time::{Duration, Instant};
+
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let delay_ms = 40; // greater than slot duration
+    let node = SlowNode::new(state.clone(), delay_ms);
+    let slot_ms = 10;
+    let cfg = DevLoopConfig { slot_ms, limits: DEFAULT_LIMITS };
+    let mut dl = DevLoop::new(node, cfg);
+    let slots = 3;
+    let start = Instant::now();
+    dl.run_for_slots(slots);
+    let elapsed = start.elapsed();
+    let min = Duration::from_millis(delay_ms * slots);
+    let tolerance = Duration::from_millis(25); // allow some scheduling overhead
+    assert!(elapsed >= min, "elapsed {:?} < min {:?}", elapsed, min);
+    assert!(elapsed <= min + tolerance, "elapsed {:?} > max {:?}", elapsed, min + tolerance);
+    let st = state.lock().unwrap();
+    assert_eq!(st.height, slots);
+}
