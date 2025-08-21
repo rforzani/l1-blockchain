@@ -3,7 +3,7 @@ use crate::fees::FeeState;
 // src/node.rs
 use crate::mempool::{BalanceView, BlockSelectionLimits, CommitmentId, Mempool, MempoolImpl, SelectError, StateView, TxId};
 use crate::state::{Balances, Nonces, Commitments, Available};
-use crate::chain::{ApplyResult, Chain};
+use crate::chain::{ApplyResult, Chain, DEFAULT_BUNDLE_LEN};
 use crate::stf::process_block;
 use crate::types::{Block, Hash};
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::pos::registry::{StakingConfig, Validator, ValidatorId, ValidatorSet, ValidatorStatus};
 use crate::pos::schedule::ProposerSchedule;
 use crate::pos::slots::SlotClock;
-use crate::crypto::vrf::{SchnorrkelVrfSigner, VrfPubkey};
+use crate::crypto::vrf::{build_vrf_msg, SchnorrkelVrfSigner, VrfPubkey, VrfSigner};
 
 pub struct StateBalanceView<'a> {
     balances: &'a Balances,
@@ -165,6 +165,21 @@ impl Node {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
     }
 
+    // Top 64 bits of SHA-256(vrf_output) for uniform compare
+    #[inline]
+    fn vrf_rand64(out32: &[u8;32]) -> u64 {
+        let h = hash_bytes_sha256(out32);
+        u64::from_be_bytes([h[0],h[1],h[2],h[3],h[4],h[5],h[6],h[7]])
+    }
+
+    #[inline]
+    fn vrf_threshold64(my_stake: u128, total: u128) -> u64 {
+        if total == 0 { return 0; }
+        // floor((stake/total) * 2^64)
+        let num = (my_stake as u128) << 64;
+        (num / total) as u64
+    }
+
     /// Look up our ValidatorId in the current validator set by matching the ed25519 pubkey.
     /// Returns None if we are not part of the active snapshot.
     fn my_validator_id(&self) -> Option<ValidatorId> {
@@ -174,17 +189,17 @@ impl Node {
             .map(|v| v.id)
     }
 
-       /// Build a deterministic per-block randomness value bound to epoch seed, tip hash, height and slot.
-       #[inline]
-       fn derive_block_randomness(&self, next_height: u64, slot: u64) -> [u8; 32] {
-           let mut buf = Vec::with_capacity(32 + 32 + 8 + 8 + 24);
-           buf.extend_from_slice(b"l1-blockchain/block-randomness:v1");
-           buf.extend_from_slice(&self.chain.epoch_seed);
-           buf.extend_from_slice(&self.chain.tip_hash);
-           buf.extend_from_slice(&next_height.to_le_bytes());
-           buf.extend_from_slice(&slot.to_le_bytes());
-           hash_bytes_sha256(&buf)
-        }
+    /// Build a deterministic per-block randomness value bound to epoch seed, tip hash, height and slot.
+    #[inline]
+    fn derive_block_randomness(&self, next_height: u64, slot: u64) -> [u8; 32] {
+        let mut buf = Vec::with_capacity(32 + 32 + 8 + 8 + 24);
+        buf.extend_from_slice(b"l1-blockchain/block-randomness:v1");
+        buf.extend_from_slice(&self.chain.epoch_seed);
+        buf.extend_from_slice(&self.chain.tip_hash);
+        buf.extend_from_slice(&next_height.to_le_bytes());
+        buf.extend_from_slice(&slot.to_le_bytes());
+        hash_bytes_sha256(&buf)
+    }
 
     pub fn height(&self) -> u64 {
         self.chain.height
@@ -222,58 +237,92 @@ impl Node {
         &self,
         limits: BlockSelectionLimits,
     ) -> Result<(BuiltBlock, ApplyResult, Balances, Nonces, Commitments, Available, u64), ProduceError> {
-        // ---- PoS gating & deterministic metadata ----
-        // Use slot clock for deterministic slot/epoch; refuse if we’re not the leader.
+        // ---- VORTEX: PoS gating & deterministic metadata ----
         let now_ms = (Self::now_ts() as u128) * 1000;
         let slot   = self.chain.clock.current_slot(now_ms);
         let epoch  = self.chain.clock.current_epoch(slot);
-
-        // Who is scheduled?
-        let scheduled = self.chain.schedule.leader_for_slot(slot);
-
-        // Who are we?
-        let my_id = self.my_validator_id();
-
-        // Refuse to produce if no leader or if we are not the leader for this slot.
-        if scheduled.is_none() || scheduled != my_id {
-            return Err(ProduceError::NotProposer {
-                slot,
-                leader: scheduled,
-                mine: my_id,
-            });
+    
+        // Bundle start (leader elected per bundle of R slots)
+        let r: u8 = DEFAULT_BUNDLE_LEN;
+        let bundle_start = self.chain.clock.bundle_start(slot, r);
+    
+        // We must know our validator id and have a VRF signer
+        let Some(proposer_id) = self.my_validator_id() else {
+            return Err(ProduceError::NotProposer { slot, leader: None, mine: None });
+        };
+        let Some(vrf) = &self.vrf_signer else {
+            return Err(ProduceError::NotProposer { slot, leader: None, mine: Some(proposer_id) });
+        };
+    
+        // Eligibility helpers
+        #[inline]
+        fn vrf_rand64(out32: &[u8; 32]) -> u64 {
+            let h = hash_bytes_sha256(out32);
+            u64::from_be_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]])
         }
-        let proposer_id = my_id.expect("checked above");
-
-
+        #[inline]
+        fn vrf_threshold64(my_stake: u128, total: u128) -> u64 {
+            if total == 0 {
+                return 0;
+            }
+            if my_stake >= total {
+                // Single-validator or 100% stake → always eligible
+                return u64::MAX;
+            }
+            // Safe: result < 2^64 because my_stake < total
+            let num = (my_stake as u128) << 64;
+            (num / total) as u64
+        }
+    
+        // Build VRF message and check stake-weighted threshold
+        let msg = build_vrf_msg(&self.chain.epoch_seed, bundle_start, proposer_id);
+        let (vrf_out, vrf_pre, vrf_proof) = self.vrf_signer
+            .as_ref()
+            .map(|s| s.vrf_prove(&msg))
+            .unwrap_or(([0u8;32], [0u8;32], Vec::new()));
+        
+        let me = self.chain
+            .validator_set
+            .get(proposer_id)
+            .expect("proposer_id present in active set");
+        let total = self.chain.validator_set.total_stake();
+    
+        let r64 = vrf_rand64(&vrf_out);
+        let thr = vrf_threshold64(me.stake, total);
+    
+        if r64 >= thr {
+            // Not elected for this bundle: do not propose.
+            return Err(ProduceError::NotProposer { slot, leader: None, mine: Some(proposer_id) });
+        }
+    
         // 0) Prune stale items before building any view or selecting.
         if self.chain.height > 0 {
             self.mempool.evict_stale(self.chain.height);
         }
-
+    
         // 1) State view for selection
         let sv = NodeStateView {
             chain:   &self.chain,
             nonces:  &self.nonces,
             mempool: &self.mempool,
         };
-
+    
         // 2) Select candidates from mempool
         let cand = self
             .mempool
             .select_block(&sv, limits)
             .map_err(ProduceError::Selection)?;
-
+    
         let next_height = self.chain.height + 1;
-
-        // Deterministic timestamp: start of the slot, not wall-clock
-        let ts_ms = self.chain.clock.slot_start_unix(slot);
+    
+        // Deterministic timestamp: start of the slot
+        let ts_ms  = self.chain.clock.slot_start_unix(slot);
         let ts_sec = (ts_ms / 1000) as u64;
-
-        // Per-block randomness committed in header (chain updates its accumulator after apply)
+    
+        // Per-block randomness committed in header
         let randomness = self.derive_block_randomness(next_height, slot);
-
-        // 3) Build a block with an unsigned header carrying only fields the STF needs (height).
-        //    Roots and gas_used will be computed by STF below and then written into the header.
+    
+        // 3) Build a block with an unsigned header; STF computes roots/gas then we sign
         let mut block = crate::types::Block {
             header: crate::types::BlockHeader {
                 parent_hash:     self.chain.tip_hash,
@@ -281,33 +330,41 @@ impl Node {
                 txs_root:        [0u8; 32], // filled after STF run
                 receipts_root:   [0u8; 32], // filled after STF run
                 gas_used:        0,         // filled after STF run
-                randomness:      randomness,
+                randomness,
                 reveal_set_root: [0u8; 32], // filled after STF run
                 il_root:         [0u8; 32], // filled after STF run
                 exec_base_fee:   self.chain.fee_state.exec_base,
                 commit_base_fee: self.chain.fee_state.commit_base,
                 avail_base_fee:  self.chain.fee_state.avail_base,
                 timestamp:       ts_sec,
+    
+                // proposer identity / schedule
                 slot,
                 epoch,
                 proposer_id,
+    
+                // Vortex PoS fields
+                bundle_len: r,
+                vrf_output: vrf_out,
+                vrf_proof:  vrf_proof.clone(),
+                vrf_preout: vrf_pre,
+    
                 signature:       [0u8; 64], // filled after signing below
             },
             transactions: cand.txs.clone(),
             reveals:      cand.reveals.clone(),
         };
-
+    
         // 4) Simulate execution to compute canonical roots/gas/receipts (does not mutate Chain)
         let mut sim_balances    = self.balances.clone();
         let mut sim_nonces      = self.nonces.clone();
         let mut sim_commitments = self.commitments.clone();
         let mut sim_available   = self.available.clone();
-
+    
         // Fee recipient: derive once from our pubkey
         let proposer_addr = addr_hex(&addr_from_pubkey(&self.proposer_pubkey));
         let mut sim_burned_total = self.chain.burned_total;
-
-        // Use your STF function that returns body results (roots, receipts, gas, counts, events)
+    
         let body = process_block(
             &block,
             &mut sim_balances,
@@ -318,20 +375,19 @@ impl Node {
             &proposer_addr,
             &mut sim_burned_total,
         ).map_err(|e| ProduceError::HeaderBuild(format!("body simulation failed: {e:?}")))?;
-
+    
         // 5) Fill header with the computed roots and gas
         block.header.txs_root        = body.txs_root;
         block.header.receipts_root   = body.receipts_root;
         block.header.reveal_set_root = body.reveal_set_root;
         block.header.il_root         = body.il_root;
         block.header.gas_used        = body.gas_total;
-        
-
+    
         // 6) Sign the header and attach signature
         let preimage = header_signing_bytes(&block.header);
         let sig      = self.signer.sign(&preimage).to_bytes();
         block.header.signature = sig;
-
+    
         let apply = ApplyResult {
             receipts: body.receipts.clone(),
             gas_total: body.gas_total,
@@ -340,7 +396,7 @@ impl Node {
             commits_used: body.commits_used,
             burned_total: sim_burned_total
         };
-
+    
         Ok((
             BuiltBlock {
                 block,
@@ -433,6 +489,17 @@ mod tests {
 
     fn addr(i: u8) -> String {
         format!("0x{:02x}{:02x}000000000000000000000000000000000000", i, i)
+    }
+
+    fn fake_vrf_fields(proposer_id: u64) -> ([u8; 32], Vec<u8>) {
+        let mut out = [0u8; 32];
+        // just encode proposer_id in big-endian into the first 8 bytes
+        out[..8].copy_from_slice(&proposer_id.to_be_bytes());
+        // "proof" is any non-empty vec; make it depend on proposer_id too
+        let mut proof = Vec::with_capacity(9);
+        proof.extend_from_slice(b"proof-id");
+        proof.push((proposer_id & 0xFF) as u8);
+        (out, proof)
     }
 
     fn make_pair(signer: &SigningKey, nonce: u64) -> (CommitTx, RevealTx) {

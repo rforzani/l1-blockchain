@@ -1,8 +1,9 @@
 //src/chain.rs
 
-use ed25519_dalek::{Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 use crate::codec::{header_bytes, header_signing_bytes};
+use crate::crypto::vrf::{build_vrf_msg, SchnorrkelVrf, VrfPubkey, VrfVerifier};
 use crate::crypto::{addr_from_pubkey, addr_hex, hash_bytes_sha256, verify_ed25519};
 use crate::fees::{update_commit_base, update_exec_base, FeeState, FEE_PARAMS};
 use crate::pos::registry::{StakingConfig, ValidatorSet, ValidatorStatus};
@@ -125,55 +126,96 @@ impl Chain {
     }
 
     pub fn verify_header_proposer(&self, header: &crate::types::BlockHeader) -> Result<(), BlockError> {
-        // 1) Slot/height relationship (devnet policy: one block per slot, strictly next)
-        //    If your policy differs, adjust this check accordingly.
+        // 1) Height/slot policy: strictly the next block (adjust if your policy differs)
         if header.height != self.height + 1 {
             return Err(BlockError::WrongSlot);
         }
-
-        // 2) Epoch must be consistent with configured slot clock
+    
+        // 2) Epoch must match the clock for the given slot
         let expected_epoch = self.clock.current_epoch(header.slot);
         if header.epoch != expected_epoch {
             return Err(BlockError::WrongEpoch);
         }
-
-        // (Optional but useful) ensure the slot is the “next” logical slot.
-        // If you allow gaps, relax/remove this.
-        let expected_slot = header.height; // 1:1 mapping in the dev loop
+    
+        // 3) (Dev policy) enforce slot == height; relax/remove if you allow gaps
+        let expected_slot = header.height;
         if header.slot != expected_slot {
             return Err(BlockError::WrongSlot);
         }
-
-        // 3) Scheduled leader for this slot must match header.proposer_id
-        let Some(scheduled) = self.schedule.leader_for_slot(header.slot) else {
-            return Err(BlockError::NotScheduledLeader);
+    
+        // 4) Proposer must exist and be Active
+        let v = match self.validator_set.get(header.proposer_id) {
+            Some(v) => v,
+            None => return Err(BlockError::NotScheduledLeader),
         };
-        if header.proposer_id != scheduled {
+        if v.status != crate::pos::registry::ValidatorStatus::Active {
             return Err(BlockError::NotScheduledLeader);
         }
-
-        // 4) The proposer must exist and be Active in the validator set
-        let v = self
-            .validator_set
-            .get(header.proposer_id)
-            .ok_or(BlockError::NotScheduledLeader)?; // or a dedicated ProposerUnknown
-
-        if v.status != ValidatorStatus::Active {
+    
+        // 5) VORTEX-ONLY: VRF proof MUST be present and valid; no alias fallback.
+        if header.vrf_proof.is_empty() {
+            // dedicated error variant would be nicer; reuse BadSignature for now
+            return Err(BlockError::BadSignature);
+        }
+    
+        // (a) Sanity on bundle_len (enforce your configured default)
+        let r = header.bundle_len;
+        if r == 0 || r != DEFAULT_BUNDLE_LEN {
+            return Err(BlockError::WrongSlot);
+        }
+    
+        // (b) Recompute bundle_start deterministically
+        let bundle_start = self.clock.bundle_start(header.slot, r);
+    
+        // (c) Build VRF message (must match Node exactly)
+        let msg = build_vrf_msg(&self.epoch_seed, bundle_start, header.proposer_id);
+    
+        // (d) Verify VRF proof against the validator's VRF public key
+        if !SchnorrkelVrf::vrf_verify(
+                &VrfPubkey(v.vrf_pubkey),
+                &msg,
+                &header.vrf_output,
+                &header.vrf_preout,
+                &header.vrf_proof,
+        ) {
+            return Err(BlockError::BadSignature); // or BadVrf if you distinguish
+        }
+    
+        // (e) Stake-weighted threshold check: interpret output uniformly in [0, 2^64)
+        #[inline]
+        fn vrf_rand64(out32: &[u8; 32]) -> u64 {
+            let h = crate::crypto::hash_bytes_sha256(out32);
+            u64::from_be_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]])
+        }
+        #[inline]
+        fn vrf_threshold64(my_stake: u128, total: u128) -> u64 {
+            if total == 0 {
+                return 0;
+            }
+            if my_stake >= total {
+                // Single-validator or 100% stake → always eligible
+                return u64::MAX;
+            }
+            // Safe: result < 2^64 because my_stake < total
+            let num = (my_stake as u128) << 64;
+            (num / total) as u64
+        }
+    
+        let total = self.validator_set.total_stake();
+        let r64   = vrf_rand64(&header.vrf_output);
+        let thr   = vrf_threshold64(v.stake, total);
+        if r64 >= thr {
+            // Not eligible this bundle → reject
             return Err(BlockError::NotScheduledLeader);
         }
-
-        // 5) Verify the header signature against the canonical preimage
-        let preimage = header_signing_bytes(header);
-
+    
+        // 6) Verify the ed25519 header signature (over the UPDATED preimage with Vortex fields)
+        let preimage = crate::codec::header_signing_bytes(header);
         let vk = VerifyingKey::from_bytes(&v.ed25519_pubkey)
             .map_err(|_| BlockError::BadSignature)?;
-
-        // ed25519-dalek 2.x: from_bytes returns Signature directly
-        let sig = ed25519_dalek::Signature::from_bytes(&header.signature);
-
-        vk.verify(&preimage, &sig)
-            .map_err(|_| BlockError::BadSignature)?;
-
+        let sig = Signature::from_bytes(&header.signature);
+        vk.verify(&preimage, &sig).map_err(|_| BlockError::BadSignature)?;
+    
         Ok(())
     }
     
@@ -484,11 +526,14 @@ impl Chain {
 #[cfg(test)]
 
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
     use ed25519_dalek::{SigningKey, Signer};
     use crate::codec::{
         header_bytes, header_signing_bytes, tx_bytes, access_list_bytes, string_bytes,
     };
+    use crate::crypto::vrf::{SchnorrkelVrfSigner, VrfSigner};
     use crate::crypto::{
         hash_bytes_sha256, addr_from_pubkey, addr_hex, commitment_hash,
         commit_signing_preimage, avail_signing_preimage,
@@ -497,7 +542,22 @@ mod tests {
     use crate::types::{
         Block, BlockHeader, Tx, CommitTx, AvailTx, RevealTx, Transaction, Hash,
     };
-    use crate::pos::registry::{StakingConfig, Validator, ValidatorId, ValidatorSet, ValidatorStatus};
+    use crate::pos::registry::{StakingConfig, Validator, ValidatorSet, ValidatorStatus};
+
+    fn fake_vrf_fields(proposer_id: u64) -> ([u8; 32], [u8; 32], Vec<u8>) {
+        let mut m = Vec::with_capacity(16 + 8);
+        m.extend_from_slice(b"fake-vrf-preout");
+        m.extend_from_slice(&proposer_id.to_be_bytes());
+        let preout = hash_bytes_sha256(&m);
+    
+        let out = hash_bytes_sha256(&preout);
+    
+        let mut proof = Vec::with_capacity(33);
+        proof.extend_from_slice(&preout);
+        proof.push(0x01);
+    
+        (out, preout, proof)
+    }
 
     fn build_block(
         chain: &Chain,
@@ -509,35 +569,75 @@ mod tests {
         transactions: Vec<Tx>,
         reveals: Vec<RevealTx>,
     ) -> Block {
+        // Derive deterministic time/slot/epoch for this block
+        let now_ms  = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()) as u128;
+        let slot    = chain.clock.current_slot(now_ms);
+        let epoch   = chain.clock.current_epoch(slot);
+        let ts_sec  = (chain.clock.slot_start_unix(slot) / 1000) as u64;
+    
+        // Proposer identity: map ed25519 pubkey -> validator id from the active set
+        let ed_pk   = signer.verifying_key().to_bytes();
+        let proposer_id = chain
+            .validator_set
+            .validators
+            .iter()
+            .find(|v| v.ed25519_pubkey == ed_pk)
+            .map(|v| v.id)
+            .unwrap_or(1); // fallback for tests if not present
+    
+        // Alias path only here: leave VRF empty but include bundle_len for completeness
+        let bundle_len = DEFAULT_BUNDLE_LEN;
+        let vrf_output = [0u8; 32];
+        let vrf_preout = [0u8; 32];
+        let vrf_proof: Vec<u8> = Vec::new();
+    
         let mut block = Block {
             header: BlockHeader {
-                parent_hash: chain.tip_hash,
-                height: chain.height + 1,
-                txs_root: [0u8; 32],
-                receipts_root: [0u8; 32],
-                gas_used: 0,
-                randomness: chain.tip_hash,
+                // consensus lineage
+                parent_hash:   chain.tip_hash,
+                height:        chain.height + 1,
+    
+                // execution roots (filled after STF simulation)
+                txs_root:        [0u8; 32],
+                receipts_root:   [0u8; 32],
+                gas_used:        0,
+                randomness:      chain.tip_hash, // ok for tests; production uses per-block derivation
                 reveal_set_root: [0u8; 32],
-                il_root: [0u8; 32],
-                exec_base_fee: chain.fee_state.exec_base,
+                il_root:         [0u8; 32],
+    
+                // fee bases
+                exec_base_fee:   chain.fee_state.exec_base,
                 commit_base_fee: chain.fee_state.commit_base,
-                avail_base_fee: chain.fee_state.avail_base,
-                timestamp: 0,
-                slot: 0,
-                epoch: 0,
-                proposer_id: 1,
-                signature: [0u8; 64],
+                avail_base_fee:  chain.fee_state.avail_base,
+    
+                // timing & identity
+                timestamp:       ts_sec,
+                slot,
+                epoch,
+                proposer_id,
+    
+                // Vortex PoS fields (alias fallback: empty VRF)
+                bundle_len,
+                vrf_output,
+                vrf_proof,
+                vrf_preout,
+    
+                // signature filled after STF + preimage build
+                signature:       [0u8; 64],
             },
             transactions,
             reveals,
         };
-
-        let mut sim_balances = balances.clone();
-        let mut sim_nonces = nonces.clone();
+    
+        // Simulate STF to compute canonical roots/gas
+        let mut sim_balances    = balances.clone();
+        let mut sim_nonces      = nonces.clone();
         let mut sim_commitments = commitments.clone();
-        let mut sim_available = available.clone();
-        let proposer_addr = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
+        let mut sim_available   = available.clone();
+    
+        let proposer_addr = addr_hex(&addr_from_pubkey(&ed_pk));
         let mut burned = 0u64;
+    
         let body = process_block(
             &block,
             &mut sim_balances,
@@ -548,17 +648,19 @@ mod tests {
             &proposer_addr,
             &mut burned,
         ).expect("process_block");
-
-        block.header.txs_root = body.txs_root;
-        block.header.receipts_root = body.receipts_root;
+    
+        // Fill header with computed roots/gas
+        block.header.txs_root        = body.txs_root;
+        block.header.receipts_root   = body.receipts_root;
         block.header.reveal_set_root = body.reveal_set_root;
-        block.header.il_root = body.il_root;
-        block.header.gas_used = body.gas_total;
-
+        block.header.il_root         = body.il_root;
+        block.header.gas_used        = body.gas_total;
+    
+        // Sign header (include new fields in preimage)
         let preimage = header_signing_bytes(&block.header);
         let sig = signer.sign(&preimage).to_bytes();
         block.header.signature = sig;
-
+    
         block
     }
 
@@ -972,14 +1074,20 @@ mod tests {
 
     #[test]
     fn too_many_avails_in_block_is_invalid() {
+        use crate::crypto::{hash_bytes_sha256, addr_from_pubkey, addr_hex};
+        use crate::crypto::vrf::{SchnorrkelVrfSigner, VrfSigner, build_vrf_msg};
+        use crate::chain::DEFAULT_BUNDLE_LEN;
+    
         let signer = SigningKey::from_bytes(&[7u8; 32]);
         let mut chain = Chain::new();
-        init_chain_with_validator(&mut chain, &signer);
-        let mut balances = Balances::default();
-        let mut nonces = Nonces::default();
+        init_chain_with_validator(&mut chain, &signer); // sets validator id=1 with a deterministic VRF pubkey
+    
+        let mut balances    = Balances::default();
+        let mut nonces      = Nonces::default();
         let mut commitments = Commitments::default();
-        let mut available = Available::default();
-
+        let mut available   = Available::default();
+    
+        // Build MAX_AVAILS_PER_BLOCK + 1 Avail txs to trigger the intrinsic error
         let mut txs = Vec::with_capacity(MAX_AVAILS_PER_BLOCK + 1);
         for _ in 0..=MAX_AVAILS_PER_BLOCK {
             txs.push(Tx::Avail(AvailTx {
@@ -989,34 +1097,65 @@ mod tests {
                 sig: [0u8; 64],
             }));
         }
-
+    
+        // --- Vortex (VRF) path setup ---
+    
+        // Your policy enforces: slot == height
+        let height = chain.height + 1; // 1
+        let slot   = height;           // 1
+        let epoch  = chain.clock.current_epoch(slot);
+    
+        let bundle_len   = DEFAULT_BUNDLE_LEN;
+        let proposer_id  = 1;
+    
+        let (vrf_output, vrf_preout, vrf_proof) = fake_vrf_fields(proposer_id);
+    
+        // --- Build header with Vortex fields filled (non-empty proof == VRF path) ---
         let mut block = Block {
             header: BlockHeader {
-                parent_hash: chain.tip_hash,
-                height: chain.height + 1,
-                txs_root: [0u8; 32],
-                receipts_root: [0u8; 32],
-                gas_used: 0,
-                randomness: chain.tip_hash,
+                parent_hash:     chain.tip_hash,
+                height,
+                txs_root:        [0u8; 32],
+                receipts_root:   [0u8; 32],
+                gas_used:        0,
+                randomness:      chain.tip_hash,
                 reveal_set_root: [0u8; 32],
-                il_root: [0u8; 32],
-                exec_base_fee: chain.fee_state.exec_base,
+                il_root:         [0u8; 32],
+                exec_base_fee:   chain.fee_state.exec_base,
                 commit_base_fee: chain.fee_state.commit_base,
-                avail_base_fee: chain.fee_state.avail_base,
-                timestamp: 0,
-                slot: 0,
-                epoch: 0,
-                proposer_id: 1,
+                avail_base_fee:  chain.fee_state.avail_base,
+                timestamp:       0, // not checked in this test
+    
+                // proposer/time metadata
+                slot,
+                epoch,
+                proposer_id,
+    
+                // Vortex PoS fields
+                bundle_len,
+                vrf_preout,
+                vrf_output,
+                vrf_proof,
+    
                 signature: [0u8; 64],
             },
             transactions: txs,
             reveals: vec![],
         };
-
+    
+        // Sign the header
         let preimage = header_signing_bytes(&block.header);
         block.header.signature = signer.sign(&preimage).to_bytes();
-
-        let res = chain.apply_block(&block, &mut balances, &mut nonces, &mut commitments, &mut available);
+    
+        // Apply and expect intrinsic invalid (too many Avails)
+        let res = chain.apply_block(
+            &block,
+            &mut balances,
+            &mut nonces,
+            &mut commitments,
+            &mut available
+        );
+    
         assert!(matches!(res, Err(BlockError::IntrinsicInvalid(msg)) if msg.contains("too many Avails in block")));
         assert_eq!(chain.height, 0);
     }
@@ -1026,14 +1165,15 @@ mod tests {
         let signer = SigningKey::from_bytes(&[8u8; 32]);
         let mut chain = Chain::new();
         init_chain_with_validator(&mut chain, &signer);
-        let mut balances = Balances::default();
-        let mut nonces = Nonces::default();
+    
+        let mut balances    = Balances::default();
+        let mut nonces      = Nonces::default();
         let mut commitments = Commitments::default();
-        let mut available = Available::default();
-
+        let mut available   = Available::default();
+    
         let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
         balances.insert(sender.clone(), 2_000);
-
+    
         let tx = Transaction::transfer(&sender, &addr(1), 1, 0);
         let mut txs = Vec::with_capacity(MAX_PENDING_COMMITS_PER_ACCOUNT + 1);
         for i in 0..=MAX_PENDING_COMMITS_PER_ACCOUNT {
@@ -1042,34 +1182,56 @@ mod tests {
             let (c, _ch) = make_commit(&signer, &tx, salt);
             txs.push(Tx::Commit(c));
         }
-
+    
+        // --- VORTEX (VRF) header fields ---
+        let height = chain.height + 1;
+        let slot   = height; // dev policy: one block per slot
+        let epoch  = chain.clock.current_epoch(slot);
+    
+        let bundle_len: u8 = DEFAULT_BUNDLE_LEN;
+    
+        let proposer_id: u64 = 1;
+        let (vrf_output, vrf_preout, vrf_proof) = fake_vrf_fields(proposer_id);
+    
         let mut block = Block {
             header: BlockHeader {
-                parent_hash: chain.tip_hash,
-                height: chain.height + 1,
-                txs_root: [0u8; 32],
-                receipts_root: [0u8; 32],
-                gas_used: 0,
-                randomness: chain.tip_hash,
+                parent_hash:     chain.tip_hash,
+                height,
+                txs_root:        [0u8; 32],
+                receipts_root:   [0u8; 32],
+                gas_used:        0,
+                randomness:      chain.tip_hash,
                 reveal_set_root: [0u8; 32],
-                il_root: [0u8; 32],
-                exec_base_fee: chain.fee_state.exec_base,
+                il_root:         [0u8; 32],
+                exec_base_fee:   chain.fee_state.exec_base,
                 commit_base_fee: chain.fee_state.commit_base,
-                avail_base_fee: chain.fee_state.avail_base,
-                timestamp: 0,
-                slot: 0,
-                epoch: 0,
-                proposer_id: 1,
+                avail_base_fee:  chain.fee_state.avail_base,
+                timestamp:       0,
+                slot,
+                epoch,
+                proposer_id,
+                bundle_len,
+                vrf_output,
+                vrf_proof,
+                vrf_preout,
                 signature: [0u8; 64],
             },
             transactions: txs,
             reveals: vec![],
         };
-
+    
+        // Sign after all header fields are set (including VRF fields)
         let preimage = header_signing_bytes(&block.header);
         block.header.signature = signer.sign(&preimage).to_bytes();
-
-        let res = chain.apply_block(&block, &mut balances, &mut nonces, &mut commitments, &mut available);
+    
+        let res = chain.apply_block(
+            &block,
+            &mut balances,
+            &mut nonces,
+            &mut commitments,
+            &mut available,
+        );
+    
         assert!(matches!(res, Err(BlockError::IntrinsicInvalid(msg)) if msg.contains("too many pending commits for owner")));
         assert!(commitments.is_empty());
         assert_eq!(chain.height, 0);
@@ -1080,45 +1242,68 @@ mod tests {
         let signer = SigningKey::from_bytes(&[9u8; 32]);
         let mut chain = Chain::new();
         init_chain_with_validator(&mut chain, &signer);
-        let mut balances = Balances::default();
-        let mut nonces = Nonces::default();
+    
+        let mut balances    = Balances::default();
+        let mut nonces      = Nonces::default();
         let mut commitments = Commitments::default();
-        let mut available = Available::default();
-
+        let mut available   = Available::default();
+    
         let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
         balances.insert(sender.clone(), 100);
-
+    
         let tx = Transaction::transfer(&sender, &addr(1), 1, 0);
         let salt = [1u8; 32];
         let (commit, _c_hash) = make_commit(&signer, &tx, salt);
-
+    
+        // --- VORTEX (VRF) header fields ---
+        let height = chain.height + 1;
+        let slot   = height; // dev policy: one block per slot
+        let epoch  = chain.clock.current_epoch(slot);
+    
+        let bundle_len: u8 = DEFAULT_BUNDLE_LEN;
+    
+        let proposer_id: u64 = 1;
+        let (vrf_output, vrf_preout, vrf_proof) = fake_vrf_fields(proposer_id);
+    
         let mut block = Block {
             header: BlockHeader {
-                parent_hash: chain.tip_hash,
-                height: chain.height + 1,
-                txs_root: [0u8; 32],
-                receipts_root: [0u8; 32],
-                gas_used: 0,
-                randomness: chain.tip_hash,
+                parent_hash:     chain.tip_hash,
+                height,
+                txs_root:        [0u8; 32],
+                receipts_root:   [0u8; 32],
+                gas_used:        0,
+                randomness:      chain.tip_hash,
                 reveal_set_root: [0u8; 32],
-                il_root: [0u8; 32],
-                exec_base_fee: chain.fee_state.exec_base,
+                il_root:         [0u8; 32],
+                exec_base_fee:   chain.fee_state.exec_base,
                 commit_base_fee: chain.fee_state.commit_base,
-                avail_base_fee: chain.fee_state.avail_base,
-                timestamp: 0,
-                slot: 0,
-                epoch: 0,
-                proposer_id: 1,
+                avail_base_fee:  chain.fee_state.avail_base,
+                timestamp:       0,
+                slot,
+                epoch,
+                proposer_id,
+                bundle_len,
+                vrf_output,
+                vrf_proof,
+                vrf_preout,
                 signature: [0u8; 64],
             },
             transactions: vec![Tx::Commit(commit.clone()), Tx::Commit(commit.clone())],
             reveals: vec![],
         };
-
+    
+        // Sign after all header fields are set (including VRF fields)
         let preimage = header_signing_bytes(&block.header);
         block.header.signature = signer.sign(&preimage).to_bytes();
-
-        let res = chain.apply_block(&block, &mut balances, &mut nonces, &mut commitments, &mut available);
+    
+        let res = chain.apply_block(
+            &block,
+            &mut balances,
+            &mut nonces,
+            &mut commitments,
+            &mut available,
+        );
+    
         assert!(matches!(res, Err(BlockError::IntrinsicInvalid(msg)) if msg.contains("duplicate commitment")));
         assert!(commitments.is_empty());
         assert_eq!(chain.height, 0);
@@ -1129,102 +1314,164 @@ mod tests {
         let signer = SigningKey::from_bytes(&[10u8; 32]);
         let mut chain = Chain::new();
         init_chain_with_validator(&mut chain, &signer);
-        let mut balances = Balances::default();
-        let mut nonces = Nonces::default();
+    
+        let mut balances    = Balances::default();
+        let mut nonces      = Nonces::default();
         let mut commitments = Commitments::default();
-        let mut available = Available::default();
-
-        let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
+        let mut available   = Available::default();
+    
+        let sender   = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
         let receiver = addr(1);
         balances.insert(sender.clone(), 1000);
         balances.insert(receiver.clone(), 0);
+    
+        let proposer_id: u64 = 1;
+    
+        // local helper: build a Vortex-only block (fills VRF fields & signs header)
+        // helper A: simulate + fill roots (for valid blocks)
+        let mut build_block_vortex_ok = |chain: &Chain,
+                                        signer: &SigningKey,
+                                        balances: &Balances,
+                                        nonces: &Nonces,
+                                        commitments: &Commitments,
+                                        available: &Available,
+                                        txs: Vec<Tx>,
+                                        reveals: Vec<RevealTx>| -> Block {
+            let height      = chain.height + 1;
+            let slot        = height;
+            let epoch       = chain.clock.current_epoch(slot);
+            let bundle_len  = DEFAULT_BUNDLE_LEN;
+            let proposer_id: u64 = 1;
+            let (vrf_output, vrf_preout, vrf_proof) = fake_vrf_fields(proposer_id);
 
-        // include a commit
+            let mut block = Block {
+                header: BlockHeader {
+                    parent_hash:     chain.tip_hash,
+                    height,
+                    txs_root:        [0u8; 32],
+                    receipts_root:   [0u8; 32],
+                    gas_used:        0,
+                    randomness:      chain.tip_hash,
+                    reveal_set_root: [0u8; 32],
+                    il_root:         [0u8; 32],
+                    exec_base_fee:   chain.fee_state.exec_base,
+                    commit_base_fee: chain.fee_state.commit_base,
+                    avail_base_fee:  chain.fee_state.avail_base,
+                    timestamp:       0,
+                    slot,
+                    epoch,
+                    proposer_id,
+                    bundle_len,
+                    vrf_output,
+                    vrf_proof,
+                    vrf_preout,
+                    signature: [0u8; 64],
+                },
+                transactions: txs,
+                reveals,
+            };
+
+            // simulate STF to compute roots/gas
+            let mut sim_balances    = balances.clone();
+            let mut sim_nonces      = nonces.clone();
+            let mut sim_commitments = commitments.clone();
+            let mut sim_available   = available.clone();
+            let proposer_addr = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
+            let mut sim_burned = 0u64;
+
+            let body = process_block(
+                &block,
+                &mut sim_balances,
+                &mut sim_nonces,
+                &mut sim_commitments,
+                &mut sim_available,
+                &chain.fee_state,
+                &proposer_addr,
+                &mut sim_burned,
+            ).expect("process_block should succeed for valid blocks");
+
+            block.header.txs_root        = body.txs_root;
+            block.header.receipts_root   = body.receipts_root;
+            block.header.reveal_set_root = body.reveal_set_root;
+            block.header.il_root         = body.il_root;
+            block.header.gas_used        = body.gas_total;
+
+            let preimage = header_signing_bytes(&block.header);
+            block.header.signature = signer.sign(&preimage).to_bytes();
+            block
+        };
+
+        // helper B: NO simulation (for blocks expected to be intrinsically invalid)
+        let mut build_block_vortex_raw = |chain: &Chain,
+                                        signer: &SigningKey,
+                                        txs: Vec<Tx>,
+                                        reveals: Vec<RevealTx>| -> Block {
+            let height      = chain.height + 1;
+            let slot        = height;
+            let epoch       = chain.clock.current_epoch(slot);
+            let bundle_len  = DEFAULT_BUNDLE_LEN;
+            let proposer_id: u64 = 1;
+            let (vrf_output, vrf_preout, vrf_proof) = fake_vrf_fields(proposer_id);
+
+            let mut block = Block {
+                header: BlockHeader {
+                    parent_hash:     chain.tip_hash,
+                    height,
+                    txs_root:        [0u8; 32],
+                    receipts_root:   [0u8; 32],
+                    gas_used:        0,
+                    randomness:      chain.tip_hash,
+                    reveal_set_root: [0u8; 32],
+                    il_root:         [0u8; 32],
+                    exec_base_fee:   chain.fee_state.exec_base,
+                    commit_base_fee: chain.fee_state.commit_base,
+                    avail_base_fee:  chain.fee_state.avail_base,
+                    timestamp:       0,
+                    slot,
+                    epoch,
+                    proposer_id,
+                    bundle_len,
+                    vrf_output,
+                    vrf_proof,
+                    vrf_preout,
+                    signature: [0u8; 64],
+                },
+                transactions: txs,
+                reveals,
+            };
+
+            // Sign as usual; STF will run inside apply_block and return IntrinsicInvalid
+            let preimage = header_signing_bytes(&block.header);
+            block.header.signature = signer.sign(&preimage).to_bytes();
+            block
+        };
+    
         let tx = Transaction::transfer(&sender, &receiver, 10, 0);
         let salt = [1u8; 32];
         let (commit, c_hash) = make_commit(&signer, &tx, salt);
-        let block1 = build_block(
-            &chain,
-            &signer,
-            &balances,
-            &nonces,
-            &commitments,
-            &available,
-            vec![Tx::Commit(commit)],
-            vec![],
-        );
-        chain
-            .apply_block(&block1, &mut balances, &mut nonces, &mut commitments, &mut available)
-            .unwrap();
-
-        // include availability
         let avail_tx = make_avail(&signer, c_hash);
-        let block2 = build_block(
-            &chain,
-            &signer,
-            &balances,
-            &nonces,
-            &commitments,
-            &available,
-            vec![Tx::Avail(avail_tx)],
-            vec![],
-        );
-        chain
-            .apply_block(&block2, &mut balances, &mut nonces, &mut commitments, &mut available)
-            .unwrap();
 
-        // advance chain until reveal is due
+        // 1) commit
+        let block1 = build_block_vortex_ok(&chain, &signer, &balances, &nonces, &commitments, &available,
+            vec![Tx::Commit(commit)], vec![]);
+        chain.apply_block(&block1, &mut balances, &mut nonces, &mut commitments, &mut available).unwrap();
+
+        // 2) avail
+        let block2 = build_block_vortex_ok(&chain, &signer, &balances, &nonces, &commitments, &available,
+            vec![Tx::Avail(avail_tx)], vec![]);
+        chain.apply_block(&block2, &mut balances, &mut nonces, &mut commitments, &mut available).unwrap();
+
+        // 3) advance two empty blocks
         for _ in 0..2 {
-            let b = build_block(
-                &chain,
-                &signer,
-                &balances,
-                &nonces,
-                &commitments,
-                &available,
-                vec![],
-                vec![],
-            );
-            chain
-                .apply_block(&b, &mut balances, &mut nonces, &mut commitments, &mut available)
-                .unwrap();
+        let b = build_block_vortex_ok(&chain, &signer, &balances, &nonces, &commitments, &available,
+        vec![], vec![]);
+        chain.apply_block(&b, &mut balances, &mut nonces, &mut commitments, &mut available).unwrap();
         }
         assert_eq!(chain.height, 4);
 
-        // build a block without the required reveal
-        let mut block5 = Block {
-            header: BlockHeader {
-                parent_hash: chain.tip_hash,
-                height: chain.height + 1,
-                txs_root: [0u8; 32],
-                receipts_root: [0u8; 32],
-                gas_used: 0,
-                randomness: chain.tip_hash,
-                reveal_set_root: [0u8; 32],
-                il_root: [0u8; 32],
-                exec_base_fee: chain.fee_state.exec_base,
-                commit_base_fee: chain.fee_state.commit_base,
-                avail_base_fee: chain.fee_state.avail_base,
-                timestamp: 0,
-                slot: 0,
-                epoch: 0,
-                proposer_id: 1,
-                signature: [0u8; 64],
-            },
-            transactions: vec![],
-            reveals: vec![],
-        };
-
-        let preimage = header_signing_bytes(&block5.header);
-        block5.header.signature = signer.sign(&preimage).to_bytes();
-
-        let res = chain.apply_block(
-            &block5,
-            &mut balances,
-            &mut nonces,
-            &mut commitments,
-            &mut available,
-        );
+        // 4) missing reveal block — use RAW helper (no STF simulation)
+        let block5 = build_block_vortex_raw(&chain, &signer, vec![], vec![]);
+        let res = chain.apply_block(&block5, &mut balances, &mut nonces, &mut commitments, &mut available);
         assert!(matches!(res, Err(BlockError::IntrinsicInvalid(msg)) if msg.contains("missing required reveal")));
         assert_eq!(chain.height, 4);
     }
@@ -1234,46 +1481,62 @@ mod tests {
         let signer = SigningKey::from_bytes(&[11u8; 32]);
         let mut chain = Chain::new();
         init_chain_with_validator(&mut chain, &signer);
-        let mut balances = Balances::default();
-        let mut nonces = Nonces::default();
+    
+        let mut balances    = Balances::default();
+        let mut nonces      = Nonces::default();
         let mut commitments = Commitments::default();
-        let mut available = Available::default();
-
+        let mut available   = Available::default();
+    
         let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
         balances.insert(sender.clone(), 1_000);
-
+    
         let tx = Transaction::transfer(&sender, &addr(1), 10, 0);
         let salt = [2u8; 32];
         let (commit, c_hash) = make_commit(&signer, &tx, salt);
         let avail = make_avail(&signer, c_hash);
-
-        // commit and avail included in the same block (avail too early)
+    
+        // --- VORTEX (VRF) header fields ---
+        let height = chain.height + 1;
+        let slot   = height; // dev policy: one block per slot
+        let epoch  = chain.clock.current_epoch(slot);
+    
+        let bundle_len: u8 = DEFAULT_BUNDLE_LEN;
+    
+        let proposer_id: u64 = 1;
+        let (vrf_output, vrf_preout, vrf_proof) = fake_vrf_fields(proposer_id);
+    
         let mut block = Block {
             header: BlockHeader {
-                parent_hash: chain.tip_hash,
-                height: chain.height + 1,
-                txs_root: [0u8; 32],
-                receipts_root: [0u8; 32],
-                gas_used: 0,
-                randomness: chain.tip_hash,
+                parent_hash:     chain.tip_hash,
+                height,
+                txs_root:        [0u8; 32],
+                receipts_root:   [0u8; 32],
+                gas_used:        0,
+                randomness:      chain.tip_hash,
                 reveal_set_root: [0u8; 32],
-                il_root: [0u8; 32],
-                exec_base_fee: chain.fee_state.exec_base,
+                il_root:         [0u8; 32],
+                exec_base_fee:   chain.fee_state.exec_base,
                 commit_base_fee: chain.fee_state.commit_base,
-                avail_base_fee: chain.fee_state.avail_base,
-                timestamp: 0,
-                slot: 0,
-                epoch: 0,
-                proposer_id: 1,
+                avail_base_fee:  chain.fee_state.avail_base,
+                timestamp:       0,
+                slot,
+                epoch,
+                proposer_id,
+                bundle_len,
+                vrf_output,
+                vrf_proof,
+                vrf_preout,
                 signature: [0u8; 64],
             },
+            // Commit and Avail in the SAME block → Avail is too early and must be rejected
             transactions: vec![Tx::Commit(commit), Tx::Avail(avail)],
             reveals: vec![],
         };
-
+    
+        // Sign after all header fields are set (including VRF fields)
         let preimage = header_signing_bytes(&block.header);
         block.header.signature = signer.sign(&preimage).to_bytes();
-
+    
         let res = chain.apply_block(
             &block,
             &mut balances,
@@ -1281,6 +1544,7 @@ mod tests {
             &mut commitments,
             &mut available,
         );
+    
         assert!(matches!(res, Err(BlockError::IntrinsicInvalid(msg)) if msg.contains("avail outside valid window")));
         assert!(available.is_empty());
         assert_eq!(chain.height, 0);

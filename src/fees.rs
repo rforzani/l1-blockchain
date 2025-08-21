@@ -158,6 +158,8 @@ pub fn update_exec_base(
 
 #[cfg(test)]
 mod tests {
+    use crate::chain::DEFAULT_BUNDLE_LEN;
+    use crate::crypto::vrf::{build_vrf_msg, SchnorrkelVrfSigner, VrfSigner};
     use crate::fees::{split_amount, update_exec_base, FeeSplitBps, FEE_PARAMS, FeeState};
     use crate::stf::process_commit;
     use crate::state::{Balances, Commitments, CHAIN_ID};
@@ -373,27 +375,65 @@ mod tests {
 
     #[test]
     fn block_hash_changes_with_proposer() {
-        let mut header = BlockHeader {
-            parent_hash: [1u8; 32],
-            height: 1,
-            txs_root: [0u8; 32],
-            receipts_root: [0u8; 32],
-            gas_used: 0,
-            randomness: [0u8; 32],
-            reveal_set_root: [0u8; 32],
-            il_root: [0u8; 32],
-            exec_base_fee: 0,
-            commit_base_fee: 0,
-            avail_base_fee: 0,
-            timestamp: 0,
-            slot: 0,
-            epoch: 0,
-            proposer_id: 1,
-            signature: [0u8; 64],
+        use crate::chain::DEFAULT_BUNDLE_LEN;
+
+        // Deterministic epoch/slot metadata for the test (not used by this assertion)
+        let epoch_seed = [7u8; 32];
+        let slot: u64 = 0;
+        let epoch: u64 = 0;
+        let bundle_len = DEFAULT_BUNDLE_LEN;
+
+        // Helper: synthesize VRF-looking fields deterministically from proposer_id
+        fn fake_vrf_fields(proposer_id: u64) -> ([u8; 32], [u8; 32], Vec<u8>) {
+            let mut m = Vec::with_capacity(16 + 8);
+            m.extend_from_slice(b"fake-vrf-preout");
+            m.extend_from_slice(&proposer_id.to_be_bytes());
+            let preout = hash_bytes_sha256(&m);
+        
+            let out = hash_bytes_sha256(&preout);
+        
+            let mut proof = Vec::with_capacity(33);
+            proof.extend_from_slice(&preout);
+            proof.push(0x01);
+        
+            (out, preout, proof)
+        }
+
+        // Constructor that fills Vortex fields (non-empty proof => Vortex path),
+        // while keeping other fields identical.
+        let mut mk_header = |proposer_id: u64| {
+            let (vrf_output, vrf_preout, vrf_proof) = fake_vrf_fields(proposer_id);
+            BlockHeader {
+                parent_hash:     [1u8; 32],
+                height:          1,
+                txs_root:        [0u8; 32],
+                receipts_root:   [0u8; 32],
+                gas_used:        0,
+                randomness:      [0u8; 32],
+                reveal_set_root: [0u8; 32],
+                il_root:         [0u8; 32],
+                exec_base_fee:   0,
+                commit_base_fee: 0,
+                avail_base_fee:  0,
+                timestamp:       0,
+                slot,
+                epoch,
+                proposer_id,
+                bundle_len,
+                vrf_output,
+                vrf_proof,
+                vrf_preout,
+                signature:       [0u8; 64],
+            }
         };
-        let h1 = hash_bytes_sha256(&header_bytes(&header));
-        header.proposer_id = 2;
-        let h2 = hash_bytes_sha256(&header_bytes(&header));
-        assert_ne!(h1, h2);
+
+        let h1 = mk_header(1);
+        let h2 = mk_header(2);
+
+        // Hash the serialized header preimage (or header_signing_bytes if that’s your canonical hash)
+        let d1 = hash_bytes_sha256(&header_bytes(&h1));
+        let d2 = hash_bytes_sha256(&header_bytes(&h2));
+
+        assert_ne!(d1, d2);
     }
 }

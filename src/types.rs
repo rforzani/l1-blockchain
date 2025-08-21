@@ -73,7 +73,11 @@ pub struct BlockHeader {
     pub slot: u64,
     pub epoch: u64,
     pub proposer_id: ValidatorId,
-    pub signature: [u8; 64]
+    pub signature: [u8; 64],
+    pub bundle_len: u8,         
+    pub vrf_preout: [u8; 32],
+    pub vrf_output: [u8; 32],    // hash(preout) or preout hash-derived 32 bytes
+    pub vrf_proof:  Vec<u8>,     // schnorrkel::VRFProof serialized
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

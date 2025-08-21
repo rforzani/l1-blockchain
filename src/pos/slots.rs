@@ -67,7 +67,7 @@ impl SlotClock {
     }
 
     #[inline]
-    pub fn bundle_start(slot: u64, bundle_len: u8) -> u64 {
+    pub fn bundle_start(&self, slot: u64, bundle_len: u8) -> u64 {
         let r = bundle_len.max(1) as u64;
         slot - (slot % r)
     }

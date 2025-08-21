@@ -118,13 +118,13 @@ fn put_access_list(v: &mut Vec<u8>, al: &AccessList) {
 pub fn header_signing_bytes(h: &BlockHeader) -> Vec<u8> {
     let mut v = vec![CODEC_VERSION];
     v.extend_from_slice(DOM_HDR);
-    
+
     v.extend_from_slice(&h.parent_hash);
     put_u64(&mut v, h.height);
     v.extend_from_slice(&h.txs_root);
     v.extend_from_slice(&h.receipts_root);
     put_u64(&mut v, h.gas_used);
-    v.extend_from_slice(&h.randomness);       
+    v.extend_from_slice(&h.randomness);
     v.extend_from_slice(&h.reveal_set_root);
     v.extend_from_slice(&h.il_root);
     put_u64(&mut v, h.exec_base_fee);
@@ -134,6 +134,13 @@ pub fn header_signing_bytes(h: &BlockHeader) -> Vec<u8> {
     put_u64(&mut v, h.slot);
     put_u64(&mut v, h.epoch);
     put_u64(&mut v, h.proposer_id);
+
+    // --- Vortex PoS fields ---
+    v.push(h.bundle_len);                 
+    v.extend_from_slice(&h.vrf_preout);
+    v.extend_from_slice(&h.vrf_output);        
+    put_u64(&mut v, h.vrf_proof.len() as u64);
+    v.extend_from_slice(&h.vrf_proof);
 
     v
 }
@@ -158,6 +165,13 @@ pub fn header_bytes(h: &BlockHeader) -> Vec<u8> {
     put_u64(&mut v, h.epoch);
     put_u64(&mut v, h.proposer_id);
     v.extend_from_slice(&h.signature);
+
+    // --- Vortex PoS fields ---
+    v.push(h.bundle_len);           
+    v.extend_from_slice(&h.vrf_preout);      
+    v.extend_from_slice(&h.vrf_output);        
+    put_u64(&mut v, h.vrf_proof.len() as u64);
+    v.extend_from_slice(&h.vrf_proof);
 
     v
 }

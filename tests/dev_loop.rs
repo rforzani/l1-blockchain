@@ -1,9 +1,10 @@
 use std::sync::{Arc, Mutex};
 use l1_blockchain::consensus::dev_loop::{DevLoop, DevLoopConfig, DEFAULT_LIMITS, DevNode};
-use l1_blockchain::crypto::vrf::SchnorrkelVrfSigner;
+use l1_blockchain::crypto::hash_bytes_sha256;
+use l1_blockchain::crypto::vrf::{build_vrf_msg, SchnorrkelVrfSigner, VrfSigner};
 use l1_blockchain::mempool::{BlockSelectionLimits, MempoolConfig, MempoolImpl};
 use l1_blockchain::node::{BuiltBlock, SelectedIds, ProduceError, Node};
-use l1_blockchain::chain::{ApplyResult, Chain};
+use l1_blockchain::chain::{ApplyResult, Chain, DEFAULT_BUNDLE_LEN};
 use l1_blockchain::state::{Balances, Nonces, Commitments, Available};
 use l1_blockchain::types::{Block, BlockHeader, Tx, RevealTx};
 use ed25519_dalek::SigningKey;
@@ -32,26 +33,50 @@ impl DevNode for FakeNode {
         st.ticks += 1;
         let h = st.height;
         st.heights.push(h);
+
+        // Vortex-only header fields
+        let slot        = h;                  // dev policy: one block per slot
+        let epoch       = 0;                  // keep 0 for fake/test node
+        let proposer_id = 1;                  // single fake validator
+        let bundle_len  = DEFAULT_BUNDLE_LEN; // constant used across codebase
+        let vrf_output = [0xAAu8; 32];
+        let vrf_preout = [0xAAu8; 32];
+        let vrf_proof  = vec![0xBB];
+
         let header = BlockHeader {
-            parent_hash: [0u8;32],
-            height: st.height,
-            txs_root: [0u8;32],
-            receipts_root: [0u8;32],
-            gas_used: 0,
-            randomness: [0u8;32],
+            parent_hash:     [0u8;32],
+            height:          h,
+            txs_root:        [0u8;32],
+            receipts_root:   [0u8;32],
+            gas_used:        0,
+            randomness:      [0u8;32],
             reveal_set_root: [0u8;32],
-            il_root: [0u8;32],
-            exec_base_fee: 0,
+            il_root:         [0u8;32],
+            exec_base_fee:   0,
             commit_base_fee: 0,
-            avail_base_fee: 0,
-            timestamp: 0,
-            slot: 0,
-            epoch: 0,
-            proposer_id: 1,
+            avail_base_fee:  0,
+            timestamp:       0,
+            slot,
+            epoch,
+            proposer_id,
+            bundle_len,
+            vrf_output,
+            vrf_proof,
+            vrf_preout,
             signature: [0u8;64],
         };
-        let block = Block { transactions: Vec::<Tx>::new(), reveals: Vec::<RevealTx>::new(), header };
-        let built = BuiltBlock { block, selected_ids: SelectedIds { commit: vec![], avail: vec![], reveal: vec![] } };
+
+        let block = Block {
+            transactions: Vec::<Tx>::new(),
+            reveals:      Vec::<RevealTx>::new(),
+            header,
+        };
+
+        let built = BuiltBlock {
+            block,
+            selected_ids: SelectedIds { commit: vec![], avail: vec![], reveal: vec![] }
+        };
+
         let apply = ApplyResult {
             receipts: vec![],
             gas_total: 0,
@@ -60,6 +85,7 @@ impl DevNode for FakeNode {
             commits_used: 0,
             burned_total: 0,
         };
+
         Ok((built, apply))
     }
 
@@ -279,30 +305,63 @@ impl DevNode for BadSigNode {
 
     fn produce_block(&mut self, _limits: BlockSelectionLimits) -> Result<(BuiltBlock, ApplyResult), ProduceError> {
         let mut chain = self.chain.lock().unwrap();
-        let header = BlockHeader {
-            parent_hash: chain.tip_hash,
-            height: chain.height + 1,
-            txs_root: [0u8;32],
-            receipts_root: [0u8;32],
-            gas_used: 0,
-            randomness: [0u8;32],
-            reveal_set_root: [0u8;32],
-            il_root: [0u8;32],
-            exec_base_fee: 0,
-            commit_base_fee: 0,
-            avail_base_fee: 0,
-            timestamp: 0,
-            slot: 0,
-            epoch: 0,
-            proposer_id: 1,
-            signature: [0u8;64], // invalid signature
+
+        // Vortex-only header fields
+        let height       = chain.height + 1;
+        let slot: u64    = height; // strict dev policy
+        let epoch: u64   = chain.clock.current_epoch(slot);
+        let bundle_len: u8 = DEFAULT_BUNDLE_LEN;
+        let bundle_start = chain.clock.bundle_start(slot, bundle_len);
+        let proposer_id: u64 = 1;
+
+        // Produce VRF fields that match the validator set’s deterministic vrf_pubkey
+        // (same seed used by init_chain_with_validator)
+        let vrf_seed = hash_bytes_sha256(b"l1-blockchain/test-vrf-seed:v1");
+        let vrf_signer = SchnorrkelVrfSigner::from_deterministic_seed(vrf_seed);
+        let (vrf_output, vrf_preout, vrf_proof) = {
+            let msg = build_vrf_msg(&chain.epoch_seed, bundle_start, proposer_id);
+            vrf_signer.vrf_prove(&msg)
         };
+
+        // Intentionally INVALID ed25519 signature (all zeros)
+        let bad_sig = [0u8; 64];
+
+        let header = BlockHeader {
+            parent_hash:     chain.tip_hash,
+            height,
+            txs_root:        [0u8;32],
+            receipts_root:   [0u8;32],
+            gas_used:        0,
+            randomness:      [0u8;32],
+            reveal_set_root: [0u8;32],
+            il_root:         [0u8;32],
+            exec_base_fee:   0,
+            commit_base_fee: 0,
+            avail_base_fee:  0,
+            timestamp:       0,
+            slot,
+            epoch,
+            proposer_id,
+            bundle_len,
+            vrf_output,
+            vrf_proof,
+            vrf_preout,
+            // invalid signature on purpose
+            signature: bad_sig,
+        };
+
         let block = Block { header, transactions: vec![], reveals: vec![] };
-        let built = BuiltBlock { block: block.clone(), selected_ids: SelectedIds { commit: vec![], avail: vec![], reveal: vec![] } };
-        let mut balances = Balances::default();
-        let mut nonces = Nonces::default();
+        let built  = BuiltBlock {
+            block: block.clone(),
+            selected_ids: SelectedIds { commit: vec![], avail: vec![], reveal: vec![] }
+        };
+
+        // Apply should fail at header signature verification
+        let mut balances    = Balances::default();
+        let mut nonces      = Nonces::default();
         let mut commitments = Commitments::default();
-        let mut available = Available::default();
+        let mut available   = Available::default();
+
         chain
             .apply_block(&block, &mut balances, &mut nonces, &mut commitments, &mut available)
             .map(|apply| (built, apply))
@@ -335,30 +394,59 @@ impl DevNode for WrongParentNode {
 
     fn produce_block(&mut self, _limits: BlockSelectionLimits) -> Result<(BuiltBlock, ApplyResult), ProduceError> {
         let mut chain = self.chain.lock().unwrap();
+
+        // Vortex-only timing/identity
+        let height       = chain.height + 1;
+        let slot: u64    = height; // dev: one block per slot
+        let epoch: u64   = chain.clock.current_epoch(slot);
+        let bundle_len: u8 = DEFAULT_BUNDLE_LEN;
+        let bundle_start = chain.clock.bundle_start(slot, bundle_len);
+        let proposer_id: u64 = 1;
+
+        // VRF fields consistent with the validator set used by init_chain_with_validator()
+        let vrf_seed   = hash_bytes_sha256(b"l1-blockchain/test-vrf-seed:v1");
+        let vrf        = SchnorrkelVrfSigner::from_deterministic_seed(vrf_seed);
+        let (vrf_output, vrf_preout, vrf_proof) = {
+            let msg = build_vrf_msg(&chain.epoch_seed, bundle_start, proposer_id);
+            vrf.vrf_prove(&msg)
+        };
+
+        // Intentionally wrong parent hash
         let header = BlockHeader {
-            parent_hash: [1u8;32], // wrong parent
-            height: chain.height + 1,
-            txs_root: [0u8;32],
-            receipts_root: [0u8;32],
-            gas_used: 0,
-            randomness: [0u8;32],
+            parent_hash:     [1u8;32], // WRONG parent on purpose
+            height,
+            txs_root:        [0u8;32],
+            receipts_root:   [0u8;32],
+            gas_used:        0,
+            randomness:      [0u8;32],
             reveal_set_root: [0u8;32],
-            il_root: [0u8;32],
-            exec_base_fee: 0,
+            il_root:         [0u8;32],
+            exec_base_fee:   0,
             commit_base_fee: 0,
-            avail_base_fee: 0,
-            timestamp: 0,
-            slot: 0,
-            epoch: 0,
-            proposer_id: 1,
+            avail_base_fee:  0,
+            timestamp:       0,
+            slot,
+            epoch,
+            proposer_id,
+            bundle_len,
+            vrf_output,
+            vrf_proof,
+            vrf_preout,
             signature: [0u8;64],
         };
+
         let block = Block { header, transactions: vec![], reveals: vec![] };
-        let built = BuiltBlock { block: block.clone(), selected_ids: SelectedIds { commit: vec![], avail: vec![], reveal: vec![] } };
-        let mut balances = Balances::default();
-        let mut nonces = Nonces::default();
+        let built = BuiltBlock {
+            block: block.clone(),
+            selected_ids: SelectedIds { commit: vec![], avail: vec![], reveal: vec![] }
+        };
+
+        // Try to apply; expect failure due to wrong parent
+        let mut balances    = Balances::default();
+        let mut nonces      = Nonces::default();
         let mut commitments = Commitments::default();
-        let mut available = Available::default();
+        let mut available   = Available::default();
+
         chain
             .apply_block(&block, &mut balances, &mut nonces, &mut commitments, &mut available)
             .map(|apply| (built, apply))

@@ -72,15 +72,27 @@ pub fn verify_block_roots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{AccessList, Block, BlockHeader, CommitTx, ExecOutcome, Receipt, Tx};
+    use crate::{chain::DEFAULT_BUNDLE_LEN, types::{AccessList, Block, BlockHeader, CommitTx, ExecOutcome, Receipt, Tx}};
+
+    fn fake_vrf_fields(proposer_id: u64) -> ([u8; 32], [u8; 32], Vec<u8>) {
+        let mut m = Vec::with_capacity(16 + 8);
+        m.extend_from_slice(b"fake-vrf-preout");
+        m.extend_from_slice(&proposer_id.to_be_bytes());
+        let preout = hash_bytes_sha256(&m);
+    
+        let out = hash_bytes_sha256(&preout);
+    
+        let mut proof = Vec::with_capacity(33);
+        proof.extend_from_slice(&preout);
+        proof.push(0x01);
+    
+        (out, preout, proof)
+    }
 
     #[test]
     fn verify_block_roots_catches_tamper() {
         // Build a block with one commit transaction and its receipt
-        let al = AccessList {
-            reads: vec![],
-            writes: vec![],
-        };
+        let al = AccessList { reads: vec![], writes: vec![] };
         let commit = CommitTx {
             commitment: [1u8; 32],
             sender: "alice".into(),
@@ -89,46 +101,67 @@ mod tests {
             pubkey: [3u8; 32],
             sig: [4u8; 64],
         };
-
+    
         let txs = vec![Tx::Commit(commit)];
+    
+        // --- VORTEX (VRF) FIELDS ---
+        // For this unit test, we synthesize deterministic VRF data.
+        // Policy: slot == height (dev), epoch 0. Bundle length = DEFAULT_BUNDLE_LEN.
+        let height: u64 = 1;
+        let slot:   u64 = height;
+        let epoch:  u64 = 0;
+        let r: u8 = DEFAULT_BUNDLE_LEN;
+    
+        // Proposer identity for the header
+        let proposer_id: u64 = 1;
+    
+        let (vrf_output, vrf_preout, vrf_proof) = fake_vrf_fields(proposer_id);
+    
+        // Header with Vortex fields populated (signature not needed for root checks)
         let header = BlockHeader {
-            parent_hash: [0u8; 32],
-            height: 1,
-            txs_root: [0u8; 32],
-            receipts_root: [0u8; 32],
-            gas_used: 0,
-            randomness: [0u8; 32],
+            parent_hash:     [0u8; 32],
+            height,
+            txs_root:        [0u8; 32],
+            receipts_root:   [0u8; 32],
+            gas_used:        0,
+            randomness:      [0u8; 32],
             reveal_set_root: [0u8; 32],
-            il_root: [0u8; 32],
-            exec_base_fee: 0,
+            il_root:         [0u8; 32],
+            exec_base_fee:   0,
             commit_base_fee: 0,
-            avail_base_fee: 0,
-            timestamp: 0,
-            slot: 0,
-            epoch: 0,
-            proposer_id: 1,
+            avail_base_fee:  0,
+            timestamp:       0,
+            slot,
+            epoch,
+            proposer_id,
+            bundle_len:  r,
+            vrf_output,
+            vrf_proof,
+            vrf_preout,
             signature: [0u8; 64],
         };
-
+    
         let mut block = Block::new(txs, header);
+    
+        // One matching receipt initially
         let mut receipts = vec![Receipt {
             outcome: ExecOutcome::Success,
             gas_used: 0,
             error: None,
         }];
-
+    
         // Compute the correct roots and embed them in the header
         let (tx_root, receipt_root, reveal_root) = compute_roots_for(&block, &receipts);
-        block.header.txs_root = tx_root;
-        block.header.receipts_root = receipt_root;
+        block.header.txs_root        = tx_root;
+        block.header.receipts_root   = receipt_root;
         block.header.reveal_set_root = reveal_root;
-
-        // Sanity check: verification passes with matching receipts
+    
+        // Sanity: passes when receipts match
         assert!(verify_block_roots(&block.header, &block, &receipts).is_ok());
-
-        // Tamper with the receipts after the header roots were set
+    
+        // Tamper with receipts AFTER roots are embedded
         receipts[0].gas_used = 1;
-
+    
         // Now verification should fail due to mismatched receipts_root
         assert!(verify_block_roots(&block.header, &block, &receipts).is_err());
     }
