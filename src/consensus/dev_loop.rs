@@ -31,6 +31,8 @@ impl<N> DevLoop<N> where N: DevNode {
     fn tick_once(&mut self) -> bool {
         let start = Instant::now();
         let before = self.node.height();
+        println!("Height Before Block Build: {}", before);
+        
         let res : Result<(BuiltBlock, ApplyResult), ProduceError> = self.node.produce_block(self.cfg.limits.clone());
 
         match &res {
