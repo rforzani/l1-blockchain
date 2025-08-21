@@ -5,12 +5,15 @@ use crate::mempool::{BalanceView, BlockSelectionLimits, CommitmentId, Mempool, M
 use crate::state::{Balances, Nonces, Commitments, Available};
 use crate::chain::{ApplyResult, Chain};
 use crate::stf::process_block;
-use crate::types::{Address, Block, Hash};
+use crate::types::{Block, Hash};
 use std::sync::Arc;
 use ed25519_dalek::{SigningKey, Signer};
-use crate::crypto::{addr_from_pubkey, addr_hex};
+use crate::crypto::{addr_from_pubkey, addr_hex, hash_bytes_sha256};
 use crate::codec::header_signing_bytes;
 use std::time::{SystemTime, UNIX_EPOCH};
+use crate::pos::registry::{StakingConfig, Validator, ValidatorId, ValidatorSet, ValidatorStatus};
+use crate::pos::schedule::ProposerSchedule;
+use crate::pos::slots::SlotClock;
 
 pub struct StateBalanceView<'a> {
     balances: &'a Balances,
@@ -38,7 +41,12 @@ pub struct BuiltBlock {
 #[derive(Debug)]
 pub enum ProduceError {
     Selection(SelectError),
-    HeaderBuild(String)
+    HeaderBuild(String),
+    NotProposer {
+        slot: u64,
+        leader: Option<ValidatorId>,
+        mine: Option<ValidatorId>,
+    },
 }
 
 pub struct Node {
@@ -110,10 +118,53 @@ impl Node {
         }
     }
 
+    pub fn install_self_as_genesis_validator(&mut self, id: ValidatorId, stake: u128) {
+        let cfg = StakingConfig {
+            min_stake: 1,              // tests/devnets can choose any positive stake
+            unbonding_epochs: 1,
+            max_validators: u32::MAX,
+        };
+
+        let v = Validator {
+            id,
+            ed25519_pubkey: self.proposer_pubkey,
+            bls_pubkey: None,
+            stake,
+            status: ValidatorStatus::Active,
+        };
+
+        let set = ValidatorSet::from_genesis(0, &cfg, vec![v]);
+        let seed = hash_bytes_sha256(b"l1-blockchain/test-epoch-seed:v1");
+
+        // one-time bootstrap; panics if called after height > 0 or if already initialized
+        self.chain.init_genesis(set, seed);
+    }
+
     #[inline]
     fn now_ts() -> u64 {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
     }
+
+    /// Look up our ValidatorId in the current validator set by matching the ed25519 pubkey.
+    /// Returns None if we are not part of the active snapshot.
+    fn my_validator_id(&self) -> Option<ValidatorId> {
+        // validator_set.validators is sorted by id; pubkeys are unique by construction
+        self.chain.validator_set.validators.iter()
+            .find(|v| v.ed25519_pubkey == self.proposer_pubkey)
+            .map(|v| v.id)
+    }
+
+       /// Build a deterministic per-block randomness value bound to epoch seed, tip hash, height and slot.
+       #[inline]
+       fn derive_block_randomness(&self, next_height: u64, slot: u64) -> [u8; 32] {
+           let mut buf = Vec::with_capacity(32 + 32 + 8 + 8 + 24);
+           buf.extend_from_slice(b"l1-blockchain/block-randomness:v1");
+           buf.extend_from_slice(&self.chain.epoch_seed);
+           buf.extend_from_slice(&self.chain.tip_hash);
+           buf.extend_from_slice(&next_height.to_le_bytes());
+           buf.extend_from_slice(&slot.to_le_bytes());
+           hash_bytes_sha256(&buf)
+        }
 
     pub fn height(&self) -> u64 {
         self.chain.height
@@ -151,6 +202,29 @@ impl Node {
         &self,
         limits: BlockSelectionLimits,
     ) -> Result<(BuiltBlock, ApplyResult, Balances, Nonces, Commitments, Available, u64), ProduceError> {
+        // ---- PoS gating & deterministic metadata ----
+        // Use slot clock for deterministic slot/epoch; refuse if we’re not the leader.
+        let now_ms = (Self::now_ts() as u128) * 1000;
+        let slot   = self.chain.clock.current_slot(now_ms);
+        let epoch  = self.chain.clock.current_epoch(slot);
+
+        // Who is scheduled?
+        let scheduled = self.chain.schedule.leader_for_slot(slot);
+
+        // Who are we?
+        let my_id = self.my_validator_id();
+
+        // Refuse to produce if no leader or if we are not the leader for this slot.
+        if scheduled.is_none() || scheduled != my_id {
+            return Err(ProduceError::NotProposer {
+                slot,
+                leader: scheduled,
+                mine: my_id,
+            });
+        }
+        let proposer_id = my_id.expect("checked above");
+
+
         // 0) Prune stale items before building any view or selecting.
         if self.chain.height > 0 {
             self.mempool.evict_stale(self.chain.height);
@@ -171,6 +245,13 @@ impl Node {
 
         let next_height = self.chain.height + 1;
 
+        // Deterministic timestamp: start of the slot, not wall-clock
+        let ts_ms = self.chain.clock.slot_start_unix(slot);
+        let ts_sec = (ts_ms / 1000) as u64;
+
+        // Per-block randomness committed in header (chain updates its accumulator after apply)
+        let randomness = self.derive_block_randomness(next_height, slot);
+
         // 3) Build a block with an unsigned header carrying only fields the STF needs (height).
         //    Roots and gas_used will be computed by STF below and then written into the header.
         let mut block = crate::types::Block {
@@ -181,13 +262,16 @@ impl Node {
                 txs_root:        [0u8; 32], // filled after STF run
                 receipts_root:   [0u8; 32], // filled after STF run
                 gas_used:        0,         // filled after STF run
-                randomness:      self.chain.tip_hash, // or your randomness source
+                randomness:      randomness,
                 reveal_set_root: [0u8; 32], // filled after STF run
                 il_root:         [0u8; 32], // filled after STF run
                 exec_base_fee:   self.chain.fee_state.exec_base,
                 commit_base_fee: self.chain.fee_state.commit_base,
                 avail_base_fee:  self.chain.fee_state.avail_base,
-                timestamp:       Self::now_ts(),
+                timestamp:       ts_sec,
+                slot,
+                epoch,
+                proposer_id,
                 signature:       [0u8; 64], // filled after signing below
             },
             transactions: cand.txs.clone(),
@@ -418,14 +502,20 @@ mod tests {
         };
         let mp = MempoolImpl::new(cfg);
         let mut node = Node::new(mp.clone(), SigningKey::from_bytes(&[2u8; 32]));
+    
+        // install this node as the epoch-0 validator (production path via init_genesis)
+        node.install_self_as_genesis_validator(1, 1_000_000);
+    
         let bv = TestBalanceView;
         let tx_sk = SigningKey::from_bytes(&[4u8; 32]);
         let sender = addr_hex(&addr_from_pubkey(&tx_sk.verifying_key().to_bytes()));
         node.set_balance(sender.clone(), 1000);
         let (c, _r) = make_pair(&tx_sk, 0);
         mp.insert_commit(Tx::Commit(c.clone()), 0, 1, &bv, &FeeState::from_defaults()).unwrap();
+    
         let limits = BlockSelectionLimits { max_avails: 10, max_reveals: 10, max_commits: 10 };
         node.produce_block(limits).expect("produce");
+    
         assert_eq!(node.height(), 1);
         assert_eq!(node.balance_of(&sender), 999);
         assert!(node.chain.commit_on_chain(&c.commitment));
@@ -443,15 +533,22 @@ mod tests {
         };
         let mp = MempoolImpl::new(cfg);
         let mut node = Node::new(mp.clone(), SigningKey::from_bytes(&[3u8; 32]));
+    
+        // NEW: make this node an active validator in the chain's validator set.
+        node.install_self_as_genesis_validator(1, 1_000_000);
+    
         let bv = TestBalanceView;
         let tx_sk = SigningKey::from_bytes(&[5u8; 32]);
         let sender = addr_hex(&addr_from_pubkey(&tx_sk.verifying_key().to_bytes()));
         node.set_balance(sender.clone(), 1000);
         let (c, _r) = make_pair(&tx_sk, 0);
         mp.insert_commit(Tx::Commit(c), 0, 1, &bv, &FeeState::from_defaults()).unwrap();
+    
         PROCESS_BLOCK_CALLS.with(|c| c.set(0));
         let limits = BlockSelectionLimits { max_avails: 10, max_reveals: 10, max_commits: 10 };
+    
         node.produce_block(limits).unwrap();
+    
         PROCESS_BLOCK_CALLS.with(|c| assert_eq!(c.get(), 1));
     }
 }

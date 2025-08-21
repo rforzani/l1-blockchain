@@ -105,6 +105,9 @@ mod tests {
             commit_base_fee: 0,
             avail_base_fee: 0,
             timestamp: 0,
+            slot: 0,
+            epoch: 0,
+            proposer_id: 1,
             signature: [0u8; 64],
         };
 

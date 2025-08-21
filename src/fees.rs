@@ -387,10 +387,13 @@ mod tests {
             commit_base_fee: 0,
             avail_base_fee: 0,
             timestamp: 0,
+            slot: 0,
+            epoch: 0,
+            proposer_id: 1,
             signature: [0u8; 64],
         };
         let h1 = hash_bytes_sha256(&header_bytes(&header));
-        header.proposer_pubkey = [4u8; 32];
+        header.proposer_id = 2;
         let h2 = hash_bytes_sha256(&header_bytes(&header));
         assert_ne!(h1, h2);
     }

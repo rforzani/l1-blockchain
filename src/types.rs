@@ -1,5 +1,7 @@
 // src/types.rs
 
+use crate::pos::registry::ValidatorId;
+
 pub type Address = String;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +71,9 @@ pub struct BlockHeader {
     pub commit_base_fee: u64,
     pub avail_base_fee: u64,
     pub timestamp: u64,
+    pub slot: u64,
+    pub epoch: u64,
+    pub proposer_id: ValidatorId,
     pub signature: [u8; 64]
 }
 

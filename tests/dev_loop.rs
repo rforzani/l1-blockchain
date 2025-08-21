@@ -45,6 +45,9 @@ impl DevNode for FakeNode {
             commit_base_fee: 0,
             avail_base_fee: 0,
             timestamp: 0,
+            slot: 0,
+            epoch: 0,
+            proposer_id: 1,
             signature: [0u8;64],
         };
         let block = Block { transactions: Vec::<Tx>::new(), reveals: Vec::<RevealTx>::new(), header };
@@ -135,12 +138,19 @@ fn empty_mempool_produces_empty_blocks() {
     };
     let mp = MempoolImpl::new(cfg);
     let signer = SigningKey::from_bytes(&[1u8;32]);
-    let node = Node::new(mp, signer);
+
+    // make this node a valid proposer at genesis
+    let mut node = Node::new(mp, signer);
+    node.install_self_as_genesis_validator(1, 1_000_000); // production path via init_genesis
+
     let blocks = Arc::new(Mutex::new(Vec::new()));
     let rec = RecordingNode { inner: node, blocks: blocks.clone() };
+
     let cfg = DevLoopConfig { slot_ms: 1, limits: DEFAULT_LIMITS };
     let mut dl = DevLoop::new(rec, cfg);
+
     dl.run_for_slots(3);
+
     let b = blocks.lock().unwrap();
     assert_eq!(b.len(), 3);
     for (i, (txc, revc, h)) in b.iter().enumerate() {
@@ -279,6 +289,9 @@ impl DevNode for BadSigNode {
             commit_base_fee: 0,
             avail_base_fee: 0,
             timestamp: 0,
+            slot: 0,
+            epoch: 0,
+            proposer_id: 1,
             signature: [0u8;64], // invalid signature
         };
         let block = Block { header, transactions: vec![], reveals: vec![] };
@@ -333,6 +346,9 @@ impl DevNode for WrongParentNode {
             commit_base_fee: 0,
             avail_base_fee: 0,
             timestamp: 0,
+            slot: 0,
+            epoch: 0,
+            proposer_id: 1,
             signature: [0u8;64],
         };
         let block = Block { header, transactions: vec![], reveals: vec![] };

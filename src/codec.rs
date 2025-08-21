@@ -132,6 +132,9 @@ pub fn header_signing_bytes(h: &BlockHeader) -> Vec<u8> {
     put_u64(&mut v, h.commit_base_fee);
     put_u64(&mut v, h.avail_base_fee);
     put_u64(&mut v, h.timestamp);
+    put_u64(&mut v, h.slot);
+    put_u64(&mut v, h.epoch);
+    put_u64(&mut v, h.proposer_id);
 
     v
 }
@@ -153,6 +156,9 @@ pub fn header_bytes(h: &BlockHeader) -> Vec<u8> {
     put_u64(&mut v, h.commit_base_fee);
     put_u64(&mut v, h.avail_base_fee);
     put_u64(&mut v, h.timestamp);
+    put_u64(&mut v, h.slot);
+    put_u64(&mut v, h.epoch);
+    put_u64(&mut v, h.proposer_id);
     v.extend_from_slice(&h.signature);
 
     v

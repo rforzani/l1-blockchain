@@ -1,13 +1,21 @@
 //src/chain.rs
 
+use ed25519_dalek::{Verifier, VerifyingKey};
+
 use crate::codec::{header_bytes, header_signing_bytes};
 use crate::crypto::{addr_from_pubkey, addr_hex, hash_bytes_sha256, verify_ed25519};
 use crate::fees::{update_commit_base, update_exec_base, FeeState, FEE_PARAMS};
+use crate::pos::registry::{StakingConfig, ValidatorSet, ValidatorStatus};
+use crate::pos::schedule::{AliasSchedule, ProposerSchedule};
+use crate::pos::slots::SlotClock;
 use crate::stf::{process_block, BlockError};
 use crate::state::{Available, Balances, Commitments, Nonces, DECRYPTION_DELAY, REVEAL_WINDOW};
 use crate::types::{Block, Event, Hash, Receipt};
 use crate::verify::verify_block_roots;
 use std::collections::{HashMap, HashSet, BTreeMap};
+
+const DEFAULT_SLOT_MS: u64 = 1_000;     // 1s slots for dev;
+const DEFAULT_EPOCH_SLOTS: u64 = 1_024; // power-of-two for easy math
 
 pub struct Chain {
     pub tip_hash: Hash,
@@ -18,6 +26,11 @@ pub struct Chain {
     avail_included: HashSet<Hash>,
     avail_due: BTreeMap<u64, Vec<Hash>>,
     commit_deadline: HashMap<Hash, u64>,
+    pub clock: SlotClock,
+    pub epoch_seed: [u8; 32],
+    pub validator_set: ValidatorSet,
+    pub schedule: AliasSchedule,
+    pub epoch_accumulator: [u8; 32]
 }
 
 #[derive(Clone)]
@@ -32,8 +45,39 @@ pub struct ApplyResult {
 
 impl Chain {
     pub fn new() -> Self {
+        // 1) Clock: deterministic start at unix 0 keeps tests stable.
+        let clock = SlotClock {
+            genesis_unix_ms: 0,
+            slot_ms: DEFAULT_SLOT_MS,
+            epoch_slots: DEFAULT_EPOCH_SLOTS,
+        };
+
+        // 2) Epoch seed: real, deterministic seed (no randomness-in-codepath).
+        let epoch_seed = {
+            // bind to a fixed, namespaced tag so it can’t collide accidentally
+            hash_bytes_sha256(b"l1-blockchain/epoch-seed:genesis")
+        };
+
+        // 3) Empty validator set at epoch 0 (no proposers yet).
+        let staking_cfg = StakingConfig {
+            min_stake: 1,              // cannot activate with 0
+            unbonding_epochs: 1,       // safe baseline
+            max_validators: u32::MAX,  // no cap until governance sets one
+        };
+        let validator_set = ValidatorSet::from_genesis(0, &staking_cfg, Vec::new());
+
+        // 4) Prebuild alias schedule for epoch 0 with the current (empty) set.
+        let mut schedule = AliasSchedule { epoch: 0, epoch_slots: DEFAULT_EPOCH_SLOTS, leaders: Vec::new() };
+        schedule.rebuild(0, DEFAULT_EPOCH_SLOTS, &validator_set, epoch_seed);
+
+        let mut buf = Vec::with_capacity(64);
+        buf.extend_from_slice(b"l1-blockchain/epoch-accum/start:v1");
+        buf.extend_from_slice(&epoch_seed);
+        let epoch_accumulator = hash_bytes_sha256(&buf);
+
+        // 5) Return fully initialized Chain (PoS fields included)
         Self {
-            tip_hash: [0u8;32],
+            tip_hash: [0u8; 32],
             height: 0,
             fee_state: FeeState::from_defaults(),
             burned_total: 0,
@@ -41,7 +85,177 @@ impl Chain {
             avail_included: HashSet::new(),
             avail_due: BTreeMap::new(),
             commit_deadline: HashMap::new(),
+            clock,
+            epoch_seed,
+            validator_set,
+            schedule,
+            epoch_accumulator
         }
+    }
+
+    /// Install the initial validator set and seed at genesis.
+    /// Must be called before the first block (height == 0) and only once in production.
+    pub fn init_genesis(&mut self, set: ValidatorSet, seed: [u8; 32]) {
+        // Ensure we're truly at genesis and not re-initializing.
+        assert!(
+            self.height == 0,
+            "init_genesis: height must be 0 (got {})", self.height
+        );
+        assert!(
+            self.validator_set.validators.is_empty()
+                && self.validator_set.total_stake == 0
+                && self.validator_set.epoch == 0,
+            "init_genesis: validator set already initialized"
+        );
+        // The provided set can be any epoch (commonly 0). No “must advance” check here.
+        self.validator_set = set;
+        self.epoch_seed = seed;
+
+        // Build the proposer schedule for the provided epoch.
+        let epoch_slots = self.clock.epoch_slots;
+        self.schedule
+            .rebuild(self.validator_set.epoch, epoch_slots, &self.validator_set, self.epoch_seed);
+
+        // Initialize the per-epoch accumulator deterministically.
+        let mut buf = Vec::with_capacity(64);
+        buf.extend_from_slice(b"twinken/epoch-accum/start:v1");
+        buf.extend_from_slice(&self.epoch_seed);
+        self.epoch_accumulator = hash_bytes_sha256(&buf);
+    }
+
+    pub fn verify_header_proposer(&self, header: &crate::types::BlockHeader) -> Result<(), BlockError> {
+        // 1) Slot/height relationship (devnet policy: one block per slot, strictly next)
+        //    If your policy differs, adjust this check accordingly.
+        if header.height != self.height + 1 {
+            return Err(BlockError::WrongSlot);
+        }
+
+        // 2) Epoch must be consistent with configured slot clock
+        let expected_epoch = self.clock.current_epoch(header.slot);
+        if header.epoch != expected_epoch {
+            return Err(BlockError::WrongEpoch);
+        }
+
+        // (Optional but useful) ensure the slot is the “next” logical slot.
+        // If you allow gaps, relax/remove this.
+        let expected_slot = header.height; // 1:1 mapping in the dev loop
+        if header.slot != expected_slot {
+            return Err(BlockError::WrongSlot);
+        }
+
+        // 3) Scheduled leader for this slot must match header.proposer_id
+        let Some(scheduled) = self.schedule.leader_for_slot(header.slot) else {
+            return Err(BlockError::NotScheduledLeader);
+        };
+        if header.proposer_id != scheduled {
+            return Err(BlockError::NotScheduledLeader);
+        }
+
+        // 4) The proposer must exist and be Active in the validator set; key must match
+        let v = self
+            .validator_set
+            .get(header.proposer_id)
+            .ok_or(BlockError::NotScheduledLeader)?; // or a dedicated ProposerUnknown
+
+        if v.status != ValidatorStatus::Active {
+            return Err(BlockError::NotScheduledLeader);
+        }
+
+        if v.ed25519_pubkey != header.proposer_pubkey {
+            return Err(BlockError::ProposerKeyMismatch);
+        }
+
+        // 5) Verify the header signature against the canonical preimage
+        let preimage = header_signing_bytes(header);
+
+        let vk = VerifyingKey::from_bytes(&header.proposer_pubkey)
+            .map_err(|_| BlockError::BadSignature)?;
+
+        // ed25519-dalek 2.x: from_bytes returns Signature directly
+        let sig = ed25519_dalek::Signature::from_bytes(&header.signature);
+
+        vk.verify(&preimage, &sig)
+            .map_err(|_| BlockError::BadSignature)?;
+
+        Ok(())
+    }
+    
+    /// Advance the chain to a new epoch with a new validator snapshot and epoch seed.
+    /// Rebuilds the alias schedule deterministically for the new epoch and resets the
+    /// per-epoch randomness accumulator.
+    pub fn on_epoch_transition(&mut self, new_set: ValidatorSet, new_seed: [u8; 32]) {
+        // Sanity: epochs must advance monotonically by at least 1.
+        let prev_epoch = self.validator_set.epoch;
+        assert!(
+            new_set.epoch >= prev_epoch + 1,
+            "on_epoch_transition: epoch must advance (got {}, prev {})",
+            new_set.epoch,
+            prev_epoch
+        );
+
+        // Install the new validator set and seed.
+        self.validator_set = new_set;
+        self.epoch_seed = new_seed;
+
+        // Rebuild the proposer schedule for the new epoch.
+        // Note: schedule is epoch-local; global slot → leader lookup uses modulo epoch_slots.
+        let epoch_slots = self.clock.epoch_slots;
+        self.schedule
+            .rebuild(self.validator_set.epoch, epoch_slots, &self.validator_set, self.epoch_seed);
+
+        // Reset the per-epoch accumulator (used to derive the NEXT epoch seed).
+        // Domain-separated to avoid cross-protocol collisions.
+        let mut buf = Vec::with_capacity(64);
+        buf.extend_from_slice(b"l1-blockchain/epoch-accum/start:v1");
+        buf.extend_from_slice(&self.epoch_seed);
+        self.epoch_accumulator = hash_bytes_sha256(&buf);
+    }
+
+    /// Derive the next epoch's seed from the current epoch's seed and its final accumulator.
+    /// This is called at the epoch boundary, after processing the last block of the epoch.
+    /// The accumulator should have been updated via `update_randomness_with_block` each block.
+    pub fn next_epoch_seed(&self, last_epoch_accumulator: [u8; 32]) -> [u8; 32] {
+        // Mix in a few stable, ungameable values to prevent seed grinding:
+        //  - previous epoch seed (binds continuity)
+        //  - last epoch accumulator (binds to block/reveal outcomes)
+        //  - tip_hash and height (chain state commitment)
+        // Domain-separated label ensures uniqueness across uses.
+        let mut buf = Vec::with_capacity(1 + 32 + 32 + 32 + 8);
+        buf.extend_from_slice(b"l1-blockchain/epoch-seed/derive:v1");
+        buf.extend_from_slice(&self.epoch_seed);
+        buf.extend_from_slice(&last_epoch_accumulator);
+        buf.extend_from_slice(&self.tip_hash);
+        buf.extend_from_slice(&self.height.to_le_bytes());
+        hash_bytes_sha256(&buf)
+    }
+
+    /// Update the per-epoch randomness accumulator with data from the newly applied block header.
+    /// Call this *after* a block is verified/applied. The accumulator is later used to derive
+    /// the next epoch’s seed via `next_epoch_seed`.
+    pub fn update_randomness_with_block(&mut self, header: &crate::types::BlockHeader) {
+        // Mix multiple header commitments to reduce manipulatability:
+        //  - previous accumulator (chaining)
+        //  - reveal_set_root (commit–reveal outcomes)
+        //  - header.randomness (your per-block randomness input)
+        //  - txs_root and receipts_root (binds to executed contents)
+        //  - il_root (inclusion list / ordering constraint commitment)
+        //  - (optionally) gas_used and base fees to bind fee schedule evolution
+        let mut buf = Vec::with_capacity(1 + 32 * 6 + 8 * 4);
+        buf.extend_from_slice(b"l1-blockchain/epoch-accum/update:v1");
+        buf.extend_from_slice(&self.epoch_accumulator);
+        buf.extend_from_slice(&header.reveal_set_root);
+        buf.extend_from_slice(&header.randomness);
+        buf.extend_from_slice(&header.txs_root);
+        buf.extend_from_slice(&header.receipts_root);
+        buf.extend_from_slice(&header.il_root);
+
+        // Lightly bind fee evolution and gas tally to the accumulator (opaque to adversaries).
+        buf.extend_from_slice(&header.gas_used.to_le_bytes());
+        buf.extend_from_slice(&header.exec_base_fee.to_le_bytes());
+        buf.extend_from_slice(&header.commit_base_fee.to_le_bytes());
+        buf.extend_from_slice(&header.avail_base_fee.to_le_bytes());
+
+        self.epoch_accumulator = hash_bytes_sha256(&buf);
     }
 
     pub fn apply_block(
@@ -310,6 +524,9 @@ mod tests {
                 commit_base_fee: chain.fee_state.commit_base,
                 avail_base_fee: chain.fee_state.avail_base,
                 timestamp: 0,
+                slot: 0,
+                epoch: 0,
+                proposer_id: 1,
                 signature: [0u8; 64],
             },
             transactions,
@@ -758,6 +975,9 @@ mod tests {
                 commit_base_fee: chain.fee_state.commit_base,
                 avail_base_fee: chain.fee_state.avail_base,
                 timestamp: 0,
+                slot: 0,
+                epoch: 0,
+                proposer_id: 1,
                 signature: [0u8; 64],
             },
             transactions: txs,
@@ -808,6 +1028,9 @@ mod tests {
                 commit_base_fee: chain.fee_state.commit_base,
                 avail_base_fee: chain.fee_state.avail_base,
                 timestamp: 0,
+                slot: 0,
+                epoch: 0,
+                proposer_id: 1,
                 signature: [0u8; 64],
             },
             transactions: txs,
@@ -854,6 +1077,9 @@ mod tests {
                 commit_base_fee: chain.fee_state.commit_base,
                 avail_base_fee: chain.fee_state.avail_base,
                 timestamp: 0,
+                slot: 0,
+                epoch: 0,
+                proposer_id: 1,
                 signature: [0u8; 64],
             },
             transactions: vec![Tx::Commit(commit.clone()), Tx::Commit(commit.clone())],
@@ -951,6 +1177,9 @@ mod tests {
                 commit_base_fee: chain.fee_state.commit_base,
                 avail_base_fee: chain.fee_state.avail_base,
                 timestamp: 0,
+                slot: 0,
+                epoch: 0,
+                proposer_id: 1,
                 signature: [0u8; 64],
             },
             transactions: vec![],
@@ -1004,6 +1233,9 @@ mod tests {
                 commit_base_fee: chain.fee_state.commit_base,
                 avail_base_fee: chain.fee_state.avail_base,
                 timestamp: 0,
+                slot: 0,
+                epoch: 0,
+                proposer_id: 1,
                 signature: [0u8; 64],
             },
             transactions: vec![Tx::Commit(commit), Tx::Avail(avail)],

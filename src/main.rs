@@ -12,6 +12,7 @@ mod fees;
 mod node;
 mod chain;
 mod verify;
+mod pos;
 
 use crate::state::{Balances, print_balances};
 use crate::types::Hash;

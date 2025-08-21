@@ -44,17 +44,28 @@ pub enum BlockError {
     IntrinsicInvalid(String),
     HeaderMismatch(String),
     BadHeight { expected: u64, got: u64 },
-    RootMismatch(String)
+    RootMismatch(String),
+    WrongParent,
+    WrongSlot,
+    WrongEpoch,
+    NotScheduledLeader,
+    ProposerKeyMismatch,
+    BadSignature,
 }
 
 impl fmt::Display for BlockError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BlockError::IntrinsicInvalid(e) => write!(f, "Intrinsic invalid: {}", e),
-            BlockError::HeaderMismatch(e)   => write!(f, "Header mismatch: {}", e),
-            BlockError::RootMismatch(e)     => write!(f, "Root mismatch: {}", e),
-            BlockError::BadHeight { expected, got } =>
-                write!(f, "Bad height: expected {}, got {}", expected, got),
+            BlockError::IntrinsicInvalid(e)            => write!(f, "Intrinsic invalid: {}", e),
+            BlockError::HeaderMismatch(e)              => write!(f, "Header mismatch: {}", e),
+            BlockError::RootMismatch(e)                => write!(f, "Root mismatch: {}", e),
+            BlockError::BadHeight { expected, got } => write!(f, "Bad height: expected {}, got {}", expected, got),
+            BlockError::WrongParent                             => write!(f, "Wrong parent"),
+            BlockError::WrongSlot                               => write!(f, "Wrong slot"),
+            BlockError::WrongEpoch                              => write!(f, "Wrong epoch"),
+            BlockError::NotScheduledLeader                      => write!(f, "Not Scheduled Leader"),
+            BlockError::ProposerKeyMismatch                     => write!(f, "Proposer Key Mismatch"),
+            BlockError::BadSignature                            => write!(f, "Bad Signature"),
         }
     }
 }
