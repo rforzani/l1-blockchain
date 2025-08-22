@@ -434,6 +434,8 @@ impl Chain {
             ));
         }
 
+        self.verify_header_proposer(&block.header)?;
+
         {
             let v = self
                 .validator_set

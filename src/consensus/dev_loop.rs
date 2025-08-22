@@ -12,7 +12,7 @@ pub struct DevLoopConfig {
 
 // Generic over a concrete Node type so tests can swap fakes later
 pub struct DevLoop<N> { 
-    node: N, 
+    pub node: N, 
     cfg: DevLoopConfig 
 }
 

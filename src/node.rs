@@ -578,6 +578,8 @@ mod tests {
 
     #[test]
     fn commit_simulated_block_updates_state() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+    
         let cfg = MempoolConfig {
             max_avails_per_block: 10,
             max_reveals_per_block: 10,
@@ -588,26 +590,49 @@ mod tests {
         };
         let mp = MempoolImpl::new(cfg);
         let mut node = Node::new(mp.clone(), SigningKey::from_bytes(&[2u8; 32]));
+    
+        // VRF signer so we can be eligible (with single validator we’re always eligible).
         let test_vrf = SchnorrkelVrfSigner::from_deterministic_seed([7u8; 32]);
         node.set_vrf_signer(test_vrf);
-
-        // install this node as the epoch-0 validator (production path via init_genesis)
+    
+        // Make this node the genesis validator with 100% stake (always eligible).
         node.install_self_as_genesis_validator(1, 1_000_000);
     
+        // ---- Align the slot with the dev policy: slot == height + 1 ----
+        // Height is 0, so we need current_slot(now) == 1.
+        let now_ms: u128 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let slot_ms = node.chain.clock.slot_ms as u128;
+        // Choose genesis so that current_slot(now) = (now_ms - genesis) / slot_ms = 1.
+        node.chain.clock.genesis_unix_ms = now_ms.saturating_sub(slot_ms * 1);
+    
+        // Prepare a payable commit
         let bv = TestBalanceView;
         let tx_sk = SigningKey::from_bytes(&[4u8; 32]);
         let sender = addr_hex(&addr_from_pubkey(&tx_sk.verifying_key().to_bytes()));
         node.set_balance(sender.clone(), 1000);
         let (c, _r) = make_pair(&tx_sk, 0);
-        mp.insert_commit(Tx::Commit(c.clone()), 0, 1, &bv, &FeeState::from_defaults()).unwrap();
+        mp.insert_commit(
+            Tx::Commit(c.clone()),
+            /*included_at*/ 0,
+            /*priority*/ 1,
+            &bv,
+            &FeeState::from_defaults(),
+        )
+        .unwrap();
     
         let limits = BlockSelectionLimits { max_avails: 10, max_reveals: 10, max_commits: 10 };
+    
+        // This will now pass proposer verification (slot==height+1 and valid VRF)
         node.produce_block(limits).expect("produce");
     
         assert_eq!(node.height(), 1);
         assert_eq!(node.balance_of(&sender), 999);
         assert!(node.chain.commit_on_chain(&c.commitment));
-    }
+    }        
+
 
     #[test]
     fn process_block_called_once() {
