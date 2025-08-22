@@ -141,6 +141,7 @@ impl DevNode for RecordingNode {
     fn height(&self) -> u64 { self.inner.height() }
 
     fn produce_block(&mut self, limits: BlockSelectionLimits) -> Result<(BuiltBlock, ApplyResult), ProduceError> {
+        self.inner.align_clock_for_test();
         let (built, apply) = self.inner.produce_block(limits)?;
         let txc = built.block.transactions.len();
         let revc = built.block.reveals.len();
