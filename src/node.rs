@@ -120,6 +120,13 @@ impl Node {
         }
     }
 
+    pub fn align_clock_for_test(&mut self) {
+        let now_ms: u128 = (Self::now_ts() as u128) * 1000;
+        let slot_ms = self.chain.clock.slot_ms as u128;
+        let desired_slot = self.chain.height + 1;
+        self.chain.clock.genesis_unix_ms = now_ms.saturating_sub(slot_ms * desired_slot as u128);
+    }
+
     /// Production: set a real VRF signer (sr25519) loaded from secure storage.
     pub fn set_vrf_signer(&mut self, vrf: SchnorrkelVrfSigner) {
         self.vrf_signer = Some(vrf);
@@ -600,10 +607,8 @@ mod tests {
     
         // ---- Align the slot with the dev policy: slot == height + 1 ----
         // Height is 0, so we need current_slot(now) == 1.
-        let now_ms: u128 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
+        // Node::now_unix() floors to seconds, matching simulate_block's time source.
+        let now_ms: u128 = (node.now_unix() as u128) * 1000;
         let slot_ms = node.chain.clock.slot_ms as u128;
         // Choose genesis so that current_slot(now) = (now_ms - genesis) / slot_ms = 1.
         node.chain.clock.genesis_unix_ms = now_ms.saturating_sub(slot_ms * 1);
@@ -652,6 +657,11 @@ mod tests {
 
         // NEW: make this node an active validator in the chain's validator set.
         node.install_self_as_genesis_validator(1, 1_000_000);
+
+        // Align the slot with the chain's height policy (slot == 1 at height 0)
+        let now_ms: u128 = (node.now_unix() as u128) * 1000;
+        let slot_ms = node.chain.clock.slot_ms as u128;
+        node.chain.clock.genesis_unix_ms = now_ms.saturating_sub(slot_ms * 1);
     
         let bv = TestBalanceView;
         let tx_sk = SigningKey::from_bytes(&[5u8; 32]);
