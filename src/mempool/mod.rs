@@ -9,6 +9,8 @@ use crate::types::{RevealTx, Tx, Address};
 use crate::fees::{FeeState, lane_base, Lane};
 pub mod queues;
 use queues::{AvailQueue, CommitQueue, RevealQueue};
+pub mod workers;
+pub use workers::{Batch, BatchStore};
 mod tests;
 
 #[derive(Clone, Debug)]

@@ -3,14 +3,21 @@
 use crate::{
     codec::{access_list_bytes, receipt_bytes, tx_bytes, tx_enum_bytes},
     crypto::{hash_bytes_sha256, merkle_root},
+    mempool::BatchStore,
     state::CHAIN_ID,
     types::{Block, BlockHeader, Hash, Receipt},
 };
 
-pub fn compute_roots_for(block: &Block, receipts: &[Receipt]) -> (Hash, Hash, Hash) {
-    // txs_root from block.transactions (reveals are NOT part of txs_root)
-    let tx_hashes: Vec<Hash> = block
-        .transactions
+pub fn compute_roots_for(block: &Block, batches: &BatchStore, receipts: &[Receipt]) -> (Hash, Hash, Hash) {
+    // Gather all transactions from referenced batches
+    let mut txs: Vec<crate::types::Tx> = block.transactions.clone();
+    for d in &block.batch_digests {
+        if let Some(batch) = batches.get(d) {
+            txs.extend(batch.txs);
+        }
+    }
+    // txs_root from all transactions (reveals are NOT part of txs_root)
+    let tx_hashes: Vec<Hash> = txs
         .iter()
         .map(|tx| hash_bytes_sha256(&tx_enum_bytes(tx)))
         .collect();
@@ -57,9 +64,10 @@ pub fn compute_roots_for(block: &Block, receipts: &[Receipt]) -> (Hash, Hash, Ha
 pub fn verify_block_roots(
     header: &BlockHeader,
     block: &Block,
+    batches: &BatchStore,
     receipts: &[Receipt],
 ) -> Result<(), String> {
-    let (txs_root, receipts_root, reveals_root) = compute_roots_for(block, receipts);
+    let (txs_root, receipts_root, reveals_root) = compute_roots_for(block, batches, receipts);
     if txs_root != header.txs_root
         || receipts_root != header.receipts_root
         || reveals_root != header.reveal_set_root
@@ -158,18 +166,19 @@ mod tests {
         }];
     
         // Compute the correct roots and embed them in the header
-        let (tx_root, receipt_root, reveal_root) = compute_roots_for(&block, &receipts);
+        let store = BatchStore::new();
+        let (tx_root, receipt_root, reveal_root) = compute_roots_for(&block, &store, &receipts);
         block.header.txs_root        = tx_root;
         block.header.receipts_root   = receipt_root;
         block.header.reveal_set_root = reveal_root;
     
         // Sanity: passes when receipts match
-        assert!(verify_block_roots(&block.header, &block, &receipts).is_ok());
+        assert!(verify_block_roots(&block.header, &block, &store, &receipts).is_ok());
     
         // Tamper with receipts AFTER roots are embedded
         receipts[0].gas_used = 1;
     
         // Now verification should fail due to mismatched receipts_root
-        assert!(verify_block_roots(&block.header, &block, &receipts).is_err());
+        assert!(verify_block_roots(&block.header, &block, &store, &receipts).is_err());
     }
 }

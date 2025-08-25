@@ -11,6 +11,7 @@ use crate::state::{CHAIN_ID, DECRYPTION_DELAY, MAX_AVAILS_PER_BLOCK, MAX_PENDING
 use crate::state::{Balances, Nonces};
 use crate::crypto::{addr_from_pubkey, addr_hex};
 use crate::codec::{tx_enum_bytes, receipt_bytes, header_bytes, tx_bytes};
+use crate::mempool::BatchStore;
 use crate::types::AvailTx;
 use crate::types::CommitmentMeta;
 use crate::types::{Block, Receipt, ExecOutcome, Hash, BlockHeader, Transaction, StateKey, Tx, Event, RevealTx, CommitTx, AccessList, Address};
@@ -514,6 +515,7 @@ fn process_reveal(
 
 pub fn process_block(
     block: &Block,
+    batch_store: &BatchStore,
     balances: &mut Balances,
     nonces: &mut Nonces,
     commitments: &mut Commitments,
@@ -538,7 +540,15 @@ pub fn process_block(
     let mut revealed_this_block: HashSet<Hash> = HashSet::new();
     let mut il_due: Vec<Hash> = Vec::new();
 
-    let avail_count = block.transactions.iter().filter(|t| matches!(t, Tx::Avail(_))).count();
+    // Gather all transactions: those directly in the block plus those fetched via batch digests.
+    let mut all_txs: Vec<Tx> = block.transactions.clone();
+    for d in &block.batch_digests {
+        if let Some(batch) = batch_store.get(d) {
+            all_txs.extend(batch.txs);
+        }
+    }
+
+    let avail_count = all_txs.iter().filter(|t| matches!(t, Tx::Avail(_))).count();
     if avail_count > MAX_AVAILS_PER_BLOCK {
         return Err(BlockError::IntrinsicInvalid("too many Avails in block".into()));
     }
@@ -558,7 +568,7 @@ pub fn process_block(
     il_due.sort(); // deterministic IL root
 
     // 1) Process "transactions" (commit/avail only)
-    for (i, tx) in block.transactions.iter().enumerate() {
+    for (i, tx) in all_txs.iter().enumerate() {
         let is_commit = matches!(tx, Tx::Commit(_));
 
         let rcpt_res = match tx {

@@ -31,6 +31,9 @@ impl Transaction {
 pub struct Block {
     pub transactions: Vec<Tx>,
     pub reveals: Vec<RevealTx>,
+    /// Digests of batches carrying the actual transactions. Consensus blocks
+    /// only reference these digests; execution fetches the batches on demand.
+    pub batch_digests: Vec<Hash>,
     pub header: BlockHeader,
     pub justify_qc: QC
 }
@@ -44,7 +47,7 @@ impl Block {
             &justify_qc.bitmap,
         );
         header.justify_qc_hash = qc_hash;
-        Self { transactions: txs, reveals, header, justify_qc }
+        Self { transactions: txs, reveals, batch_digests: Vec::new(), header, justify_qc }
     }
     pub fn new(txs: Vec<Tx>, header: BlockHeader, justify_qc: QC) -> Self {
         Self::new_with_reveals(txs, Vec::new(), header, justify_qc)

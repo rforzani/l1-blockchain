@@ -10,6 +10,7 @@ use crate::pos::registry::{StakingConfig, ValidatorSet, ValidatorStatus};
 use crate::pos::schedule::{AliasSchedule, ProposerSchedule};
 use crate::pos::slots::SlotClock;
 use crate::stf::{process_block, BlockError};
+use crate::mempool::BatchStore;
 use crate::state::{Available, Balances, Commitments, Nonces, DECRYPTION_DELAY, REVEAL_WINDOW};
 use crate::types::{Block, BlockHeader, Event, Hash, Receipt};
 use crate::verify::verify_block_roots;
@@ -33,7 +34,8 @@ pub struct Chain {
     pub epoch_seed: [u8; 32],
     pub validator_set: ValidatorSet,
     pub schedule: AliasSchedule,
-    pub epoch_accumulator: [u8; 32]
+    pub epoch_accumulator: [u8; 32],
+    pub batch_store: BatchStore,
 }
 
 #[derive(Clone)]
@@ -92,7 +94,8 @@ impl Chain {
             epoch_seed,
             validator_set,
             schedule,
-            epoch_accumulator
+            epoch_accumulator,
+            batch_store: BatchStore::new(),
         }
     }
 
@@ -347,6 +350,7 @@ impl Chain {
         let mut sim_burned_total = self.burned_total;
         let res = process_block(
             block,
+            &self.batch_store,
             &mut sim_balances,
             &mut sim_nonces,
             &mut sim_commitments,
@@ -356,7 +360,7 @@ impl Chain {
             &mut sim_burned_total,
         )?;
 
-        verify_block_roots(&block.header, block, &res.receipts)
+        verify_block_roots(&block.header, block, &self.batch_store, &res.receipts)
             .map_err(BlockError::RootMismatch)?;
 
         *balances = sim_balances;
@@ -449,7 +453,7 @@ impl Chain {
             }
         }
 
-        verify_block_roots(&block.header, block, &apply.receipts)
+        verify_block_roots(&block.header, block, &self.batch_store, &apply.receipts)
             .map_err(BlockError::RootMismatch)?;
 
         for ev in &apply.events {
@@ -640,6 +644,7 @@ mod tests {
             },
             transactions,
             reveals,
+            batch_digests: Vec::new(),
             justify_qc: dummy_qc(),
         };
     
@@ -651,9 +656,10 @@ mod tests {
     
         let proposer_addr = addr_hex(&addr_from_pubkey(&ed_pk));
         let mut burned = 0u64;
-    
+
         let body = process_block(
             &block,
+            &chain.batch_store,
             &mut sim_balances,
             &mut sim_nonces,
             &mut sim_commitments,
@@ -1156,6 +1162,7 @@ mod tests {
             },
             transactions: txs,
             reveals: vec![],
+            batch_digests: Vec::new(),
             justify_qc: dummy_qc(),
         };
     
@@ -1236,6 +1243,7 @@ mod tests {
             },
             transactions: txs,
             reveals: vec![],
+            batch_digests: Vec::new(),
             justify_qc: dummy_qc(),
         };
     
@@ -1311,6 +1319,7 @@ mod tests {
             },
             transactions: vec![Tx::Commit(commit.clone()), Tx::Commit(commit.clone())],
             reveals: vec![],
+            batch_digests: Vec::new(),
             justify_qc: dummy_qc(),
         };
     
@@ -1393,6 +1402,7 @@ mod tests {
                 },
                 transactions: txs,
                 reveals,
+                batch_digests: Vec::new(),
                 justify_qc: dummy_qc(),
             };
 
@@ -1406,6 +1416,7 @@ mod tests {
 
             let body = process_block(
                 &block,
+                &chain.batch_store,
                 &mut sim_balances,
                 &mut sim_nonces,
                 &mut sim_commitments,
@@ -1465,6 +1476,7 @@ mod tests {
                 },
                 transactions: txs,
                 reveals,
+                batch_digests: Vec::new(),
                 justify_qc: dummy_qc(),
             };
 
@@ -1561,6 +1573,7 @@ mod tests {
             // Commit and Avail in the SAME block → Avail is too early and must be rejected
             transactions: vec![Tx::Commit(commit), Tx::Avail(avail)],
             reveals: vec![],
+            batch_digests: Vec::new(),
             justify_qc: dummy_qc(),
         };
     
