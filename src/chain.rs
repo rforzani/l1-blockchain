@@ -11,9 +11,10 @@ use crate::pos::schedule::{AliasSchedule, ProposerSchedule};
 use crate::pos::slots::SlotClock;
 use crate::stf::{process_block, BlockError};
 use crate::state::{Available, Balances, Commitments, Nonces, DECRYPTION_DELAY, REVEAL_WINDOW};
-use crate::types::{Block, Event, Hash, Receipt};
+use crate::types::{Block, BlockHeader, Event, Hash, Receipt};
 use crate::verify::verify_block_roots;
 use std::collections::{HashMap, HashSet, BTreeMap};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SLOT_MS: u64 = 1_000;     // 1s slots for dev;
 const DEFAULT_EPOCH_SLOTS: u64 = 1_024; // power-of-two for easy math
@@ -93,6 +94,22 @@ impl Chain {
             schedule,
             epoch_accumulator
         }
+    }
+
+    pub fn now_ts(&self) -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    }
+
+    pub fn current_slot_at(&self, now_ms: u128) -> u64 {
+        self.clock.current_slot(now_ms)
+    }
+
+
+    pub fn current_slot(&self) -> u64 {
+        self.current_slot_at(self.now_ts())
     }
 
     /// Install the initial validator set and seed at genesis.

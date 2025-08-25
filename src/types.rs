@@ -1,6 +1,8 @@
 // src/types.rs
 
-use crate::pos::registry::ValidatorId;
+use bitvec::vec::BitVec;
+
+use crate::{codec::qc_commitment, crypto::bls::{BlsAggregate, BlsSignatureBytes}, pos::registry::ValidatorId};
 
 pub type Address = String;
 
@@ -30,14 +32,22 @@ pub struct Block {
     pub transactions: Vec<Tx>,
     pub reveals: Vec<RevealTx>,
     pub header: BlockHeader,
+    pub justify_qc: QC
 }
 
 impl Block {
-    pub fn new_with_reveals(txs: Vec<Tx>, reveals: Vec<RevealTx>, header: BlockHeader) -> Self {
-        Self { transactions: txs, reveals, header }
+    pub fn new_with_reveals(txs: Vec<Tx>, reveals: Vec<RevealTx>, mut header: BlockHeader, justify_qc: QC) -> Self {
+        let qc_hash = qc_commitment(
+            justify_qc.view,
+            &justify_qc.block_id,
+            &justify_qc.agg_sig,
+            &justify_qc.bitmap,
+        );
+        header.justify_qc_hash = qc_hash;
+        Self { transactions: txs, reveals, header, justify_qc }
     }
-    pub fn new(txs: Vec<Tx>, header: BlockHeader) -> Self {
-        Self::new_with_reveals(txs, Vec::new(), header)
+    pub fn new(txs: Vec<Tx>, header: BlockHeader, justify_qc: QC) -> Self {
+        Self::new_with_reveals(txs, Vec::new(), header, justify_qc)
     }
 }
 
@@ -54,7 +64,80 @@ pub struct Receipt {
     pub error: Option<String>, // Some(reason) if Revert
 }
 
+#[derive(Debug, Clone)]
+pub struct Pacemaker {
+    /// base timeout for a view (ms)
+    pub base_timeout_ms: u64,
+    /// current timeout for this view (ms), grows with backoff
+    pub current_timeout_ms: u64,
+    /// monotonic ms when we entered the current view
+    pub view_start_ms: u128,
+    /// cap for timeout growth (ms)
+    pub max_timeout_ms: u64,
+    /// backoff multiplier numerator/denominator (e.g., 3/2 = 1.5x)
+    pub backoff_num: u64,
+    pub backoff_den: u64,
+}
+
+impl Pacemaker {
+    pub fn new(base_timeout_ms: u64, max_timeout_ms: u64, backoff_num: u64, backoff_den: u64) -> Self {
+        Self {
+            base_timeout_ms,
+            current_timeout_ms: base_timeout_ms,
+            view_start_ms: 0,
+            max_timeout_ms,
+            backoff_num: backoff_num.max(1),
+            backoff_den: backoff_den.max(1),
+        }
+    }
+
+    /// Call when you switch to a new view.
+    pub fn on_enter_view(&mut self, now_ms: u128) {
+        self.view_start_ms = now_ms;
+        self.current_timeout_ms = self.base_timeout_ms;
+    }
+
+    /// Returns true if the current view's timer expired at `now_ms`.
+    pub fn expired(&self, now_ms: u128) -> bool {
+        now_ms.saturating_sub(self.view_start_ms) >= self.current_timeout_ms as u128
+    }
+
+    /// Bump the timeout using configured backoff, capped at `max_timeout_ms`.
+    pub fn bump_backoff(&mut self) {
+        let mut next = (self.current_timeout_ms.saturating_mul(self.backoff_num)) / self.backoff_den;
+        if next < self.base_timeout_ms {
+            next = self.base_timeout_ms;
+        }
+        if next > self.max_timeout_ms {
+            next = self.max_timeout_ms;
+        }
+        self.current_timeout_ms = next;
+    }
+}
+
 pub type Hash = [u8; 32];
+
+pub struct Vote {
+    pub view: u64,
+    pub block_id: Hash,
+    pub voter_id: ValidatorId,
+    pub bls_sig: BlsSignatureBytes,
+}
+
+#[derive(Debug, Clone)]
+pub struct QC {
+    pub view: u64,               // the view these votes attest to
+    pub block_id: Hash,          // the block that was voted for
+    pub agg_sig: BlsSignatureBytes,   // aggregated signature over (block_id||view)
+    pub bitmap: BitVec,          // which validators signed (for auditing/slashing)
+}
+
+pub struct HotStuffState {
+    pub current_view: u64,
+    pub locked_block: (Hash, u64),    // id and view of the block we’re locked on
+    pub high_qc: QC,                  // best QC we’ve seen
+    pub pacemaker: Pacemaker,         // timeouts / timers per view
+}
 
 #[derive(Debug, Clone)]
 pub struct BlockHeader {
@@ -76,8 +159,10 @@ pub struct BlockHeader {
     pub signature: [u8; 64],
     pub bundle_len: u8,         
     pub vrf_preout: [u8; 32],
-    pub vrf_output: [u8; 32],    // hash(preout) or preout hash-derived 32 bytes
-    pub vrf_proof:  Vec<u8>,     // schnorrkel::VRFProof serialized
+    pub vrf_output: [u8; 32], 
+    pub vrf_proof:  Vec<u8>,  
+    pub view: u64,            
+    pub justify_qc_hash: Hash,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

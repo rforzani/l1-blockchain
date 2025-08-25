@@ -1,6 +1,9 @@
 // src/codec.rs
 
-use crate::types::{AccessList, BlockHeader, ExecOutcome, Receipt, StateKey, Transaction};
+use sha2::{Digest, Sha256};
+
+use crate::crypto::bls::{BlsSignatureBytes, SignerBitmap};
+use crate::types::{AccessList, BlockHeader, ExecOutcome, Hash, Receipt, StateKey, Transaction};
 use crate::types::{Tx};
 
 pub const CODEC_VERSION: u8 = 1;
@@ -9,6 +12,45 @@ pub const DOM_RCPT: &[u8] = b"RCPT";
 pub const DOM_HDR: &[u8] = b"HDR";
 const TAG_COMMIT:   u8 = 1;
 const TAG_AVAIL:    u8 = 2;
+const QC_COMMIT_VERSION: u8 = 1;
+
+#[inline]
+fn encode_bitmap_lsb0(bitmap: &SignerBitmap) -> Vec<u8> {
+    // LSB0 packing: bit 0 -> byte0 bit0, bit 1 -> byte0 bit1, ...
+    let n = bitmap.len();
+    let mut out = vec![0u8; (n + 7) / 8];
+    for (i, bit) in bitmap.iter().by_vals().enumerate() {
+        if bit {
+            let byte = i / 8;
+            let off  = i % 8;
+            out[byte] |= 1u8 << off;
+        }
+    }
+    out
+}
+
+pub fn qc_commitment(
+    view: u64,
+    block_id: &[u8],
+    agg_sig: &BlsSignatureBytes,
+    bitmap: &SignerBitmap,
+) -> [u8; 32] {
+    let mut v = Vec::with_capacity(1 + 8 + block_id.len() + 96 + (bitmap.len() + 7)/8 + 8);
+    v.push(QC_COMMIT_VERSION);
+    v.extend_from_slice(&view.to_be_bytes());
+    v.extend_from_slice(block_id);
+    v.extend_from_slice(&agg_sig.0);
+    // bitmap length (bits) + packed bytes
+    let bit_len = bitmap.len() as u32;
+    v.extend_from_slice(&bit_len.to_be_bytes());
+    let bm_bytes = encode_bitmap_lsb0(bitmap);
+    v.extend_from_slice(&bm_bytes);
+
+    let digest = Sha256::digest(&v);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
 
 // append a u64 to a Vec<u8> in little-endian.
 pub fn put_u64(dst: &mut Vec<u8>, x: u64) {
@@ -141,6 +183,8 @@ pub fn header_signing_bytes(h: &BlockHeader) -> Vec<u8> {
     v.extend_from_slice(&h.vrf_output);        
     put_u64(&mut v, h.vrf_proof.len() as u64);
     v.extend_from_slice(&h.vrf_proof);
+    put_u64(&mut v, h.view);
+    v.extend_from_slice(&h.justify_qc_hash);
 
     v
 }
@@ -164,7 +208,6 @@ pub fn header_bytes(h: &BlockHeader) -> Vec<u8> {
     put_u64(&mut v, h.slot);
     put_u64(&mut v, h.epoch);
     put_u64(&mut v, h.proposer_id);
-    v.extend_from_slice(&h.signature);
 
     // --- Vortex PoS fields ---
     v.push(h.bundle_len);           
@@ -172,8 +215,20 @@ pub fn header_bytes(h: &BlockHeader) -> Vec<u8> {
     v.extend_from_slice(&h.vrf_output);        
     put_u64(&mut v, h.vrf_proof.len() as u64);
     v.extend_from_slice(&h.vrf_proof);
+    put_u64(&mut v, h.view);
+    v.extend_from_slice(&h.justify_qc_hash);
+
+    v.extend_from_slice(&h.signature);
 
     v
+}
+
+pub fn header_id(h: &BlockHeader) -> Hash {
+    let pre = header_signing_bytes(h);
+    let digest = Sha256::digest(&pre);
+    let mut out: Hash = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
 }
 
 pub fn put_bytes(v: &mut Vec<u8>, bytes: &[u8]) {

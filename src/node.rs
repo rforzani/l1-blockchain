@@ -1,20 +1,22 @@
 use crate::consensus::dev_loop::DevNode;
+use crate::consensus::HotStuff;
+use crate::crypto::bls::{verify_qc, BlsSigner};
 use crate::fees::FeeState;
 // src/node.rs
 use crate::mempool::{BalanceView, BlockSelectionLimits, CommitmentId, Mempool, MempoolImpl, SelectError, StateView, TxId};
 use crate::state::{Balances, Nonces, Commitments, Available};
 use crate::chain::{ApplyResult, Chain, DEFAULT_BUNDLE_LEN};
 use crate::stf::process_block;
-use crate::types::{Block, Hash};
+use crate::types::{Block, Hash, HotStuffState, Pacemaker, QC};
 use std::sync::Arc;
+use ed25519_dalek::ed25519::Error;
 use ed25519_dalek::{SigningKey, Signer};
 use crate::crypto::{addr_from_pubkey, addr_hex, hash_bytes_sha256};
 use crate::codec::header_signing_bytes;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::pos::registry::{StakingConfig, Validator, ValidatorId, ValidatorSet, ValidatorStatus};
-use crate::pos::schedule::ProposerSchedule;
-use crate::pos::slots::SlotClock;
 use crate::crypto::vrf::{build_vrf_msg, SchnorrkelVrfSigner, VrfPubkey, VrfSigner};
+use anyhow::{Result, Context, anyhow, bail};
 
 pub struct StateBalanceView<'a> {
     balances: &'a Balances,
@@ -50,6 +52,22 @@ pub enum ProduceError {
     },
 }
 
+
+#[derive(Clone)]
+pub struct PacemakerConfig {
+    pub base_timeout_ms: u64,
+    pub max_timeout_ms: u64,
+    pub backoff_num: u64,
+    pub backoff_den: u64,
+}
+
+#[derive(Clone)]
+pub struct ConsensusConfig {
+    pub genesis_qc: QC,
+    pub pacemaker: PacemakerConfig,
+    pub genesis_block_id: Hash,
+}
+
 pub struct Node {
     chain: Chain,
     balances: Balances,
@@ -60,6 +78,7 @@ pub struct Node {
     signer: SigningKey,
     proposer_pubkey: [u8; 32],
     vrf_signer: Option<SchnorrkelVrfSigner>,
+    hotstuff: Option<HotStuff>,
 }
 
 struct NodeStateView<'a> {
@@ -116,8 +135,129 @@ impl Node {
             mempool,
             signer,
             proposer_pubkey,
-            vrf_signer: None
+            vrf_signer: None,
+            hotstuff: None
         }
+    }
+
+    pub fn new_with_consensus(
+        mempool: Arc<MempoolImpl>,
+        ed25519: SigningKey,
+        consensus_cfg: ConsensusConfig,
+        bls_sk: Option<[u8; 32]>,
+        my_validator_id: Option<ValidatorId>,
+    ) -> Result<Self> {
+        let mut node = Self::new(mempool, ed25519);
+
+        // Active-set BLS pubkeys (stable index order)
+        let active_bls_pks: Vec<[u8; 48]> = node
+            .collect_active_bls_pubkeys_in_order()
+            .map_err(|e| anyhow!("failed to collect active BLS pubkeys: {e}"))?;
+        if active_bls_pks.is_empty() {
+            bail!("active validator set is empty");
+        }
+
+        // Resolve my id
+        let my_id: ValidatorId = if let Some(id) = my_validator_id {
+            id
+        } else {
+            node.resolve_my_validator_id()
+                .map_err(|e| anyhow!("unable to resolve this node's ValidatorId: {e}"))?
+        };
+        if (my_id as usize) >= active_bls_pks.len() {
+            bail!("my_validator_id {} out of range (n={})", my_id, active_bls_pks.len());
+        }
+
+        // Optional BLS signer
+        let bls_signer: Option<BlsSigner> = match bls_sk {
+            Some(sk) => BlsSigner::from_sk_bytes(&sk),
+            None => None,
+        };
+
+        // --- Membership check (implemented) ---
+        // Consider this node "active" if its id is within the active set
+        // and the advertised pubkey at that index is not the all-zero default.
+        let i_am_active = {
+            let idx = my_id as usize;
+            let pk = active_bls_pks[idx];
+            pk != [0u8; 48]
+        };
+        if i_am_active && bls_signer.is_none() {
+            bail!("node is in active set (id={}) but has no BLS secret key", my_id);
+        }
+
+        // Seed from SlotClock/time (uses Chain helpers implemented below)
+        let current_view: u64 = node.chain.current_slot();
+        let tip_hash: Hash = node.chain.tip_hash;
+        let locked_block: (Hash, u64) = (tip_hash, current_view);
+
+        // Genesis binding & QC verification
+        if consensus_cfg.genesis_qc.block_id != consensus_cfg.genesis_block_id || consensus_cfg.genesis_qc.view != 0 {
+            bail!("genesis_qc does not certify the configured genesis_block_id/view=0");
+        }
+        verify_qc(
+            &consensus_cfg.genesis_qc.block_id,
+            consensus_cfg.genesis_qc.view,
+            &consensus_cfg.genesis_qc.agg_sig,
+            &consensus_cfg.genesis_qc.bitmap,
+            &active_bls_pks,
+        ).map_err(|e| anyhow!("invalid genesis_qc: {:?}", e))?;
+
+        // Prefer persisted high_qc if available (and valid)
+        let mut high_qc = consensus_cfg.genesis_qc.clone();
+        if let Some(best) = node.load_best_qc_from_store()? {
+            verify_qc(&best.block_id, best.view, &best.agg_sig, &best.bitmap, &active_bls_pks)
+                .map_err(|e| anyhow!("persisted high_qc failed verification: {:?}", e))?;
+            if best.view > high_qc.view {
+                high_qc = best;
+            }
+        }
+
+        // Pacemaker from config; start timer from Chain clock
+        let pmc = &consensus_cfg.pacemaker;
+        let mut pacemaker = Pacemaker::new(pmc.base_timeout_ms, pmc.max_timeout_ms, pmc.backoff_num, pmc.backoff_den);
+        pacemaker.on_enter_view(node.chain.now_ts()); // ms since epoch as u128
+
+        let hs_state = HotStuffState { current_view, locked_block, high_qc, pacemaker };
+
+        let hs = HotStuff::new(hs_state, active_bls_pks, my_id, bls_signer);
+        node.hotstuff = Some(hs);
+
+        Ok(node)
+    }
+
+    /// Return BLS pubkeys of the *active* validator set in **stable index order**.
+    fn collect_active_bls_pubkeys_in_order(&self) -> Result<Vec<[u8;48]>> {
+        let vs = &self.chain.validator_set;
+        let mut out = Vec::with_capacity(vs.validators.len());
+        for (idx, v) in vs.validators.iter().enumerate() {
+            // Consider active if `status` is Active; else skip.
+            let active = v.status == ValidatorStatus::Active;
+            if !active { continue; }
+
+            let pk = v.bls_pubkey.ok_or_else(|| {
+                anyhow!("active validator at index {} missing bls_pubkey", idx)
+            })?;
+            out.push(pk);
+        }
+        Ok(out)
+    }
+
+    /// Resolve my ValidatorId from the registry, e.g., by matching my Ed25519 pubkey.
+    fn resolve_my_validator_id(&self) -> Result<ValidatorId> {
+        let me = self.proposer_pubkey; // [u8;32]
+        let vs = &self.chain.validator_set;
+
+        for (idx, v) in vs.validators.iter().enumerate() {
+            if v.ed25519_pubkey == me {
+                return Ok(idx as ValidatorId);
+            }
+        }
+        Err(anyhow!("local Ed25519 pubkey not found in validator set").into())
+    }
+
+    fn load_best_qc_from_store(&self) -> Result<Option<QC>> {
+        Ok(None)
     }
 
     pub fn align_clock_for_test(&mut self) {
