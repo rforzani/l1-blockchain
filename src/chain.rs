@@ -169,61 +169,66 @@ impl Chain {
             return Err(BlockError::NotScheduledLeader);
         }
     
-        // 5) VORTEX-ONLY: VRF proof MUST be present and valid; no alias fallback.
-        if header.vrf_proof.is_empty() {
-            // dedicated error variant would be nicer; reuse BadSignature for now
-            return Err(BlockError::BadSignature);
-        }
-    
         // (a) Sanity on bundle_len (enforce your configured default)
         let r = header.bundle_len;
         if r == 0 || r != DEFAULT_BUNDLE_LEN {
             return Err(BlockError::WrongSlot);
         }
-    
+
         // (b) Recompute bundle_start deterministically
         let bundle_start = self.clock.bundle_start(header.slot, r);
-    
-        // (c) Build VRF message (must match Node exactly)
-        let msg = build_vrf_msg(&self.epoch_seed, bundle_start, header.proposer_id);
-    
-        // (d) Verify VRF proof against the validator's VRF public key
-        if !SchnorrkelVrf::vrf_verify(
+
+        if header.vrf_proof.is_empty() {
+            // VRF path produced no winner; fall back to alias schedule.
+            let expected = self
+                .schedule
+                .fallback_leader_for_bundle(bundle_start)
+                .ok_or(BlockError::NotScheduledLeader)?;
+            if header.proposer_id != expected {
+                return Err(BlockError::NotScheduledLeader);
+            }
+        } else {
+            // (c) Build VRF message (must match Node exactly)
+            let msg = build_vrf_msg(&self.epoch_seed, bundle_start, header.proposer_id);
+
+            // (d) Verify VRF proof against the validator's VRF public key
+            if !SchnorrkelVrf::vrf_verify(
                 &VrfPubkey(v.vrf_pubkey),
                 &msg,
                 &header.vrf_output,
                 &header.vrf_preout,
                 &header.vrf_proof,
-        ) {
-            return Err(BlockError::BadSignature); // or BadVrf if you distinguish
-        }
-    
-        // (e) Stake-weighted threshold check: interpret output uniformly in [0, 2^64)
-        #[inline]
-        fn vrf_rand64(out32: &[u8; 32]) -> u64 {
-            let h = crate::crypto::hash_bytes_sha256(out32);
-            u64::from_be_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]])
-        }
-        #[inline]
-        fn vrf_threshold64(my_stake: u128, total: u128) -> u64 {
-            if total == 0 {
-                return 0;
+            ) {
+                return Err(BlockError::BadSignature); // or BadVrf if you distinguish
             }
-            if my_stake >= total {
-                // Single-validator or 100% stake → always eligible
-                return u64::MAX;
+
+            // (e) Stake-weighted threshold check: interpret output uniformly in [0, 2^64)
+            #[inline]
+            fn vrf_rand64(out32: &[u8; 32]) -> u64 {
+                let h = crate::crypto::hash_bytes_sha256(out32);
+                u64::from_be_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]])
             }
-            // Safe: result < 2^64 because my_stake < total
-            let num = (my_stake as u128) << 64;
-            (num / total) as u64
-        }
-    
-        let total = self.validator_set.total_stake();
-        let r64   = vrf_rand64(&header.vrf_output);
-        let thr   = vrf_threshold64(v.stake, total);
-        if r64 >= thr {
-            // Not eligible this bundle → reject
-            return Err(BlockError::NotScheduledLeader);
+            #[inline]
+            fn vrf_threshold64(my_stake: u128, total: u128) -> u64 {
+                if total == 0 {
+                    return 0;
+                }
+                if my_stake >= total {
+                    // Single-validator or 100% stake → always eligible
+                    return u64::MAX;
+                }
+                // Safe: result < 2^64 because my_stake < total
+                let num = (my_stake as u128) << 64;
+                (num / total) as u64
+            }
+
+            let total = self.validator_set.total_stake();
+            let r64   = vrf_rand64(&header.vrf_output);
+            let thr   = vrf_threshold64(v.stake, total);
+            if r64 >= thr {
+                // Not eligible this bundle → reject
+                return Err(BlockError::NotScheduledLeader);
+            }
         }
     
         // 6) Verify the ed25519 header signature (over the UPDATED preimage with Vortex fields)
@@ -559,8 +564,10 @@ mod tests {
     };
     use crate::state::{Balances, Nonces, Commitments, Available, CHAIN_ID, MAX_AVAILS_PER_BLOCK, MAX_PENDING_COMMITS_PER_ACCOUNT};
     use crate::types::{
-        Block, BlockHeader, Tx, CommitTx, AvailTx, RevealTx, Transaction, Hash,
+        Block, BlockHeader, Tx, CommitTx, AvailTx, RevealTx, Transaction, Hash, QC,
     };
+    use crate::crypto::bls::BlsSignatureBytes;
+    use bitvec::vec::BitVec;
     use crate::pos::registry::{StakingConfig, Validator, ValidatorSet, ValidatorStatus};
 
     fn fake_vrf_fields(proposer_id: u64) -> ([u8; 32], [u8; 32], Vec<u8>) {
@@ -576,6 +583,10 @@ mod tests {
         proof.push(0x01);
     
         (out, preout, proof)
+    }
+
+    fn dummy_qc() -> QC {
+        QC { view: 0, block_id: [0u8;32], agg_sig: BlsSignatureBytes([0u8;96]), bitmap: BitVec::new() }
     }
 
     fn build_block(
@@ -634,18 +645,23 @@ mod tests {
                 slot,
                 epoch,
                 proposer_id,
-    
+
                 // Vortex PoS fields (alias fallback: empty VRF)
                 bundle_len,
                 vrf_output,
                 vrf_proof,
                 vrf_preout,
-    
+
+                // HotStuff fields
+                view: 0,
+                justify_qc_hash: [0u8; 32],
+
                 // signature filled after STF + preimage build
                 signature:       [0u8; 64],
             },
             transactions,
             reveals,
+            justify_qc: dummy_qc(),
         };
     
         // Simulate STF to compute canonical roots/gas
@@ -1144,22 +1160,24 @@ mod tests {
                 commit_base_fee: chain.fee_state.commit_base,
                 avail_base_fee:  chain.fee_state.avail_base,
                 timestamp:       0, // not checked in this test
-    
+
                 // proposer/time metadata
                 slot,
                 epoch,
                 proposer_id,
-    
+
                 // Vortex PoS fields
                 bundle_len,
                 vrf_preout,
                 vrf_output,
                 vrf_proof,
-    
+                view: 0,
+                justify_qc_hash: [0u8;32],
                 signature: [0u8; 64],
             },
             transactions: txs,
             reveals: vec![],
+            justify_qc: dummy_qc(),
         };
     
         // Sign the header
@@ -1233,10 +1251,13 @@ mod tests {
                 vrf_output,
                 vrf_proof,
                 vrf_preout,
+                view: 0,
+                justify_qc_hash: [0u8;32],
                 signature: [0u8; 64],
             },
             transactions: txs,
             reveals: vec![],
+            justify_qc: dummy_qc(),
         };
     
         // Sign after all header fields are set (including VRF fields)
@@ -1305,10 +1326,13 @@ mod tests {
                 vrf_output,
                 vrf_proof,
                 vrf_preout,
+                view: 0,
+                justify_qc_hash: [0u8;32],
                 signature: [0u8; 64],
             },
             transactions: vec![Tx::Commit(commit.clone()), Tx::Commit(commit.clone())],
             reveals: vec![],
+            justify_qc: dummy_qc(),
         };
     
         // Sign after all header fields are set (including VRF fields)
@@ -1384,10 +1408,13 @@ mod tests {
                     vrf_output,
                     vrf_proof,
                     vrf_preout,
+                    view: 0,
+                    justify_qc_hash: [0u8;32],
                     signature: [0u8; 64],
                 },
                 transactions: txs,
                 reveals,
+                justify_qc: dummy_qc(),
             };
 
             // simulate STF to compute roots/gas
@@ -1453,10 +1480,13 @@ mod tests {
                     vrf_output,
                     vrf_proof,
                     vrf_preout,
+                    view: 0,
+                    justify_qc_hash: [0u8;32],
                     signature: [0u8; 64],
                 },
                 transactions: txs,
                 reveals,
+                justify_qc: dummy_qc(),
             };
 
             // Sign as usual; STF will run inside apply_block and return IntrinsicInvalid
@@ -1545,11 +1575,14 @@ mod tests {
                 vrf_output,
                 vrf_proof,
                 vrf_preout,
+                view: 0,
+                justify_qc_hash: [0u8;32],
                 signature: [0u8; 64],
             },
             // Commit and Avail in the SAME block → Avail is too early and must be rejected
             transactions: vec![Tx::Commit(commit), Tx::Avail(avail)],
             reveals: vec![],
+            justify_qc: dummy_qc(),
         };
     
         // Sign after all header fields are set (including VRF fields)

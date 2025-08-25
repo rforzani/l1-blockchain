@@ -14,8 +14,10 @@ pub trait ProposerSchedule {
         epoch_seed: [u8; 32],
     );
 
-    /// Return the scheduled leader for a given *global* slot, or None when no leader is eligible.
-    fn leader_for_slot(&self, global_slot: u64) -> Option<ValidatorId>;
+    /// Deterministic fallback: when the VRF election yields no winner for a bundle,
+    /// fall back to the scheduled leader for the bundle's starting slot. `bundle_start`
+    /// is the first slot of the bundle in global slot indexing.
+    fn fallback_leader_for_bundle(&self, bundle_start: u64) -> Option<ValidatorId>;
 
     fn epoch(&self) -> u64;
     fn epoch_slots(&self) -> u64;
@@ -190,12 +192,13 @@ impl ProposerSchedule for AliasSchedule {
         self.leaders = leaders;
     }
 
-    fn leader_for_slot(&self, global_slot: u64) -> Option<ValidatorId> {
+    fn fallback_leader_for_bundle(&self, bundle_start: u64) -> Option<ValidatorId> {
         if self.leaders.is_empty() || self.epoch_slots == 0 {
             return None;
         }
-        let idx = (global_slot % self.epoch_slots) as usize;
-        // idx is always within bounds because leaders.len() == epoch_slots
+        // Alias schedule is built per-slot; bundle fallback simply uses the bundle's
+        // starting slot to pick a deterministic leader.
+        let idx = (bundle_start % self.epoch_slots) as usize;
         Some(self.leaders[idx])
     }
 

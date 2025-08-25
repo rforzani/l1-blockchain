@@ -6,8 +6,14 @@ use l1_blockchain::mempool::{BlockSelectionLimits, MempoolConfig, MempoolImpl};
 use l1_blockchain::node::{BuiltBlock, SelectedIds, ProduceError, Node};
 use l1_blockchain::chain::{ApplyResult, Chain, DEFAULT_BUNDLE_LEN};
 use l1_blockchain::state::{Balances, Nonces, Commitments, Available};
-use l1_blockchain::types::{Block, BlockHeader, Tx, RevealTx};
+use l1_blockchain::types::{Block, BlockHeader, Tx, RevealTx, QC};
+use l1_blockchain::crypto::bls::BlsSignatureBytes;
+use bitvec::vec::BitVec;
 use ed25519_dalek::SigningKey;
+
+fn dummy_qc() -> QC {
+    QC { view: 0, block_id: [0u8;32], agg_sig: BlsSignatureBytes([0u8;96]), bitmap: BitVec::new() }
+}
 
 #[derive(Default)]
 struct FakeState {
@@ -63,6 +69,8 @@ impl DevNode for FakeNode {
             vrf_output,
             vrf_proof,
             vrf_preout,
+            view: 0,
+            justify_qc_hash: [0u8; 32],
             signature: [0u8;64],
         };
 
@@ -70,6 +78,7 @@ impl DevNode for FakeNode {
             transactions: Vec::<Tx>::new(),
             reveals:      Vec::<RevealTx>::new(),
             header,
+            justify_qc: dummy_qc(),
         };
 
         let built = BuiltBlock {
@@ -347,11 +356,12 @@ impl DevNode for BadSigNode {
             vrf_output,
             vrf_proof,
             vrf_preout,
+            view: 0,
+            justify_qc_hash: [0u8;32],
             // invalid signature on purpose
             signature: bad_sig,
         };
-
-        let block = Block { header, transactions: vec![], reveals: vec![] };
+        let block = Block { header, transactions: vec![], reveals: vec![], justify_qc: dummy_qc() };
         let built  = BuiltBlock {
             block: block.clone(),
             selected_ids: SelectedIds { commit: vec![], avail: vec![], reveal: vec![] }
@@ -433,10 +443,11 @@ impl DevNode for WrongParentNode {
             vrf_output,
             vrf_proof,
             vrf_preout,
+            view: 0,
+            justify_qc_hash: [0u8;32],
             signature: [0u8;64],
         };
-
-        let block = Block { header, transactions: vec![], reveals: vec![] };
+        let block = Block { header, transactions: vec![], reveals: vec![], justify_qc: dummy_qc() };
         let built = BuiltBlock {
             block: block.clone(),
             selected_ids: SelectedIds { commit: vec![], avail: vec![], reveal: vec![] }
