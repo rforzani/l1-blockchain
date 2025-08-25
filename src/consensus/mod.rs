@@ -91,13 +91,43 @@ impl HotStuff {
         self.parent_index.insert(id, header.parent_hash);
     }
 
-    pub fn on_new_slot(&mut self, _now_ms: u128) {
-        // next step (later): pacemaker timeout handling & view increment
+    pub fn on_new_slot(&mut self, now_ms: u128) {
+        if self.state.pacemaker.expired(now_ms) {
+            self.state.current_view += 1;
+            self.state.pacemaker.bump_backoff();
+            self.state.pacemaker.on_enter_view(now_ms);
+        }
     }
 
-    pub fn on_block_proposal(&mut self, _block: Block, _now_ms: u128) -> Result<(), Error> {
-        // next step (later)
-        Err(Error::Unimplemented)
+    pub fn on_block_proposal(&mut self, block: Block, _now_ms: u128) -> Result<(), Error> {
+        if block.header.proposer_id != self.validator_id {
+            return Err(Error::Unimplemented);
+        }
+
+        let committed = qc_commitment(
+            block.justify_qc.view,
+            &block.justify_qc.block_id,
+            &block.justify_qc.agg_sig,
+            &block.justify_qc.bitmap,
+        );
+        if block.header.justify_qc_hash != committed {
+            return Err(Error::QcCommitmentMismatch);
+        }
+
+        verify_qc(
+            &block.justify_qc.block_id,
+            block.justify_qc.view,
+            &block.justify_qc.agg_sig,
+            &block.justify_qc.bitmap,
+            &self.validator_pks,
+        )
+        .map_err(|_| Error::QcInvalid)?;
+
+        if block.justify_qc.view > self.state.high_qc.view {
+            self.state.high_qc = block.justify_qc.clone();
+        }
+
+        Ok(())
     }
 
     pub fn on_qc<S: BlockStore>(
