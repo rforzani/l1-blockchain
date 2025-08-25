@@ -3,7 +3,7 @@
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 use crate::codec::{header_bytes, header_signing_bytes};
-use crate::crypto::vrf::{build_vrf_msg, SchnorrkelVrf, VrfPubkey, VrfVerifier};
+use crate::crypto::vrf::{build_vrf_msg, vrf_eligible, SchnorrkelVrf, VrfPubkey, VrfVerifier};
 use crate::crypto::{addr_from_pubkey, addr_hex, hash_bytes_sha256, verify_ed25519};
 use crate::fees::{update_commit_base, update_exec_base, FeeState, FEE_PARAMS};
 use crate::pos::registry::{StakingConfig, ValidatorSet, ValidatorStatus};
@@ -202,30 +202,9 @@ impl Chain {
                 return Err(BlockError::BadSignature); // or BadVrf if you distinguish
             }
 
-            // (e) Stake-weighted threshold check: interpret output uniformly in [0, 2^64)
-            #[inline]
-            fn vrf_rand64(out32: &[u8; 32]) -> u64 {
-                let h = crate::crypto::hash_bytes_sha256(out32);
-                u64::from_be_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]])
-            }
-            #[inline]
-            fn vrf_threshold64(my_stake: u128, total: u128) -> u64 {
-                if total == 0 {
-                    return 0;
-                }
-                if my_stake >= total {
-                    // Single-validator or 100% stake → always eligible
-                    return u64::MAX;
-                }
-                // Safe: result < 2^64 because my_stake < total
-                let num = (my_stake as u128) << 64;
-                (num / total) as u64
-            }
-
+            // (e) Stake-weighted threshold check using shared helper
             let total = self.validator_set.total_stake();
-            let r64   = vrf_rand64(&header.vrf_output);
-            let thr   = vrf_threshold64(v.stake, total);
-            if r64 >= thr {
+            if !vrf_eligible(v.stake, total, &header.vrf_output) {
                 // Not eligible this bundle → reject
                 return Err(BlockError::NotScheduledLeader);
             }

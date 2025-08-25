@@ -10,15 +10,14 @@ use crate::stf::process_block;
 use crate::types::{Block, Hash, HotStuffState, Pacemaker, QC};
 use bitvec::vec::BitVec;
 use std::sync::Arc;
-use ed25519_dalek::ed25519::Error;
 use ed25519_dalek::{SigningKey, Signer};
 use crate::crypto::{addr_from_pubkey, addr_hex, hash_bytes_sha256};
 use crate::codec::header_signing_bytes;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::pos::registry::{StakingConfig, Validator, ValidatorId, ValidatorSet, ValidatorStatus};
 use crate::pos::schedule::ProposerSchedule;
-use crate::crypto::vrf::{build_vrf_msg, SchnorrkelVrfSigner, VrfPubkey, VrfSigner};
-use anyhow::{Result, Context, anyhow, bail};
+use crate::crypto::vrf::{build_vrf_msg, vrf_eligible, SchnorrkelVrfSigner, VrfSigner};
+use anyhow::{Result, anyhow, bail};
 
 pub struct StateBalanceView<'a> {
     balances: &'a Balances,
@@ -388,26 +387,6 @@ impl Node {
             return Err(ProduceError::NotProposer { slot, leader: None, mine: Some(proposer_id) });
         };
     
-        // Eligibility helpers
-        #[inline]
-        fn vrf_rand64(out32: &[u8; 32]) -> u64 {
-            let h = hash_bytes_sha256(out32);
-            u64::from_be_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]])
-        }
-        #[inline]
-        fn vrf_threshold64(my_stake: u128, total: u128) -> u64 {
-            if total == 0 {
-                return 0;
-            }
-            if my_stake >= total {
-                // Single-validator or 100% stake → always eligible
-                return u64::MAX;
-            }
-            // Safe: result < 2^64 because my_stake < total
-            let num = (my_stake as u128) << 64;
-            (num / total) as u64
-        }
-    
         // Build VRF message and check stake-weighted threshold
         let msg = build_vrf_msg(&self.chain.epoch_seed, bundle_start, proposer_id);
         let (mut vrf_out, mut vrf_pre, mut vrf_proof) = self
@@ -421,15 +400,12 @@ impl Node {
             .get(proposer_id)
             .expect("proposer_id present in active set");
         let total = self.chain.validator_set.total_stake();
-    
-        let r64 = vrf_rand64(&vrf_out);
-        let thr = vrf_threshold64(me.stake, total);
-    
+
         let fallback = self
             .chain
             .schedule
             .fallback_leader_for_bundle(bundle_start);
-        if r64 >= thr {
+        if !vrf_eligible(me.stake, total, &vrf_out) {
             // Not elected via VRF. Only continue if we're the deterministic fallback leader.
             if fallback != Some(proposer_id) {
                 return Err(ProduceError::NotProposer { slot, leader: fallback, mine: Some(proposer_id) });
