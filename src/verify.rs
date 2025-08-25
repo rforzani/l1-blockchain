@@ -72,7 +72,9 @@ pub fn verify_block_roots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{chain::DEFAULT_BUNDLE_LEN, types::{AccessList, Block, BlockHeader, CommitTx, ExecOutcome, Receipt, Tx}};
+    use crate::{chain::DEFAULT_BUNDLE_LEN, types::{AccessList, Block, BlockHeader, CommitTx, ExecOutcome, Receipt, Tx, QC}};
+    use crate::crypto::bls::BlsSignatureBytes;
+    use bitvec::vec::BitVec;
 
     fn fake_vrf_fields(proposer_id: u64) -> ([u8; 32], [u8; 32], Vec<u8>) {
         let mut m = Vec::with_capacity(16 + 8);
@@ -138,10 +140,15 @@ mod tests {
             vrf_output,
             vrf_proof,
             vrf_preout,
+            view: 0,
+            justify_qc_hash: [0u8;32],
             signature: [0u8; 64],
         };
-    
-        let mut block = Block::new(txs, header);
+
+        fn dummy_qc() -> QC {
+            QC { view: 0, block_id: [0u8;32], agg_sig: BlsSignatureBytes([0u8;96]), bitmap: BitVec::new() }
+        }
+        let mut block = Block::new(txs, header, dummy_qc());
     
         // One matching receipt initially
         let mut receipts = vec![Receipt {

@@ -1,6 +1,6 @@
 use crate::consensus::dev_loop::DevNode;
 use crate::consensus::HotStuff;
-use crate::crypto::bls::{verify_qc, BlsSigner};
+use crate::crypto::bls::{verify_qc, BlsSigner, BlsSignatureBytes};
 use crate::fees::FeeState;
 // src/node.rs
 use crate::mempool::{BalanceView, BlockSelectionLimits, CommitmentId, Mempool, MempoolImpl, SelectError, StateView, TxId};
@@ -8,6 +8,7 @@ use crate::state::{Balances, Nonces, Commitments, Available};
 use crate::chain::{ApplyResult, Chain, DEFAULT_BUNDLE_LEN};
 use crate::stf::process_block;
 use crate::types::{Block, Hash, HotStuffState, Pacemaker, QC};
+use bitvec::vec::BitVec;
 use std::sync::Arc;
 use ed25519_dalek::ed25519::Error;
 use ed25519_dalek::{SigningKey, Signer};
@@ -15,6 +16,7 @@ use crate::crypto::{addr_from_pubkey, addr_hex, hash_bytes_sha256};
 use crate::codec::header_signing_bytes;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::pos::registry::{StakingConfig, Validator, ValidatorId, ValidatorSet, ValidatorStatus};
+use crate::pos::schedule::ProposerSchedule;
 use crate::crypto::vrf::{build_vrf_msg, SchnorrkelVrfSigner, VrfPubkey, VrfSigner};
 use anyhow::{Result, Context, anyhow, bail};
 
@@ -312,21 +314,6 @@ impl Node {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
     }
 
-    // Top 64 bits of SHA-256(vrf_output) for uniform compare
-    #[inline]
-    fn vrf_rand64(out32: &[u8;32]) -> u64 {
-        let h = hash_bytes_sha256(out32);
-        u64::from_be_bytes([h[0],h[1],h[2],h[3],h[4],h[5],h[6],h[7]])
-    }
-
-    #[inline]
-    fn vrf_threshold64(my_stake: u128, total: u128) -> u64 {
-        if total == 0 { return 0; }
-        // floor((stake/total) * 2^64)
-        let num = (my_stake as u128) << 64;
-        (num / total) as u64
-    }
-
     /// Look up our ValidatorId in the current validator set by matching the ed25519 pubkey.
     /// Returns None if we are not part of the active snapshot.
     fn my_validator_id(&self) -> Option<ValidatorId> {
@@ -397,7 +384,7 @@ impl Node {
         let Some(proposer_id) = self.my_validator_id() else {
             return Err(ProduceError::NotProposer { slot, leader: None, mine: None });
         };
-        let Some(vrf) = &self.vrf_signer else {
+        let Some(_vrf) = &self.vrf_signer else {
             return Err(ProduceError::NotProposer { slot, leader: None, mine: Some(proposer_id) });
         };
     
@@ -423,10 +410,11 @@ impl Node {
     
         // Build VRF message and check stake-weighted threshold
         let msg = build_vrf_msg(&self.chain.epoch_seed, bundle_start, proposer_id);
-        let (vrf_out, vrf_pre, vrf_proof) = self.vrf_signer
+        let (mut vrf_out, mut vrf_pre, mut vrf_proof) = self
+            .vrf_signer
             .as_ref()
             .map(|s| s.vrf_prove(&msg))
-            .unwrap_or(([0u8;32], [0u8;32], Vec::new()));
+            .unwrap_or(([0u8; 32], [0u8; 32], Vec::new()));
         
         let me = self.chain
             .validator_set
@@ -437,9 +425,19 @@ impl Node {
         let r64 = vrf_rand64(&vrf_out);
         let thr = vrf_threshold64(me.stake, total);
     
+        let fallback = self
+            .chain
+            .schedule
+            .fallback_leader_for_bundle(bundle_start);
         if r64 >= thr {
-            // Not elected for this bundle: do not propose.
-            return Err(ProduceError::NotProposer { slot, leader: None, mine: Some(proposer_id) });
+            // Not elected via VRF. Only continue if we're the deterministic fallback leader.
+            if fallback != Some(proposer_id) {
+                return Err(ProduceError::NotProposer { slot, leader: fallback, mine: Some(proposer_id) });
+            }
+            // Use empty VRF fields to signal alias fallback.
+            vrf_out = [0u8; 32];
+            vrf_pre = [0u8; 32];
+            vrf_proof.clear();
         }
     
         // 0) Prune stale items before building any view or selecting.
@@ -469,38 +467,61 @@ impl Node {
         // Per-block randomness committed in header
         let randomness = self.derive_block_randomness(next_height, slot);
     
+        // HotStuff view/QC: use current consensus state if enabled
+        let view = self
+            .hotstuff
+            .as_ref()
+            .map(|h| h.state.current_view)
+            .unwrap_or(0);
+        let justify_qc = self
+            .hotstuff
+            .as_ref()
+            .map(|h| h.state.high_qc.clone())
+            .unwrap_or(QC {
+                view: 0,
+                block_id: self.chain.tip_hash,
+                agg_sig: BlsSignatureBytes([0u8; 96]),
+                bitmap: BitVec::new(),
+            });
+
         // 3) Build a block with an unsigned header; STF computes roots/gas then we sign
-        let mut block = crate::types::Block {
-            header: crate::types::BlockHeader {
-                parent_hash:     self.chain.tip_hash,
-                height:          next_height,
-                txs_root:        [0u8; 32], // filled after STF run
-                receipts_root:   [0u8; 32], // filled after STF run
-                gas_used:        0,         // filled after STF run
-                randomness,
-                reveal_set_root: [0u8; 32], // filled after STF run
-                il_root:         [0u8; 32], // filled after STF run
-                exec_base_fee:   self.chain.fee_state.exec_base,
-                commit_base_fee: self.chain.fee_state.commit_base,
-                avail_base_fee:  self.chain.fee_state.avail_base,
-                timestamp:       ts_sec,
-    
-                // proposer identity / schedule
-                slot,
-                epoch,
-                proposer_id,
-    
-                // Vortex PoS fields
-                bundle_len: r,
-                vrf_output: vrf_out,
-                vrf_proof:  vrf_proof.clone(),
-                vrf_preout: vrf_pre,
-    
-                signature:       [0u8; 64], // filled after signing below
-            },
-            transactions: cand.txs.clone(),
-            reveals:      cand.reveals.clone(),
+        let header = crate::types::BlockHeader {
+            parent_hash:     self.chain.tip_hash,
+            height:          next_height,
+            txs_root:        [0u8; 32], // filled after STF run
+            receipts_root:   [0u8; 32], // filled after STF run
+            gas_used:        0,         // filled after STF run
+            randomness,
+            reveal_set_root: [0u8; 32], // filled after STF run
+            il_root:         [0u8; 32], // filled after STF run
+            exec_base_fee:   self.chain.fee_state.exec_base,
+            commit_base_fee: self.chain.fee_state.commit_base,
+            avail_base_fee:  self.chain.fee_state.avail_base,
+            timestamp:       ts_sec,
+
+            // proposer identity / schedule
+            slot,
+            epoch,
+            proposer_id,
+
+            // Vortex PoS fields
+            bundle_len: r,
+            vrf_preout: vrf_pre,
+            vrf_output: vrf_out,
+            vrf_proof:  vrf_proof.clone(),
+
+            // HotStuff/consensus fields
+            view,
+            justify_qc_hash: [0u8; 32],
+
+            signature: [0u8; 64], // filled after signing below
         };
+        let mut block = crate::types::Block::new_with_reveals(
+            cand.txs.clone(),
+            cand.reveals.clone(),
+            header,
+            justify_qc,
+        );
     
         // 4) Simulate execution to compute canonical roots/gas/receipts (does not mutate Chain)
         let mut sim_balances    = self.balances.clone();

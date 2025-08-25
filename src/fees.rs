@@ -423,6 +423,8 @@ mod tests {
                 vrf_output,
                 vrf_proof,
                 vrf_preout,
+                view: 0,
+                justify_qc_hash: [0u8;32],
                 signature:       [0u8; 64],
             }
         };
