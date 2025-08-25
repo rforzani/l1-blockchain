@@ -1,5 +1,4 @@
-use schnorrkel::{Keypair, PublicKey, MiniSecretKey, ExpansionMode, signing_context};
-use crate::crypto::hash_bytes_sha256;
+use schnorrkel::{Keypair, MiniSecretKey, ExpansionMode};
 
 pub const VRF_OUTPUT_BYTES: usize = 32;
 pub type VrfOutput = [u8; VRF_OUTPUT_BYTES];
@@ -38,7 +37,6 @@ impl SchnorrkelVrfSigner {
     pub fn public_bytes(&self) -> [u8; 32] { self.kp.public.to_bytes() }
 }
 
-const CTX: &[u8] = b"l1-vortex/vrf";
 
 /// ===== Production path: real schnorrkel VRF (uses OS randomness) =====
 #[cfg(not(feature = "vrf_deterministic"))]
@@ -131,4 +129,56 @@ pub fn build_vrf_msg(epoch_seed: &[u8; 32], bundle_start_slot: u64, proposer_id:
     m.extend_from_slice(&bundle_start_slot.to_be_bytes());
     m.extend_from_slice(&proposer_id.to_be_bytes());
     m
+}
+
+/// Returns true if a validator with `stake` in a validator set with `total`
+/// stake is eligible given a 32-byte VRF output. The output is first hashed to
+/// derive an unbiased 64-bit value which is then compared against the
+/// stake-weighted threshold `(stake / total) * 2^64`.
+pub fn vrf_eligible(stake: u128, total: u128, out: &VrfOutput) -> bool {
+    if total == 0 {
+        return false;
+    }
+    if stake >= total {
+        // Single-validator or full stake – effectively always eligible.
+        return true;
+    }
+
+    let h = crate::crypto::hash_bytes_sha256(out);
+    let r64 = u64::from_be_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]]);
+    let num = stake << 64;
+    let thr = (num / total) as u64;
+    r64 < thr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::hash_bytes_sha256;
+
+    #[test]
+    fn zero_total_stake_not_eligible() {
+        let out = [0u8; 32];
+        assert!(!vrf_eligible(10, 0, &out));
+    }
+
+    #[test]
+    fn single_validator_always_eligible() {
+        let out = [0u8; 32];
+        assert!(vrf_eligible(100, 100, &out));
+    }
+
+    #[test]
+    fn threshold_boundaries() {
+        let out = [0u8; 32];
+        let h = hash_bytes_sha256(&out);
+        let r64 = u64::from_be_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]]);
+        let total = 1u128 << 64; // 2^64
+
+        // Exactly at threshold -> not eligible
+        assert!(!vrf_eligible(r64 as u128, total, &out));
+
+        // Just over threshold -> eligible
+        assert!(vrf_eligible((r64 as u128) + 1, total, &out));
+    }
 }
