@@ -77,6 +77,7 @@ impl DevNode for FakeNode {
         let block = Block {
             transactions: Vec::<Tx>::new(),
             reveals:      Vec::<RevealTx>::new(),
+            batch_digests: Vec::new(),
             header,
             justify_qc: dummy_qc(),
         };
@@ -361,7 +362,7 @@ impl DevNode for BadSigNode {
             // invalid signature on purpose
             signature: bad_sig,
         };
-        let block = Block { header, transactions: vec![], reveals: vec![], justify_qc: dummy_qc() };
+        let block = Block { header, transactions: vec![], reveals: vec![], batch_digests: vec![], justify_qc: dummy_qc() };
         let built  = BuiltBlock {
             block: block.clone(),
             selected_ids: SelectedIds { commit: vec![], avail: vec![], reveal: vec![] }
@@ -447,7 +448,7 @@ impl DevNode for WrongParentNode {
             justify_qc_hash: [0u8;32],
             signature: [0u8;64],
         };
-        let block = Block { header, transactions: vec![], reveals: vec![], justify_qc: dummy_qc() };
+        let block = Block { header, transactions: vec![], reveals: vec![], batch_digests: vec![], justify_qc: dummy_qc() };
         let built = BuiltBlock {
             block: block.clone(),
             selected_ids: SelectedIds { commit: vec![], avail: vec![], reveal: vec![] }

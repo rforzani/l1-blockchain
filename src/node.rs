@@ -3,7 +3,7 @@ use crate::consensus::HotStuff;
 use crate::crypto::bls::{verify_qc, BlsSigner, BlsSignatureBytes};
 use crate::fees::FeeState;
 // src/node.rs
-use crate::mempool::{BalanceView, BlockSelectionLimits, CommitmentId, Mempool, MempoolImpl, SelectError, StateView, TxId};
+use crate::mempool::{BalanceView, BlockSelectionLimits, CommitmentId, Mempool, MempoolImpl, SelectError, StateView, TxId, Batch};
 use crate::state::{Balances, Nonces, Commitments, Available};
 use crate::chain::{ApplyResult, Chain, DEFAULT_BUNDLE_LEN};
 use crate::stf::process_block;
@@ -493,11 +493,15 @@ impl Node {
             signature: [0u8; 64], // filled after signing below
         };
         let mut block = crate::types::Block::new_with_reveals(
-            cand.txs.clone(),
+            Vec::new(),
             cand.reveals.clone(),
             header,
             justify_qc,
         );
+        // Package selected transactions into a batch referenced by digest
+        let batch = Batch::new(cand.txs.clone(), Vec::new(), proposer_id, [0u8; 64]);
+        self.chain.batch_store.insert(batch.clone());
+        block.batch_digests.push(batch.id);
     
         // 4) Simulate execution to compute canonical roots/gas/receipts (does not mutate Chain)
         let mut sim_balances    = self.balances.clone();
@@ -511,6 +515,7 @@ impl Node {
     
         let body = process_block(
             &block,
+            &self.chain.batch_store,
             &mut sim_balances,
             &mut sim_nonces,
             &mut sim_commitments,

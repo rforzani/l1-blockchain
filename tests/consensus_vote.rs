@@ -122,6 +122,7 @@ fn proposal_triggers_qc_creation() {
             Block {
                 transactions: vec![],
                 reveals: vec![],
+                batch_digests: vec![],
                 header,
                 justify_qc: qc.clone(),
             }
