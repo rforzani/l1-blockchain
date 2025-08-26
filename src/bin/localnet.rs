@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::SigningKey;
-use tokio::{net::TcpListener, time::{sleep, Duration}};
+use tokio::{net::TcpListener, time::Duration};
 
 use l1_blockchain::{
     consensus::dev_loop::DEFAULT_LIMITS, crypto::vrf::SchnorrkelVrfSigner, mempool::{MempoolConfig, MempoolImpl}, node::Node, rpc::{self, AppState, FaucetLimiter}
@@ -40,13 +40,14 @@ async fn main() -> anyhow::Result<()> {
     {
         let shared2 = shared.clone();
         tokio::spawn(async move {
+            // Use `interval` so that block production stays aligned to the
+            // 1-second slot boundary even if producing a block takes time.
+            let mut ticker = tokio::time::interval(Duration::from_millis(1000));
             loop {
-                {
-                    let mut n = shared2.lock().unwrap();
-                    // Ignore the result here for dev; errors will be visible in logs
-                    let _ = n.produce_block(DEFAULT_LIMITS.clone());
-                }
-                sleep(Duration::from_millis(1000)).await;
+                ticker.tick().await;
+                let mut n = shared2.lock().unwrap();
+                // Ignore the result here for dev; errors will be visible in logs
+                let _ = n.produce_block(DEFAULT_LIMITS.clone());
             }
         });
     }
