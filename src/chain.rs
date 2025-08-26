@@ -6,7 +6,7 @@ use crate::codec::{header_bytes, header_signing_bytes};
 use crate::crypto::vrf::{build_vrf_msg, vrf_eligible, SchnorrkelVrf, VrfPubkey, VrfVerifier};
 use crate::crypto::{addr_from_pubkey, addr_hex, hash_bytes_sha256, verify_ed25519};
 use crate::fees::{update_commit_base, update_exec_base, FeeState, FEE_PARAMS};
-use crate::pos::registry::{StakingConfig, ValidatorSet, ValidatorStatus};
+use crate::pos::registry::{StakingConfig, ValidatorSet, ValidatorStatus, ValidatorId};
 use crate::pos::schedule::{AliasSchedule, ProposerSchedule};
 use crate::pos::slots::SlotClock;
 use crate::stf::{process_block, BlockError};
@@ -36,6 +36,8 @@ pub struct Chain {
     pub schedule: AliasSchedule,
     pub epoch_accumulator: [u8; 32],
     pub batch_store: BatchStore,
+    /// VRF tie-break cache: maps bundle_start to (proposer_id, vrf_output)
+    bundle_winners: HashMap<u64, (ValidatorId, [u8; 32])>,
 }
 
 #[derive(Clone)]
@@ -96,6 +98,7 @@ impl Chain {
             schedule,
             epoch_accumulator,
             batch_store: BatchStore::new(),
+            bundle_winners: HashMap::new(),
         }
     }
 
@@ -145,7 +148,7 @@ impl Chain {
         self.epoch_accumulator = hash_bytes_sha256(&buf);
     }
 
-    pub fn verify_header_proposer(&self, header: &crate::types::BlockHeader) -> Result<(), BlockError> {
+    pub fn verify_header_proposer(&mut self, header: &crate::types::BlockHeader) -> Result<(), BlockError> {
         // 1) Height/slot policy: strictly the next block (adjust if your policy differs)
         if header.height != self.height + 1 {
             return Err(BlockError::WrongSlot);
@@ -210,6 +213,25 @@ impl Chain {
             if !vrf_eligible(v.stake, total, &header.vrf_output) {
                 // Not eligible this bundle → reject
                 return Err(BlockError::NotScheduledLeader);
+            }
+
+            // (f) Tie-break if multiple VRF winners exist for this bundle.
+            self.bundle_winners.retain(|&k, _| k >= bundle_start);
+            match self.bundle_winners.get(&bundle_start) {
+                Some((winner_id, winner_out)) => {
+                    if &header.vrf_output < winner_out {
+                        self.bundle_winners
+                            .insert(bundle_start, (header.proposer_id, header.vrf_output));
+                    } else if &header.vrf_output == winner_out && header.proposer_id == *winner_id {
+                        // same winner; OK
+                    } else {
+                        return Err(BlockError::NotScheduledLeader);
+                    }
+                }
+                None => {
+                    self.bundle_winners
+                        .insert(bundle_start, (header.proposer_id, header.vrf_output));
+                }
             }
         }
     
@@ -806,6 +828,82 @@ mod tests {
         assert_eq!(chain.height, 1);
         let expected_tip = hash_bytes_sha256(&header_bytes(&block.header));
         assert_eq!(chain.tip_hash, expected_tip);
+    }
+
+    #[test]
+    fn vrf_tie_break_lexicographic_smallest_wins() {
+        use crate::codec::header_signing_bytes;
+        use crate::crypto::vrf::{SchnorrkelVrfSigner, VrfSigner, build_vrf_msg};
+        use crate::pos::registry::{Validator, ValidatorSet, ValidatorStatus, StakingConfig};
+        use ed25519_dalek::SigningKey;
+        use crate::types::BlockHeader;
+        use crate::stf::BlockError;
+
+        let mut chain = Chain::new();
+        let seed = [1u8;32];
+
+        // two validators with deterministic VRF keys
+        let vrf1 = SchnorrkelVrfSigner::from_deterministic_seed([5u8;32]);
+        let vrf2 = SchnorrkelVrfSigner::from_deterministic_seed([6u8;32]);
+        let sk1 = SigningKey::from_bytes(&[1u8;32]);
+        let sk2 = SigningKey::from_bytes(&[2u8;32]);
+
+        let v1 = Validator { id:1, ed25519_pubkey: sk1.verifying_key().to_bytes(), bls_pubkey: None, vrf_pubkey: vrf1.public_bytes(), stake:1, status: ValidatorStatus::Active };
+        let v2 = Validator { id:2, ed25519_pubkey: sk2.verifying_key().to_bytes(), bls_pubkey: None, vrf_pubkey: vrf2.public_bytes(), stake:1, status: ValidatorStatus::Active };
+        let cfg = StakingConfig { min_stake:1, unbonding_epochs:1, max_validators:u32::MAX };
+        let set = ValidatorSet::from_genesis(0, &cfg, vec![v1, v2]);
+        chain.init_genesis(set, seed);
+
+        let slot = 1u64;
+        let epoch = chain.clock.current_epoch(slot);
+        let bundle_len = DEFAULT_BUNDLE_LEN;
+        let bundle_start = chain.clock.bundle_start(slot, bundle_len);
+
+        let msg1 = build_vrf_msg(&chain.epoch_seed, bundle_start, 1);
+        let (out1, pre1, proof1) = vrf1.vrf_prove(&msg1);
+        let msg2 = build_vrf_msg(&chain.epoch_seed, bundle_start, 2);
+        let (out2, pre2, proof2) = vrf2.vrf_prove(&msg2);
+
+        let mk_header = |pid: u64, out: [u8;32], pre: [u8;32], proof: Vec<u8>| -> BlockHeader {
+            BlockHeader {
+                parent_hash: chain.tip_hash,
+                height: 1,
+                txs_root: [0u8;32],
+                receipts_root: [0u8;32],
+                gas_used: 0,
+                randomness: [0u8;32],
+                reveal_set_root: [0u8;32],
+                il_root: [0u8;32],
+                exec_base_fee: chain.fee_state.exec_base,
+                commit_base_fee: chain.fee_state.commit_base,
+                avail_base_fee: chain.fee_state.avail_base,
+                timestamp: 0,
+                slot,
+                epoch,
+                proposer_id: pid,
+                bundle_len,
+                vrf_preout: pre,
+                vrf_output: out,
+                vrf_proof: proof,
+                view: 0,
+                justify_qc_hash: [0u8;32],
+                signature: [0u8;64],
+            }
+        };
+
+        // header from validator with smaller VRF output (id=2)
+        let mut header_small = mk_header(2, out2, pre2, proof2.clone());
+        let pre_small = header_signing_bytes(&header_small);
+        header_small.signature = sk2.sign(&pre_small).to_bytes();
+        // header from validator with larger VRF output (id=1)
+        let mut header_large = mk_header(1, out1, pre1, proof1.clone());
+        let pre_large = header_signing_bytes(&header_large);
+        header_large.signature = sk1.sign(&pre_large).to_bytes();
+
+        // accept smaller VRF output first
+        assert!(chain.verify_header_proposer(&header_small).is_ok());
+        // larger output should now be rejected for this bundle
+        assert!(matches!(chain.verify_header_proposer(&header_large), Err(BlockError::NotScheduledLeader)));
     }
 
     #[test]
