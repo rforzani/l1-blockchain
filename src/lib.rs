@@ -12,3 +12,4 @@ pub mod gas;
 pub mod node;
 pub mod consensus;
 pub mod pos;
+pub mod devnet;
