@@ -608,6 +608,23 @@ impl Node {
         self.mempool.revalidate_affordability(&view, &self.chain.fee_state);
         self.mempool.evict_stale(self.chain.height);
 
+        // HotStuff: single-process vote aggregation and high_qc update.
+        if let Some(hs) = self.hotstuff.as_mut() {
+            // Track parent lineage for safety checks.
+            hs.observe_block_header(&built.block.header);
+
+            let now_ms = (Self::now_ts() as u128) * 1000;
+            // As leader, validate the proposal we're about to broadcast.
+            let _ = hs.on_block_proposal(built.block.clone(), now_ms);
+
+            // Vote on the proposal and, if we are the leader, aggregate.
+            if let Some(vote) = hs.maybe_vote_self(&built.block) {
+                if let Some(qc) = hs.on_vote(vote) {
+                    let _ = hs.on_qc_self(qc, now_ms);
+                }
+            }
+        }
+
         Ok((built, res))
     }
 
@@ -628,8 +645,9 @@ mod tests {
     use crate::fees::FeeState;
     use crate::types::{Transaction, Tx, CommitTx, RevealTx, Address};
     use crate::stf::PROCESS_BLOCK_CALLS;
-    use crate::codec::{tx_bytes, access_list_bytes, string_bytes};
+    use crate::codec::{tx_bytes, access_list_bytes, string_bytes, header_id};
     use crate::crypto::{commitment_hash, commit_signing_preimage, addr_from_pubkey, addr_hex};
+    use crate::crypto::bls::{BlsSigner, BlsAggregate, vote_msg};
 
     struct TestBalanceView;
     impl BalanceView for TestBalanceView {
@@ -818,5 +836,49 @@ mod tests {
         node.produce_block(limits).unwrap();
     
         PROCESS_BLOCK_CALLS.with(|c| assert_eq!(c.get(), 1));
+    }
+
+    #[test]
+    fn hotstuff_updates_high_qc() {
+        let cfg = MempoolConfig {
+            max_avails_per_block: 10,
+            max_reveals_per_block: 10,
+            max_commits_per_block: 10,
+            max_pending_commits_per_account: 10,
+            commit_ttl_blocks: 2,
+            reveal_window_blocks: 2,
+        };
+        let mp = MempoolImpl::new(cfg);
+        let mut node = Node::new(mp.clone(), SigningKey::from_bytes(&[1u8;32]));
+        node.set_vrf_signer(SchnorrkelVrfSigner::from_deterministic_seed([7u8;32]));
+        node.install_self_as_genesis_validator(0, 100);
+
+        let bls_signer = BlsSigner::from_sk_bytes(&[2u8;32]).unwrap();
+        let bls_pk = bls_signer.public_key_bytes();
+        node.chain.validator_set.validators[0].bls_pubkey = Some(bls_pk);
+
+        let genesis_id = node.chain.tip_hash;
+        let msg = vote_msg(&genesis_id, 0);
+        let sig = bls_signer.sign(&msg);
+        let mut agg = BlsAggregate::new();
+        agg.push(&sig.0);
+        let agg_sig = agg.finalize().unwrap();
+        let mut bitmap = BitVec::repeat(false, 1);
+        bitmap.set(0, true);
+        let qc0 = QC { view: 0, block_id: genesis_id, agg_sig, bitmap };
+
+        let mut pm = Pacemaker::new(1000, 10000, 2, 1);
+        pm.on_enter_view(node.chain.now_ts());
+        let hs_state = HotStuffState { current_view: 1, locked_block: (genesis_id, 0), high_qc: qc0, pacemaker: pm };
+        node.hotstuff = Some(HotStuff::new(hs_state, vec![bls_pk], 0, Some(bls_signer)));
+
+        node.align_clock_for_test();
+        let limits = BlockSelectionLimits { max_avails: 10, max_reveals: 10, max_commits: 10 };
+        let (built, _) = node.produce_block(limits).expect("block");
+
+        let hs = node.hotstuff.as_ref().unwrap();
+        let bid = header_id(&built.block.header);
+        assert_eq!(hs.state.high_qc.block_id, bid);
+        assert_eq!(hs.state.high_qc.view, built.block.header.view);
     }
 }

@@ -286,7 +286,50 @@ impl HotStuff {
             }
         }
         None
-    }    
+    }
+
+    /// Convenience wrapper for [`maybe_vote`] that snapshots the current
+    /// parent index and uses it as a temporary `BlockStore`.
+    pub fn maybe_vote_self(&mut self, block: &Block) -> Option<Vote> {
+        struct TmpStore(HashMap<Hash, Hash>);
+        impl BlockStore for TmpStore {
+            fn is_descendant(&self, candidate_parent: &Hash, ancestor: &Hash) -> bool {
+                if candidate_parent == ancestor { return true; }
+                let mut cur = *candidate_parent;
+                while let Some(p) = self.0.get(&cur) {
+                    if p == ancestor { return true; }
+                    cur = *p;
+                }
+                false
+            }
+            fn get_parent(&self, block_id: &Hash) -> Option<Hash> {
+                self.0.get(block_id).cloned()
+            }
+        }
+        let store = TmpStore(self.parent_index.clone());
+        self.maybe_vote(&store, block)
+    }
+
+    /// Convenience wrapper for [`on_qc`] using a snapshot `BlockStore`.
+    pub fn on_qc_self(&mut self, qc: QC, now_ms: u128) -> Result<Option<Hash>, Error> {
+        struct TmpStore(HashMap<Hash, Hash>);
+        impl BlockStore for TmpStore {
+            fn is_descendant(&self, candidate_parent: &Hash, ancestor: &Hash) -> bool {
+                if candidate_parent == ancestor { return true; }
+                let mut cur = *candidate_parent;
+                while let Some(p) = self.0.get(&cur) {
+                    if p == ancestor { return true; }
+                    cur = *p;
+                }
+                false
+            }
+            fn get_parent(&self, block_id: &Hash) -> Option<Hash> {
+                self.0.get(block_id).cloned()
+            }
+        }
+        let store = TmpStore(self.parent_index.clone());
+        self.on_qc(&store, qc, now_ms)
+    }
 }
 
 impl BlockStore for HotStuff {
