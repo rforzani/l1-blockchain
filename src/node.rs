@@ -3,11 +3,11 @@ use crate::consensus::HotStuff;
 use crate::crypto::bls::{verify_qc, BlsSigner, BlsSignatureBytes};
 use crate::fees::FeeState;
 // src/node.rs
-use crate::mempool::{BalanceView, BlockSelectionLimits, CommitmentId, Mempool, MempoolImpl, SelectError, StateView, TxId, Batch};
+use crate::mempool::{BalanceView, BlockSelectionLimits, CommitmentId, Mempool, MempoolImpl, SelectError, StateView, TxId, Batch, AdmissionError};
 use crate::state::{Balances, Nonces, Commitments, Available};
 use crate::chain::{ApplyResult, Chain, DEFAULT_BUNDLE_LEN};
 use crate::stf::process_block;
-use crate::types::{Block, Hash, HotStuffState, Pacemaker, QC};
+use crate::types::{Block, Hash, HotStuffState, Pacemaker, QC, RevealTx, AvailTx, CommitTx, Tx};
 use bitvec::vec::BitVec;
 use std::sync::Arc;
 use ed25519_dalek::{SigningKey, Signer};
@@ -364,6 +364,39 @@ impl Node {
 
     pub fn set_balance(&mut self, who: String, amount: u64) {
         self.balances.insert(who, amount);
+    }
+
+    pub fn rpc_insert_commit(&self, commit: CommitTx, fee_bid: u128) -> Result<TxId, AdmissionError> {
+        let view = StateBalanceView { balances: &self.balances };
+        self.mempool.insert_commit(
+            Tx::Commit(commit),
+            self.chain.height,
+            fee_bid,
+            &view,
+            &self.chain.fee_state,
+        )
+    }
+
+    pub fn rpc_insert_avail(&self, avail: AvailTx, fee_bid: u128) -> Result<TxId, AdmissionError> {
+        let view = StateBalanceView { balances: &self.balances };
+        self.mempool.insert_avail(
+            Tx::Avail(avail),
+            self.chain.height,
+            fee_bid,
+            &view,
+            &self.chain.fee_state,
+        )
+    }
+
+    pub fn rpc_insert_reveal(&self, reveal: RevealTx, fee_bid: u128) -> Result<TxId, AdmissionError> {
+        let view = StateBalanceView { balances: &self.balances };
+        self.mempool.insert_reveal(
+            reveal,
+            self.chain.height,
+            fee_bid,
+            &view,
+            &self.chain.fee_state,
+        )
     }
 
     fn simulate_block(
