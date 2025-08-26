@@ -7,11 +7,8 @@ use hex;
 use crate::node::Node;
 use crate::types::{CommitTx, AvailTx, RevealTx, Transaction, AccessList, StateKey};
 use crate::mempool::AdmissionError;
-
-#[derive(Clone)]
-pub struct AppState {
-    pub node: Arc<Mutex<Node>>,
-}
+use std::collections::HashMap;
+use time::OffsetDateTime;
 
 #[derive(Serialize)]
 struct StatusResp {
@@ -36,6 +33,58 @@ enum AccessKey {
 struct AccessListReq {
     reads:  Vec<AccessKey>,
     writes: Vec<AccessKey>,
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    pub node: std::sync::Arc<std::sync::Mutex<crate::node::Node>>,
+    pub faucet: std::sync::Arc<std::sync::Mutex<FaucetLimiter>>,
+}
+
+#[derive(Debug)]
+pub struct FaucetLimiter {
+    daily_limit: u64,
+    // addr(lowercased) -> (day_index, used_today)
+    book: HashMap<String, (u64, u64)>,
+}
+
+#[derive(Deserialize)]
+struct FaucetReq {
+    address: String,
+    // optional; if omitted, defaults to 100_000
+    amount: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct FaucetResp {
+    credited: u64,
+    balance: u64,
+    day_used: u64,
+    day_limit: u64,
+}
+
+impl FaucetLimiter {
+    pub fn new(daily_limit: u64) -> Self {
+        Self { daily_limit, book: HashMap::new() }
+    }
+    fn today() -> u64 {
+        (OffsetDateTime::now_utc().unix_timestamp() / 86_400) as u64
+    }
+    pub fn try_reserve(&mut self, addr: &str, amount: u64) -> Result<(), String> {
+        let today = Self::today();
+        let key = addr.to_lowercase();
+        let entry = self.book.entry(key).or_insert((today, 0));
+        if entry.0 != today {
+            entry.0 = today;
+            entry.1 = 0;
+        }
+        let used = entry.1;
+        if used.saturating_add(amount) > self.daily_limit {
+            return Err(format!("daily limit exceeded: used {used}, request {amount}, limit {}", self.daily_limit));
+        }
+        entry.1 = used + amount;
+        Ok(())
+    }
 }
 
 fn to_state_keys(v: Vec<AccessKey>) -> Vec<StateKey> {
@@ -114,6 +163,7 @@ pub fn router(state: AppState) -> Router {
         .route("/mempool/commit", post(submit_commit))
         .route("/mempool/avail",  post(submit_avail))
         .route("/mempool/reveal", post(submit_reveal))
+        .route("/faucet/claim",   post(faucet_claim))
         .with_state(state)
 }
 
@@ -169,6 +219,41 @@ async fn submit_reveal(State(state): State<AppState>, Json(req): Json<RevealReq>
     let node = state.node.lock().unwrap();
     let txid = node.rpc_insert_reveal(reveal, fee).map_err(adm_err)?;
     Ok(Json(SubmitResp { txid: hex::encode(txid.0) }))
+}
+
+// POST /faucet/claim  {"address":"0x....","amount":12345}
+async fn faucet_claim(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::Json(req): axum::Json<FaucetReq>,
+) -> Result<axum::Json<FaucetResp>, (StatusCode, String)> {
+    let amount = req.amount.unwrap_or(100_000);
+    if amount == 0 {
+        return Err((StatusCode::BAD_REQUEST, "amount must be > 0".into()));
+    }
+
+    // rate-limit accounting
+    let (used_after, limit) = {
+        let mut limiter = state.faucet.lock().unwrap();
+        limiter.try_reserve(&req.address, amount)
+            .map_err(|e| (StatusCode::TOO_MANY_REQUESTS, e))?;
+        // read back the “used today”
+        let key = req.address.to_lowercase();
+        let (day, used) = *limiter.book.get(&key).unwrap();
+        (used, limiter.daily_limit)
+    };
+
+    // credit balance directly
+    let new_balance = {
+        let mut node = state.node.lock().unwrap();
+        node.credit_balance_direct(&req.address, amount)
+    };
+
+    Ok(axum::Json(FaucetResp {
+        credited: amount,
+        balance: new_balance,
+        day_used: used_after,
+        day_limit: limit,
+    }))
 }
 
 fn adm_err(e: AdmissionError) -> (StatusCode, String) {

@@ -4,11 +4,7 @@ use ed25519_dalek::SigningKey;
 use tokio::{net::TcpListener, time::{sleep, Duration}};
 
 use l1_blockchain::{
-    rpc,
-    node::Node,
-    mempool::{MempoolConfig, MempoolImpl},
-    crypto::vrf::SchnorrkelVrfSigner,
-    consensus::dev_loop::DEFAULT_LIMITS
+    consensus::dev_loop::DEFAULT_LIMITS, crypto::vrf::SchnorrkelVrfSigner, mempool::{MempoolConfig, MempoolImpl}, node::Node, rpc::{self, AppState, FaucetLimiter}
 };
 
 #[tokio::main]
@@ -56,7 +52,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- RPC server (Axum 0.7) ---
-    let app = rpc::router(rpc::AppState { node: shared });
+    let app_state = AppState {
+        node: shared,
+        // e.g., 1_000_000 units/day/address cap — adjust to your token’s decimals
+        faucet: Arc::new(Mutex::new(FaucetLimiter::new(1_000_000))),
+    };
+    let app = rpc::router(app_state);
     let listener = TcpListener::bind("127.0.0.1:8545").await?;
     println!("RPC listening on http://127.0.0.1:8545");
     axum::serve(listener, app).await?;

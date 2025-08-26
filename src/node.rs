@@ -399,6 +399,23 @@ impl Node {
         )
     }
 
+    // Credits `amount` directly to `addr` balance (DEV/FAUCET ONLY).
+    // Returns the new balance.
+    pub fn credit_balance_direct(&mut self, addr: &str, amount: u64) -> u64 {
+        use std::collections::hash_map::Entry;
+        match self.balances.entry(addr.to_string()) {
+            Entry::Occupied(mut e) => {
+                let v = e.get_mut();
+                *v = v.saturating_add(amount);
+                *v
+            }
+            Entry::Vacant(e) => {
+                e.insert(amount);
+                amount
+            }
+        }
+    }
+
     fn simulate_block(
         &self,
         limits: BlockSelectionLimits,
