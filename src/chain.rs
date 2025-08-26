@@ -140,7 +140,7 @@ impl Chain {
 
         // Initialize the per-epoch accumulator deterministically.
         let mut buf = Vec::with_capacity(64);
-        buf.extend_from_slice(b"twinken/epoch-accum/start:v1");
+        buf.extend_from_slice(b"l1-blockchain/epoch-accum/start:v1");
         buf.extend_from_slice(&self.epoch_seed);
         self.epoch_accumulator = hash_bytes_sha256(&buf);
     }
