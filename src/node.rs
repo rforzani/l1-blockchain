@@ -683,7 +683,7 @@ impl Node {
 impl DevNode for Node {
     fn height(&self) -> u64 { self.height() }
 
-    fn produce_block(&mut self, limits: BlockSelectionLimits) -> Result<(BuiltBlock, ApplyResult), ProduceError> { self.produce_block(limits) }
+    fn produce_block(&mut self, limits: BlockSelectionLimits) -> Result<(BuiltBlock, ApplyResult), ProduceError> { Node::produce_block(self, limits) }
     
     fn now_unix(&self) -> u64 { Node::now_ts() } 
 }
