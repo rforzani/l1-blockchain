@@ -362,3 +362,16 @@ fn test_large_transaction_data() {
     let decrypted = engine.decrypt(&ciphertext, &shares).unwrap();
     assert_eq!(decrypted, large_data);
 }
+
+#[test]
+fn test_malformed_public_key_rejected() {
+    let validators = setup_test_validators(1);
+    let mut validator_pks: Vec<[u8; 48]> =
+        validators.iter().map(|v| v.bls_public_key()).collect();
+
+    // Push malformed key bytes that are not a valid BLS12-381 point
+    validator_pks.push([0u8; 48]);
+
+    let result = dkg::generate_threshold_public_key(&validator_pks, 0, 1);
+    assert!(matches!(result, Err(ThresholdError::InvalidPublicKey)));
+}

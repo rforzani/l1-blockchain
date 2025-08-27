@@ -717,9 +717,11 @@ pub mod dkg {
             return Err(ThresholdError::InvalidPublicKey);
         }
 
-        for pk_bytes in validator_pks {
-            mpk::PublicKey::from_bytes(pk_bytes).map_err(|_| ThresholdError::InvalidPublicKey)?;
-        }
+        validator_pks.iter().try_for_each(|pk_bytes| {
+            mpk::PublicKey::from_bytes(pk_bytes)
+                .map(|_| ())
+                .map_err(|_| ThresholdError::InvalidPublicKey)
+        })?;
 
         let threshold_pk_bytes = validator_pks[0];
 
