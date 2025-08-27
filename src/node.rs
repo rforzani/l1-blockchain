@@ -1,6 +1,6 @@
 use crate::consensus::dev_loop::DevNode;
 use crate::consensus::HotStuff;
-use crate::crypto::bls::{verify_qc, BlsSigner, BlsSignatureBytes};
+use crate::crypto::bls::{verify_qc, BlsSigner, BlsSignatureBytes, BlsAggregate, vote_msg};
 use crate::fees::FeeState;
 // src/node.rs
 use crate::mempool::{BalanceView, BlockSelectionLimits, CommitmentId, Mempool, MempoolImpl, SelectError, StateView, TxId, Batch, AdmissionError};
@@ -12,7 +12,7 @@ use bitvec::vec::BitVec;
 use std::sync::Arc;
 use ed25519_dalek::{SigningKey, Signer};
 use crate::crypto::{addr_from_pubkey, addr_hex, hash_bytes_sha256};
-use crate::codec::header_signing_bytes;
+use crate::codec::{header_signing_bytes, qc_commitment};
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::pos::registry::{StakingConfig, Validator, ValidatorId, ValidatorSet, ValidatorStatus};
 use crate::pos::schedule::ProposerSchedule;
@@ -79,6 +79,7 @@ pub struct Node {
     signer: SigningKey,
     proposer_pubkey: [u8; 32],
     vrf_signer: Option<SchnorrkelVrfSigner>,
+    bls_signer: Option<BlsSigner>,
     hotstuff: Option<HotStuff>,
 }
 
@@ -137,6 +138,7 @@ impl Node {
             signer,
             proposer_pubkey,
             vrf_signer: None,
+            bls_signer: None,
             hotstuff: None
         }
     }
@@ -221,8 +223,9 @@ impl Node {
 
         let hs_state = HotStuffState { current_view, locked_block, high_qc, pacemaker };
 
-        let hs = HotStuff::new(hs_state, active_bls_pks, my_id, bls_signer);
+        let hs = HotStuff::new(hs_state, active_bls_pks, my_id, bls_signer.clone());
         node.hotstuff = Some(hs);
+        node.bls_signer = bls_signer;
 
         Ok(node)
     }
@@ -287,17 +290,18 @@ impl Node {
             .public_bytes()
     }
 
-    pub fn install_self_as_genesis_validator(&mut self, id: ValidatorId, stake: u128) {
+    pub fn install_self_as_genesis_validator(&mut self, id: ValidatorId, stake: u128) -> BlsSigner {
         let cfg = StakingConfig {
             min_stake: 1,
             unbonding_epochs: 1,
             max_validators: u32::MAX,
         };
 
+        let bls_signer = BlsSigner::from_sk_bytes(&[1u8;32]).unwrap();
         let v = Validator {
             id,
             ed25519_pubkey: self.proposer_pubkey,
-            bls_pubkey: None,
+            bls_pubkey: Some(bls_signer.public_key_bytes()),
             vrf_pubkey: self.my_vrf_pubkey(),
             stake,
             status: ValidatorStatus::Active,
@@ -306,6 +310,8 @@ impl Node {
         let set = ValidatorSet::from_genesis(0, &cfg, vec![v]);
         let seed = hash_bytes_sha256(b"l1-blockchain/test-epoch-seed:v1");
         self.chain.init_genesis(set, seed);
+        self.bls_signer = Some(bls_signer.clone());
+        bls_signer
     }
 
     #[inline]
@@ -499,19 +505,29 @@ impl Node {
             .as_ref()
             .map(|h| h.state.current_view)
             .unwrap_or(0);
-        let justify_qc = self
-            .hotstuff
-            .as_ref()
-            .map(|h| h.state.high_qc.clone())
-            .unwrap_or(QC {
-                view: 0,
-                block_id: self.chain.tip_hash,
-                agg_sig: BlsSignatureBytes([0u8; 96]),
-                bitmap: BitVec::new(),
-            });
+        let (justify_qc, justify_qc_hash) = if let Some(h) = self.hotstuff.as_ref() {
+            let qc = h.state.high_qc.clone();
+            let hash = qc_commitment(qc.view, &qc.block_id, &qc.agg_sig, &qc.bitmap);
+            (qc, hash)
+        } else {
+            let bls = self
+                .bls_signer
+                .as_ref()
+                .expect("BLS signer required when HotStuff disabled");
+            let msg = vote_msg(&self.chain.tip_hash, self.chain.height);
+            let mut agg = BlsAggregate::new();
+            let sig = bls.sign(&msg);
+            agg.push(&sig.0);
+            let agg_sig = agg.finalize().unwrap();
+            let mut bitmap = BitVec::repeat(false, 1);
+            bitmap.set(0, true);
+            let qc = QC { view: self.chain.height, block_id: self.chain.tip_hash, agg_sig, bitmap };
+            let hash = qc_commitment(qc.view, &qc.block_id, &qc.agg_sig, &qc.bitmap);
+            (qc, hash)
+        };
 
         // 3) Build a block with an unsigned header; STF computes roots/gas then we sign
-        let header = crate::types::BlockHeader {
+        let mut header = crate::types::BlockHeader {
             parent_hash:     self.chain.tip_hash,
             height:          next_height,
             txs_root:        [0u8; 32], // filled after STF run
@@ -538,7 +554,7 @@ impl Node {
 
             // HotStuff/consensus fields
             view,
-            justify_qc_hash: [0u8; 32],
+            justify_qc_hash: justify_qc_hash,
 
             signature: [0u8; 64], // filled after signing below
         };
@@ -813,7 +829,7 @@ mod tests {
         node.set_vrf_signer(test_vrf);
     
         // Make this node the genesis validator with 100% stake (always eligible).
-        node.install_self_as_genesis_validator(1, 1_000_000);
+        let _bls = node.install_self_as_genesis_validator(1, 1_000_000);
     
         // ---- Align the slot with the dev policy: slot == height + 1 ----
         // Height is 0, so we need current_slot(now) == 1.
@@ -866,7 +882,7 @@ mod tests {
         node.set_vrf_signer(test_vrf);
 
         // NEW: make this node an active validator in the chain's validator set.
-        node.install_self_as_genesis_validator(1, 1_000_000);
+        let _bls = node.install_self_as_genesis_validator(1, 1_000_000);
 
         // Align the slot with the chain's height policy (slot == 1 at height 0)
         let now_ms: u128 = (node.now_unix() as u128) * 1000;
@@ -901,7 +917,7 @@ mod tests {
         let mp = MempoolImpl::new(cfg);
         let mut node = Node::new(mp.clone(), SigningKey::from_bytes(&[1u8;32]));
         node.set_vrf_signer(SchnorrkelVrfSigner::from_deterministic_seed([7u8;32]));
-        node.install_self_as_genesis_validator(0, 100);
+        let _my_bls = node.install_self_as_genesis_validator(0, 100);
 
         let bls_signer = BlsSigner::from_sk_bytes(&[2u8;32]).unwrap();
         let bls_pk = bls_signer.public_key_bytes();

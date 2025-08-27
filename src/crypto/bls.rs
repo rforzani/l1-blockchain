@@ -118,6 +118,7 @@ pub fn vote_msg(block_id: &[u8], view: u64) -> Vec<u8> {
 
 /// Validator BLS signer (keeps SecretKey in memory).
 /// Use only in validator processes; do NOT serialize/ship the secret key.
+#[derive(Clone)]
 pub struct BlsSigner(mpk::SecretKey);
 
 impl BlsSigner {
