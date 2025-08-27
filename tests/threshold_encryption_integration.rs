@@ -1,20 +1,22 @@
 //! Integration tests for threshold encryption in the full blockchain context
 
 use l1_blockchain::chain::Chain;
-use l1_blockchain::codec::{access_list_bytes, tx_bytes};
+use ed25519_dalek::{Signer, SigningKey};
+use l1_blockchain::codec::{access_list_bytes, string_bytes};
 use l1_blockchain::crypto::bls::BlsSigner;
-use l1_blockchain::crypto::{commitment_hash, hash_bytes_sha256};
+use l1_blockchain::crypto::{
+    addr_from_pubkey, addr_hex, avail_signing_preimage, commit_signing_preimage,
+};
 use l1_blockchain::fees::FeeState;
 use l1_blockchain::mempool::encrypted::dkg;
-use l1_blockchain::mempool::{ThresholdCiphertext, ThresholdEngine, ThresholdShare};
+use l1_blockchain::mempool::{ThresholdEngine, ThresholdShare};
 use l1_blockchain::pos::registry::{Validator, ValidatorSet, ValidatorStatus};
 use l1_blockchain::state::CHAIN_ID;
 use l1_blockchain::state::{Available, Balances, Commitments, Nonces};
 use l1_blockchain::stf::{process_block, process_commit};
 use l1_blockchain::types::{
-    AccessList, AvailTx, Block, BlockHeader, CommitTx, Event, Hash, RevealTx, Transaction, Tx,
+    AccessList, AvailTx, Block, BlockHeader, CommitTx, Event, StateKey,
 };
-use std::collections::HashMap;
 
 /// Create a test validator set with threshold encryption capabilities
 fn create_test_validator_set(n_validators: usize, epoch: u64) -> (ValidatorSet, ThresholdEngine) {
@@ -81,9 +83,24 @@ fn test_full_commit_avail_decrypt_flow() {
     let mut commitments = Commitments::new();
     let mut available = Available::new();
 
-    // Set up initial balance
-    let sender = "0x1234567890123456789012345678901234567890";
-    balances.insert(sender.to_string(), 10_000);
+    // Set up sender keypair and initial balance
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let verifying_key = signing_key.verifying_key();
+    let sender = addr_hex(&addr_from_pubkey(&verifying_key.to_bytes()));
+    balances.insert(sender.clone(), 10_000);
+
+    // Access list includes sender balance and nonce (read + write)
+    let mut access_list = AccessList {
+        reads: vec![
+            StateKey::Balance(sender.clone()),
+            StateKey::Nonce(sender.clone()),
+        ],
+        writes: vec![
+            StateKey::Balance(sender.clone()),
+            StateKey::Nonce(sender.clone()),
+        ],
+    };
+    access_list.canonicalize();
 
     let fee_state = FeeState {
         commit_base: 100,
@@ -94,17 +111,27 @@ fn test_full_commit_avail_decrypt_flow() {
     // 1. Create and process a commit transaction with encrypted payload
     let original_tx_data = b"secret transaction payload for testing";
     let encrypted_payload = chain.threshold_engine.encrypt(original_tx_data, 0).unwrap();
+    let commitment = [1u8; 32]; // Mock commitment hash
+
+    let al_bytes = access_list_bytes(&access_list);
+    let sender_bytes = string_bytes(&sender);
+    let encrypted_payload_hash = encrypted_payload.commitment_hash();
+    let commit_preimage = commit_signing_preimage(
+        &commitment,
+        &encrypted_payload_hash,
+        &sender_bytes,
+        &al_bytes,
+        CHAIN_ID,
+    );
+    let commit_sig = signing_key.sign(&commit_preimage);
 
     let commit_tx = CommitTx {
-        commitment: [1u8; 32], // Mock commitment hash
-        sender: sender.to_string(),
-        access_list: AccessList {
-            reads: vec![],
-            writes: vec![],
-        },
+        commitment,
+        sender: sender.clone(),
+        access_list: access_list.clone(),
         encrypted_payload: encrypted_payload.clone(),
-        pubkey: [2u8; 32],
-        sig: [3u8; 64],
+        pubkey: verifying_key.to_bytes(),
+        sig: commit_sig.to_bytes(),
     };
 
     // Process commit transaction
@@ -160,13 +187,15 @@ fn test_full_commit_avail_decrypt_flow() {
 
     // 3. Create and process availability transaction
     let payload_hash = encrypted_payload.commitment_hash();
+    let avail_preimage = avail_signing_preimage(&commit_tx.commitment, &sender_bytes, CHAIN_ID);
+    let avail_sig = signing_key.sign(&avail_preimage);
     let avail_tx = AvailTx {
         commitment: commit_tx.commitment,
-        sender: sender.to_string(),
+        sender: sender.clone(),
         payload_hash,
         payload_size: encrypted_payload.size() as u64,
-        pubkey: [4u8; 32],
-        sig: [5u8; 64],
+        pubkey: verifying_key.to_bytes(),
+        sig: avail_sig.to_bytes(),
     };
 
     // Process the avail transaction to mark commitment as available
@@ -174,7 +203,7 @@ fn test_full_commit_avail_decrypt_flow() {
         &avail_tx,
         &mut commitments,
         &mut available,
-        10, // current_height (after decryption delay)
+        3, // current_height within reveal window
         &mut events,
         &mut balances,
         &fee_state,
@@ -269,8 +298,23 @@ fn test_insufficient_threshold_shares() {
     let mut commitments = Commitments::new();
     let mut available = Available::new();
 
-    let sender = "0x1234567890123456789012345678901234567890";
-    balances.insert(sender.to_string(), 10_000);
+    // Sender keypair
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let verifying_key = signing_key.verifying_key();
+    let sender = addr_hex(&addr_from_pubkey(&verifying_key.to_bytes()));
+    balances.insert(sender.clone(), 10_000);
+
+    let mut access_list = AccessList {
+        reads: vec![
+            StateKey::Balance(sender.clone()),
+            StateKey::Nonce(sender.clone()),
+        ],
+        writes: vec![
+            StateKey::Balance(sender.clone()),
+            StateKey::Nonce(sender.clone()),
+        ],
+    };
+    access_list.canonicalize();
 
     let fee_state = FeeState {
         commit_base: 100,
@@ -282,16 +326,26 @@ fn test_insufficient_threshold_shares() {
     let original_tx_data = b"secret transaction payload";
     let encrypted_payload = chain.threshold_engine.encrypt(original_tx_data, 0).unwrap();
 
+    let commitment = [1u8; 32];
+    let al_bytes = access_list_bytes(&access_list);
+    let sender_bytes = string_bytes(&sender);
+    let encrypted_payload_hash = encrypted_payload.commitment_hash();
+    let preimage = commit_signing_preimage(
+        &commitment,
+        &encrypted_payload_hash,
+        &sender_bytes,
+        &al_bytes,
+        CHAIN_ID,
+    );
+    let sig = signing_key.sign(&preimage);
+
     let commit_tx = CommitTx {
-        commitment: [1u8; 32],
-        sender: sender.to_string(),
-        access_list: AccessList {
-            reads: vec![],
-            writes: vec![],
-        },
+        commitment,
+        sender: sender.clone(),
+        access_list: access_list.clone(),
         encrypted_payload: encrypted_payload.clone(),
-        pubkey: [2u8; 32],
-        sig: [3u8; 64],
+        pubkey: verifying_key.to_bytes(),
+        sig: sig.to_bytes(),
     };
 
     // Process commit
