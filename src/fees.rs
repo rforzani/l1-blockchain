@@ -168,6 +168,7 @@ mod tests {
     use crate::crypto::{
         addr_from_pubkey, addr_hex, commitment_hash, commit_signing_preimage, hash_bytes_sha256,
     };
+    use crate::mempool::encrypted::ThresholdCiphertext;
     use ed25519_dalek::{SigningKey, Signer};
 
     fn cap_step(prev: u64) -> u64 {
@@ -315,12 +316,18 @@ mod tests {
         let tx_ser = tx_bytes(tx);
         let al_bytes = access_list_bytes(&tx.access_list);
         let commitment = commitment_hash(&tx_ser, &al_bytes, &salt, CHAIN_ID);
-        let ciphertext_hash = hash_bytes_sha256(b"ciphertext");
+        let encrypted_payload = ThresholdCiphertext {
+            ephemeral_pk: [0u8; 48],
+            encrypted_data: vec![0u8; 32],
+            tag: [0u8; 32],
+            epoch: 1,
+        };
         let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
         let sender_bytes = string_bytes(&sender);
+        let encrypted_data_hash = hash_bytes_sha256(&encrypted_payload.encrypted_data);
         let preimage = commit_signing_preimage(
             &commitment,
-            &ciphertext_hash,
+            &encrypted_data_hash,
             &sender_bytes,
             &al_bytes,
             CHAIN_ID,
@@ -330,7 +337,7 @@ mod tests {
             commitment,
             sender,
             access_list: tx.access_list.clone(),
-            ciphertext_hash,
+            encrypted_payload,
             pubkey: signer.verifying_key().to_bytes(),
             sig,
         }

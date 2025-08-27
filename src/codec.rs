@@ -243,7 +243,8 @@ pub fn tx_enum_bytes(tx: &Tx) -> Vec<u8> {
         Tx::Commit(c) => {
             v.push(TAG_COMMIT);
             v.extend_from_slice(&c.commitment);        // 32
-            v.extend_from_slice(&c.ciphertext_hash);   // 32
+            let payload_hash = c.encrypted_payload.commitment_hash();
+            v.extend_from_slice(&payload_hash);   // 32
             put_str(&mut v, &c.sender);                // canonical
             put_access_list(&mut v, &c.access_list);   // canonical
             v.extend_from_slice(&c.pubkey);            // 32
@@ -252,6 +253,8 @@ pub fn tx_enum_bytes(tx: &Tx) -> Vec<u8> {
         Tx::Avail(a) => {
             v.push(TAG_AVAIL);
             v.extend_from_slice(&a.commitment);        // 32
+            v.extend_from_slice(&a.payload_hash);      // 32
+            v.extend_from_slice(&a.payload_size.to_le_bytes()); // 8
             put_str(&mut v, &a.sender);                // canonical
             v.extend_from_slice(&a.pubkey);            // 32
             v.extend_from_slice(&a.sig);               // 64
@@ -343,16 +346,28 @@ mod tests {
                 let pubkey: [u8; 32] = rd_fixed::<32>(&mut i, bytes).map_err(|e| e.to_string())?;
                 let sig:    [u8; 64] = rd_fixed::<64>(&mut i, bytes).map_err(|e| e.to_string())?;
 
+                // Create mock encrypted payload from the legacy ciphertext_hash
+                // In production, this would need proper migration logic
+                let mock_encrypted_payload = crate::mempool::encrypted::ThresholdCiphertext {
+                    ephemeral_pk: [0u8; 48],
+                    encrypted_data: ciphertext_hash.to_vec(), // Use hash as placeholder data
+                    tag: [0u8; 32],
+                    epoch: 0,
+                };
+                
                 Ok(Tx::Commit(CommitTx {
-                    commitment, ciphertext_hash, sender, access_list, pubkey, sig
+                    commitment, sender, access_list, encrypted_payload: mock_encrypted_payload, pubkey, sig
                 }))
             }
             TAG_AVAIL => {
                 let commitment: Hash = rd_fixed::<32>(&mut i, bytes).map_err(|e| e.to_string())?;
+                let payload_hash: Hash = rd_fixed::<32>(&mut i, bytes).map_err(|e| e.to_string())?;
+                let payload_size_bytes: [u8; 8] = rd_fixed::<8>(&mut i, bytes).map_err(|e| e.to_string())?;
+                let payload_size = u64::from_le_bytes(payload_size_bytes);
                 let sender = rd_str(&mut i, bytes).map_err(|e| e.to_string())?;
                 let pubkey: [u8; 32] = rd_fixed::<32>(&mut i, bytes).map_err(|e| e.to_string())?;
                 let sig:    [u8; 64] = rd_fixed::<64>(&mut i, bytes).map_err(|e| e.to_string())?;
-                Ok(Tx::Avail(AvailTx { commitment, sender, pubkey, sig }))
+                Ok(Tx::Avail(AvailTx { commitment, sender, payload_hash, payload_size, pubkey, sig }))
             }
             _ => Err("unknown tag".into()),
         }
@@ -370,13 +385,19 @@ mod tests {
 
     #[test]
     fn codec_roundtrip_commit_manual_decode() {
+        let mock_encrypted_payload = crate::mempool::encrypted::ThresholdCiphertext {
+            ephemeral_pk: [0x22u8; 48],
+            encrypted_data: vec![0x33u8; 64],
+            tag: [0x44u8; 32],
+            epoch: 0,
+        };
         let tx = Tx::Commit(CommitTx {
-            commitment:      nz32(0x11),
-            ciphertext_hash: nz32(0x22),
-            sender:          "Alice".into(),
-            access_list:     dummy_al(),
-            pubkey:          nz32(0xA1),
-            sig:             nz64(0xB2),
+            commitment: nz32(0x11),
+            sender: "Alice".into(),
+            access_list: dummy_al(),
+            encrypted_payload: mock_encrypted_payload,
+            pubkey: nz32(0xA1),
+            sig: nz64(0xB2),
         });
 
         let enc = tx_enum_bytes(&tx);
@@ -388,9 +409,11 @@ mod tests {
     fn codec_roundtrip_avail_manual_decode() {
         let tx = Tx::Avail(AvailTx {
             commitment: nz32(0x33),
-            sender:     "Alice".into(),
-            pubkey:     nz32(0xC3),
-            sig:        nz64(0xD4),
+            sender: "Alice".into(),
+            payload_hash: nz32(0x55),
+            payload_size: 1024,
+            pubkey: nz32(0xC3),
+            sig: nz64(0xD4),
         });
 
         let enc = tx_enum_bytes(&tx);
@@ -402,9 +425,11 @@ mod tests {
     fn codec_rejects_wrong_version() {
         let tx = Tx::Avail(AvailTx {
             commitment: nz32(0x44),
-            sender:     "Alice".into(),
-            pubkey:     nz32(0xE5),
-            sig:        nz64(0xF6),
+            sender: "Alice".into(),
+            payload_hash: nz32(0x66),
+            payload_size: 2048,
+            pubkey: nz32(0xE5),
+            sig: nz64(0xF6),
         });
         let mut enc = tx_enum_bytes(&tx);
         enc[0] = CODEC_VERSION.wrapping_add(1); // flip version
@@ -415,13 +440,19 @@ mod tests {
 
     #[test]
     fn codec_rejects_truncated_buffer() {
+        let mock_encrypted_payload = crate::mempool::encrypted::ThresholdCiphertext {
+            ephemeral_pk: [0x66u8; 48],
+            encrypted_data: vec![0x77u8; 64],
+            tag: [0x88u8; 32],
+            epoch: 0,
+        };
         let tx = Tx::Commit(CommitTx {
-            commitment:      nz32(0x55),
-            ciphertext_hash: nz32(0x66),
-            sender:          "Alice".into(),
-            access_list:     dummy_al(),
-            pubkey:          nz32(0x77),
-            sig:             nz64(0x88),
+            commitment: nz32(0x55),
+            sender: "Alice".into(),
+            access_list: dummy_al(),
+            encrypted_payload: mock_encrypted_payload,
+            pubkey: nz32(0x77),
+            sig: nz64(0x88),
         });
         let mut enc = tx_enum_bytes(&tx);
         enc.truncate(enc.len().saturating_sub(1)); // drop last byte

@@ -2,6 +2,7 @@ use l1_blockchain::mempool::workers::{Batch, BatchStore};
 use l1_blockchain::pos::registry::ValidatorId;
 use l1_blockchain::types::{Block, BlockHeader, CommitTx, QC, Tx, AccessList};
 use l1_blockchain::crypto::bls::BlsSignatureBytes;
+use l1_blockchain::mempool::encrypted::ThresholdCiphertext;
 use bitvec::vec::BitVec;
 
 fn dummy_block() -> Block {
@@ -42,7 +43,12 @@ fn sample_commit() -> Tx {
         commitment: [1u8;32],
         sender: "alice".into(),
         access_list: AccessList { reads: vec![], writes: vec![] },
-        ciphertext_hash: [2u8;32],
+        encrypted_payload: ThresholdCiphertext {
+            ephemeral_pk: [0u8; 48],
+            encrypted_data: vec![2u8; 32],
+            tag: [0u8; 32],
+            epoch: 1,
+        },
         pubkey: [3u8;32],
         sig: [4u8;64],
     };

@@ -11,7 +11,7 @@ use crate::pos::registry::{StakingConfig, ValidatorSet, ValidatorStatus, Validat
 use crate::pos::schedule::{AliasSchedule, ProposerSchedule};
 use crate::pos::slots::SlotClock;
 use crate::stf::{process_block, BlockError};
-use crate::mempool::BatchStore;
+use crate::mempool::{BatchStore, ThresholdEngine};
 use crate::state::{Available, Balances, Commitments, Nonces, DECRYPTION_DELAY, REVEAL_WINDOW};
 use crate::types::{Block, BlockHeader, Event, Hash, Receipt};
 use crate::verify::verify_block_roots;
@@ -41,6 +41,10 @@ pub struct Chain {
     /// VRF tie-break cache: maps bundle_start to (proposer_id, vrf_output)
     bundle_winners: HashMap<u64, (ValidatorId, [u8; 32])>,
     pub tau: f64,
+    /// Threshold encryption engine for decrypting committed transactions
+    pub threshold_engine: ThresholdEngine,
+    /// Pending threshold shares by commitment hash
+    pending_shares: HashMap<Hash, Vec<crate::mempool::encrypted::ThresholdShare>>,
 }
 
 #[derive(Clone)]
@@ -103,6 +107,8 @@ impl Chain {
             batch_store: BatchStore::new(),
             bundle_winners: HashMap::new(),
             tau: DEFAULT_TAU,
+            threshold_engine: ThresholdEngine::new(),
+            pending_shares: HashMap::new(),
         }
     }
 
@@ -409,6 +415,8 @@ impl Chain {
             &self.fee_state,
             &proposer_addr,
             &mut sim_burned_total,
+            &self.threshold_engine,
+            self,
         )?;
 
         verify_block_roots(&block.header, block, &self.batch_store, &res.receipts)
@@ -443,6 +451,14 @@ impl Chain {
                             }
                         }
                     }
+                }
+                Event::ThresholdShareReceived { commitment, validator_id: _ } => {
+                    // Handle threshold share received - could trigger decryption attempts
+                    // For now, just log or track the event
+                }
+                Event::ThresholdDecryptionComplete { commitment: _ } => {
+                    // Handle completed threshold decryption
+                    // This could trigger reveal processing or other consensus actions
                 }
             }
         }
@@ -556,6 +572,14 @@ impl Chain {
                         }
                     }
                 }
+                Event::ThresholdShareReceived { commitment, validator_id: _ } => {
+                    // Handle threshold share received - could trigger decryption attempts
+                    // For now, just log or track the event
+                }
+                Event::ThresholdDecryptionComplete { commitment: _ } => {
+                    // Handle completed threshold decryption
+                    // This could trigger reveal processing or other consensus actions
+                }
             }
         }
 
@@ -603,6 +627,67 @@ impl Chain {
     /// Commitments that are due (deadline == `height`) and already available.
     pub fn commitments_due_and_available(&self, height: u64) -> Vec<Hash> {
         self.avail_due.get(&height).cloned().unwrap_or_default()
+    }
+
+    /// Add a threshold share for a commitment from a validator
+    pub fn add_threshold_share(
+        &mut self, 
+        commitment: Hash, 
+        share: crate::mempool::encrypted::ThresholdShare
+    ) -> Result<bool, String> {
+        // Validate the validator is in the current active set
+        if !self.validator_set.validators.iter().any(|v| v.id == share.validator_id && v.status == ValidatorStatus::Active) {
+            return Err(format!("Share from invalid validator: {}", share.validator_id));
+        }
+
+        // Get or create the shares collection for this commitment
+        let shares = self.pending_shares.entry(commitment).or_insert_with(Vec::new);
+        
+        // Check if we already have a share from this validator for this commitment
+        if shares.iter().any(|s| s.validator_id == share.validator_id) {
+            return Err(format!("Duplicate share from validator {}", share.validator_id));
+        }
+
+        // Validate the share epoch matches current validator set epoch
+        if share.epoch != self.validator_set.epoch {
+            return Err(format!("Share epoch {} does not match current epoch {}", 
+                share.epoch, self.validator_set.epoch));
+        }
+
+        // Add the share
+        shares.push(share);
+        
+        // Check if we now have enough shares to decrypt
+        let threshold = (self.validator_set.validators.len() * 2) / 3 + 1; // Byzantine fault tolerance
+        Ok(shares.len() >= threshold)
+    }
+
+    /// Get the collected threshold shares for a commitment
+    pub fn get_threshold_shares(&self, commitment: &Hash) -> Option<&Vec<crate::mempool::encrypted::ThresholdShare>> {
+        self.pending_shares.get(commitment)
+    }
+
+    /// Remove threshold shares for a commitment (after processing)
+    pub fn remove_threshold_shares(&mut self, commitment: &Hash) {
+        self.pending_shares.remove(commitment);
+    }
+
+    /// Check if a commitment has enough threshold shares for decryption
+    pub fn can_decrypt_commitment(&self, commitment: &Hash) -> bool {
+        if let Some(shares) = self.pending_shares.get(commitment) {
+            let threshold = (self.validator_set.validators.len() * 2) / 3 + 1;
+            shares.len() >= threshold
+        } else {
+            false
+        }
+    }
+
+    /// Clean up old threshold shares that are no longer needed
+    pub fn cleanup_old_shares(&mut self, commitments: &crate::state::Commitments) {
+        self.pending_shares.retain(|commitment, _| {
+            // Keep shares for commitments that still exist and aren't consumed
+            commitments.get(commitment).map(|meta| !meta.consumed).unwrap_or(false)
+        });
     }
 
     /// Collect BLS public keys from active validators in stable order.
@@ -762,6 +847,8 @@ mod tests {
             &chain.fee_state,
             &proposer_addr,
             &mut burned,
+            &chain.threshold_engine,
+            chain,
         ).expect("process_block");
     
         // Fill header with computed roots/gas
@@ -816,12 +903,19 @@ mod tests {
         let tx_ser = tx_bytes(tx);
         let al_bytes = access_list_bytes(&tx.access_list);
         let commitment = commitment_hash(&tx_ser, &al_bytes, &salt, CHAIN_ID);
-        let ciphertext_hash = hash_bytes_sha256(b"ciphertext");
+        // Create mock encrypted payload for testing
+        let mock_encrypted_payload = crate::mempool::encrypted::ThresholdCiphertext {
+            ephemeral_pk: [0x42u8; 48],
+            encrypted_data: b"mock encrypted transaction data".to_vec(),
+            tag: [0x24u8; 32],
+            epoch: 0,
+        };
+        let encrypted_payload_hash = mock_encrypted_payload.commitment_hash();
         let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
         let sender_bytes = string_bytes(&sender);
         let preimage = commit_signing_preimage(
             &commitment,
-            &ciphertext_hash,
+            &encrypted_payload_hash,
             &sender_bytes,
             &al_bytes,
             CHAIN_ID,
@@ -832,7 +926,7 @@ mod tests {
                 commitment,
                 sender,
                 access_list: tx.access_list.clone(),
-                ciphertext_hash,
+                encrypted_payload: mock_encrypted_payload,
                 pubkey: signer.verifying_key().to_bytes(),
                 sig,
             },
@@ -848,6 +942,8 @@ mod tests {
         AvailTx {
             commitment,
             sender,
+            payload_hash: [0x99u8; 32], // Mock payload hash
+            payload_size: 1024,         // Mock payload size
             pubkey: signer.verifying_key().to_bytes(),
             sig,
         }
@@ -1311,6 +1407,8 @@ mod tests {
             txs.push(Tx::Avail(AvailTx {
                 commitment: [0u8; 32],
                 sender: String::new(),
+                payload_hash: [0u8; 32],
+                payload_size: 100,
                 pubkey: [0u8; 32],
                 sig: [0u8; 64],
             }));
@@ -1635,6 +1733,8 @@ mod tests {
                 &chain.fee_state,
                 &proposer_addr,
                 &mut sim_burned,
+                &chain.threshold_engine,
+                chain,
             ).expect("process_block should succeed for valid blocks");
 
             block.header.txs_root        = body.txs_root;

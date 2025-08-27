@@ -98,6 +98,8 @@ fn build_empty_alias_block(
         &chain.fee_state,
         &proposer_addr,
         &mut burned,
+        &chain.threshold_engine,
+        chain,
     ).expect("process_block");
 
     // fill in the roots and gas

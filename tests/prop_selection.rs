@@ -13,10 +13,21 @@ use l1_blockchain::mempool::{
     StateView, BalanceView,
 };
 use l1_blockchain::state::CHAIN_ID;
-use l1_blockchain::types::{AccessList, AvailTx, CommitTx, RevealTx, Transaction, Tx, Address};
+use l1_blockchain::types::{AccessList, AvailTx, CommitTx, RevealTx, Transaction, Tx, Address, Hash};
 use l1_blockchain::fees::FeeState;
+use l1_blockchain::mempool::encrypted::ThresholdCiphertext;
 
 // -------------------- Small helpers for this test --------------------
+
+// Helper to create mock encrypted payloads for testing
+fn mock_threshold_ciphertext() -> ThresholdCiphertext {
+    ThresholdCiphertext {
+        ephemeral_pk: [0u8; 48],
+        encrypted_data: vec![0u8; 32],
+        tag: [0u8; 32],
+        epoch: 1,
+    }
+}
 
 /// Dummy StateView used only in this property test.
 struct SV {
@@ -272,9 +283,9 @@ proptest! {
         let height = 88;
         let fees = [5u128, 20, 10];
 
-        let a0 = AvailTx { commitment: commitments[0], sender: sender.clone(), pubkey: [0u8;32], sig: [0u8;64] };
-        let a1 = AvailTx { commitment: commitments[1], sender: sender.clone(), pubkey: [0u8;32], sig: [0u8;64] };
-        let a2 = AvailTx { commitment: commitments[2], sender: sender.clone(), pubkey: [0u8;32], sig: [0u8;64] };
+        let a0 = AvailTx { commitment: commitments[0], sender: sender.clone(), payload_hash: [0u8; 32], payload_size: 100, pubkey: [0u8;32], sig: [0u8;64] };
+        let a1 = AvailTx { commitment: commitments[1], sender: sender.clone(), payload_hash: [0u8; 32], payload_size: 100, pubkey: [0u8;32], sig: [0u8;64] };
+        let a2 = AvailTx { commitment: commitments[2], sender: sender.clone(), payload_hash: [0u8; 32], payload_size: 100, pubkey: [0u8;32], sig: [0u8;64] };
 
         mem.insert_avail(Tx::Avail(a0.clone()), height, fees[0], &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
         mem.insert_avail(Tx::Avail(a1.clone()), height, fees[1], &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
@@ -343,7 +354,7 @@ fn insert_commit_and_reveal(
         commitment: cmt,
         sender: sender.to_owned(),
         access_list: r.tx.access_list.clone(),
-        ciphertext_hash: [0u8; 32],
+        encrypted_payload: mock_threshold_ciphertext(),
         pubkey: [0u8; 32],
         sig: [0u8; 64],
     };
@@ -371,7 +382,7 @@ fn insert_commit_only(
         commitment: cmt,
         sender: sender.to_owned(),
         access_list: r.tx.access_list.clone(),
-        ciphertext_hash: [0u8; 32],
+        encrypted_payload: mock_threshold_ciphertext(),
         pubkey: [0u8; 32],
         sig: [0u8; 64],
     };
@@ -395,7 +406,7 @@ fn build_triple(
         commitment: cmt,
         sender: sender.clone(),
         access_list: reveal.tx.access_list.clone(),
-        ciphertext_hash: [0u8; 32],
+        encrypted_payload: mock_threshold_ciphertext(),
         pubkey: [0u8; 32],
         sig: [0u8; 64],
     };
@@ -403,6 +414,8 @@ fn build_triple(
     let avail = AvailTx {
         commitment: cmt,
         sender: sender.clone(),
+        payload_hash: [0u8; 32],
+        payload_size: 100,
         pubkey: [0u8; 32],
         sig: [0u8; 64],
     };

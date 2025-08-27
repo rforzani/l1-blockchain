@@ -2,7 +2,7 @@
 
 use bitvec::vec::BitVec;
 
-use crate::{codec::qc_commitment, crypto::bls::{BlsAggregate, BlsSignatureBytes}, pos::registry::ValidatorId};
+use crate::{codec::qc_commitment, crypto::bls::{BlsAggregate, BlsSignatureBytes}, pos::registry::ValidatorId, mempool::encrypted::ThresholdCiphertext};
 
 pub type Address = String;
 
@@ -265,7 +265,7 @@ pub struct CommitTx {
     pub commitment: Hash,
     pub sender: Address,
     pub access_list: AccessList,
-    pub ciphertext_hash: Hash,
+    pub encrypted_payload: ThresholdCiphertext,
     pub pubkey: [u8; 32],
     pub sig: [u8; 64]
 }
@@ -274,6 +274,8 @@ pub struct CommitTx {
 pub struct AvailTx {
     pub commitment: Hash,
     pub sender: Address,
+    pub payload_hash: Hash, // Hash of the encrypted payload for availability proof
+    pub payload_size: u64,  // Size of encrypted payload in bytes
     pub pubkey: [u8; 32],
     pub sig: [u8; 64]
 }
@@ -298,6 +300,9 @@ pub struct CommitmentMeta {
     pub consumed: bool,
     pub included_at: u64,
     pub access_list: AccessList,
+    pub encrypted_payload: ThresholdCiphertext, // Store the encrypted transaction
+    pub decryption_shares: Vec<crate::mempool::encrypted::ThresholdShare>, // Collected shares
+    pub is_decrypted: bool, // Whether enough shares have been collected
 }
 
 #[derive(Debug, Clone)]
@@ -305,5 +310,7 @@ pub enum Event {
     CommitStored { commitment: Hash, owner: Address, expires_at: u64 },
     CommitConsumed { commitment: Hash },
     CommitExpired { commitment: Hash },
-    AvailabilityRecorded { commitment: Hash }
+    AvailabilityRecorded { commitment: Hash },
+    ThresholdShareReceived { commitment: Hash, validator_id: ValidatorId },
+    ThresholdDecryptionComplete { commitment: Hash },
 }

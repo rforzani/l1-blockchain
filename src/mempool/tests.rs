@@ -90,7 +90,12 @@ fn make_commit(from: &str, nonce: u64) -> (CommitTx, Transaction, Hash, Hash) {
         commitment,
         sender: from.to_string(),
         access_list: tx.access_list.clone(),
-        ciphertext_hash: hash_bytes_sha256(b"placeholder-ciphertext"),
+        encrypted_payload: crate::mempool::encrypted::ThresholdCiphertext {
+            ephemeral_pk: [0u8; 48],
+            encrypted_data: b"placeholder-ciphertext".to_vec(),
+            tag: [0u8; 32],
+            epoch: 0,
+        },
         pubkey: [0u8; 32],
         sig: [0u8; 64],
     };
@@ -102,6 +107,8 @@ fn make_avail(from: &str, commitment: Hash) -> AvailTx {
     AvailTx {
         commitment,
         sender: from.to_string(),
+        payload_hash: [0u8; 32],  // Mock payload hash
+        payload_size: 64,         // Mock payload size  
         pubkey: [0u8; 32],
         sig: [0u8; 64],
     }

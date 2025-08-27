@@ -184,13 +184,22 @@ async fn submit_commit(State(state): State<AppState>, Json(req): Json<CommitReq>
     let mut al = AccessList { reads: to_state_keys(req.access_list.reads), writes: to_state_keys(req.access_list.writes) };
     al.canonicalize();
 
+    // Create a mock encrypted payload for RPC testing
+    // In production, this should come from the request or be computed properly
+    let mock_encrypted_payload = crate::mempool::encrypted::ThresholdCiphertext {
+        ephemeral_pk: [0u8; 48],
+        encrypted_data: hex::decode(&req.ciphertext_hash).unwrap_or_else(|_| vec![0u8; 64]),
+        tag: [0u8; 32],
+        epoch: 0, // Should be set to current epoch
+    };
+    
     let commit = CommitTx {
-        commitment:      hex32(&req.commitment),
-        sender:          req.sender,
-        access_list:     al,
-        ciphertext_hash: hex32(&req.ciphertext_hash),
-        pubkey:          hex32(&req.pubkey),
-        sig:             hex64(&req.sig),
+        commitment:        hex32(&req.commitment),
+        sender:            req.sender,
+        access_list:       al,
+        encrypted_payload: mock_encrypted_payload,
+        pubkey:            hex32(&req.pubkey),
+        sig:               hex64(&req.sig),
     };
 
     let fee = req.fee_bid.unwrap_or(1);
@@ -201,10 +210,12 @@ async fn submit_commit(State(state): State<AppState>, Json(req): Json<CommitReq>
 
 async fn submit_avail(State(state): State<AppState>, Json(req): Json<AvailReq>) -> Result<Json<SubmitResp>, (StatusCode, String)> {
     let avail = AvailTx {
-        commitment: hex32(&req.commitment),
-        sender:     req.sender,
-        pubkey:     hex32(&req.pubkey),
-        sig:        hex64(&req.sig),
+        commitment:   hex32(&req.commitment),
+        sender:       req.sender,
+        payload_hash: [0u8; 32], // Mock payload hash - should be computed from actual encrypted payload
+        payload_size: 64,        // Mock payload size
+        pubkey:       hex32(&req.pubkey),
+        sig:          hex64(&req.sig),
     };
     let fee = req.fee_bid.unwrap_or(1);
     let node = state.node.lock().unwrap();

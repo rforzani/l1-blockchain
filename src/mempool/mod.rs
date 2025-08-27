@@ -11,7 +11,11 @@ pub mod queues;
 use queues::{AvailQueue, CommitQueue, RevealQueue};
 pub mod workers;
 pub use workers::{Batch, BatchStore};
+pub mod encrypted;
+pub use encrypted::{ThresholdEngine, ThresholdCiphertext, ThresholdShare, ThresholdError};
 mod tests;
+#[cfg(test)]
+mod encrypted_tests;
 
 #[derive(Clone, Debug)]
 pub struct MempoolConfig {
@@ -266,6 +270,14 @@ impl Mempool for MempoolImpl {
         fee_state: &FeeState,
     ) -> Result<TxId, AdmissionError> {
         let Tx::Commit(c) = tx else { return Err(AdmissionError::WrongTxType) };
+        
+        // Validate encrypted payload structure
+        c.encrypted_payload.verify()
+            .map_err(|_| AdmissionError::BadAccessList)?; // Reuse existing error type
+        
+        // TODO: In production, add epoch validation to ensure the encrypted payload
+        // is for the current committee epoch
+        
         let want = lane_base(fee_state, Lane::Commit);
         ensure_affordable(view, &c.sender, want, "commit")?;
         let mut commits = self.commits.write().unwrap();
@@ -286,6 +298,15 @@ impl Mempool for MempoolImpl {
         fee_state: &FeeState,
     ) -> Result<TxId, AdmissionError> {
         let Tx::Avail(a) = tx else { return Err(AdmissionError::WrongTxType) };
+        
+        // Basic payload validation - ensure size is reasonable and hash is non-zero
+        if a.payload_size == 0 || a.payload_size > 1_048_576 { // Max 1MB
+            return Err(AdmissionError::BadAccessList); // Reuse existing error type
+        }
+        if a.payload_hash == [0u8; 32] {
+            return Err(AdmissionError::BadAccessList); // Payload hash should not be all zeros
+        }
+        
         let want = lane_base(fee_state, Lane::Avail);
         ensure_affordable(view, &a.sender, want, "avail")?;
         let mut avails = self.avails.write().unwrap();

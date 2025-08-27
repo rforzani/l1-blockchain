@@ -56,7 +56,7 @@ pub fn verify_ed25519(pubkey: &[u8; 32], sig_bytes: &[u8; 64], msg: &[u8]) -> bo
 
 pub fn commit_signing_preimage(
     commitment: &Hash,     
-    ciphertext_hash: &Hash,
+    encrypted_payload_hash: &Hash,
     sender_bytes: &[u8],
     access_list_bytes: &[u8],
     chain_id: u64,
@@ -65,7 +65,7 @@ pub fn commit_signing_preimage(
     buf.extend_from_slice(SIGN_COMMIT_DOMAIN);
     buf.extend_from_slice(&chain_id.to_le_bytes());
     buf.extend_from_slice(commitment);
-    buf.extend_from_slice(ciphertext_hash);
+    buf.extend_from_slice(encrypted_payload_hash);
     buf.extend_from_slice(sender_bytes);
     buf.extend_from_slice(access_list_bytes);
     buf
@@ -194,11 +194,11 @@ pub mod test_sig {
         sender: &str,
         access_list: &AccessList,
         commitment: &Hash,
-        ciphertext_hash: &Hash,
+        encrypted_payload_hash: &Hash,
     ) -> ([u8;32], [u8;64]) {
         let sender_bytes = string_bytes(sender);
         let al_bytes     = access_list_bytes(access_list);
-        let pre          = commit_signing_preimage(commitment, ciphertext_hash, &sender_bytes, &al_bytes, CHAIN_ID);
+        let pre          = commit_signing_preimage(commitment, encrypted_payload_hash, &sender_bytes, &al_bytes, CHAIN_ID);
         let sig          = sk.sign(&pre).to_bytes();     // v2: to_bytes() -> [u8;64]
         (VerifyingKey::from(sk).to_bytes(), sig)
     }

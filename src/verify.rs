@@ -4,6 +4,7 @@ use crate::{
     codec::{access_list_bytes, receipt_bytes, tx_bytes, tx_enum_bytes},
     crypto::{hash_bytes_sha256, merkle_root},
     mempool::BatchStore,
+    mempool::encrypted::ThresholdCiphertext,
     state::CHAIN_ID,
     types::{Block, BlockHeader, Hash, Receipt},
 };
@@ -107,7 +108,12 @@ mod tests {
             commitment: [1u8; 32],
             sender: "alice".into(),
             access_list: al,
-            ciphertext_hash: [2u8; 32],
+            encrypted_payload: ThresholdCiphertext {
+                ephemeral_pk: [0u8; 48],
+                encrypted_data: vec![2u8; 32],
+                tag: [0u8; 32],
+                epoch: 1,
+            },
             pubkey: [3u8; 32],
             sig: [4u8; 64],
         };

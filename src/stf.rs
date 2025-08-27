@@ -11,7 +11,7 @@ use crate::state::{CHAIN_ID, DECRYPTION_DELAY, MAX_AVAILS_PER_BLOCK, MAX_PENDING
 use crate::state::{Balances, Nonces};
 use crate::crypto::{addr_from_pubkey, addr_hex};
 use crate::codec::{tx_enum_bytes, receipt_bytes, header_bytes, tx_bytes};
-use crate::mempool::BatchStore;
+use crate::mempool::{BatchStore, ThresholdEngine, ThresholdError};
 use crate::types::AvailTx;
 use crate::types::CommitmentMeta;
 use crate::types::{Block, Receipt, ExecOutcome, Hash, BlockHeader, Transaction, StateKey, Tx, Event, RevealTx, CommitTx, AccessList, Address};
@@ -231,9 +231,9 @@ pub fn process_transaction(
     Ok(Receipt { outcome, gas_used: base, error })
 }
 
-fn process_avail(
+pub fn process_avail(
     a: &AvailTx,
-    commitments: &Commitments,
+    commitments: &mut Commitments,
     available: &mut Available,
     current_height: u64,
     events: &mut Vec<Event>,
@@ -245,24 +245,38 @@ fn process_avail(
     use crate::codec::string_bytes;
     use crate::crypto::{avail_signing_preimage, verify_ed25519};
     
-    // sanity: commitment exists & not consumed
-    let meta = commitments.get(&a.commitment)
+    // Validate commitment exists and is not consumed
+    let meta = commitments.get_mut(&a.commitment)
         .ok_or_else(|| TxError::IntrinsicInvalid("no such commitment".into()))?;
     if meta.consumed {
         return Err(TxError::IntrinsicInvalid("already consumed".into()));
     }
 
-    // --- owner binding: a.sender must match the commitment owner you stored at commit time ---
-    let Some(meta) = commitments.get(&a.commitment) else {
-        return Err(TxError::IntrinsicInvalid("unknown commitment".into()));
-    };
-    if a.sender != meta.owner {
-        return Err(TxError::IntrinsicInvalid("avail sender mismatch with commitment owner".into()));
+    // Validate timing - avail transactions can be submitted during the commitment window
+    let ready_at = meta.included_at + DECRYPTION_DELAY;
+    let deadline = ready_at + REVEAL_WINDOW;
+    if current_height >= deadline {
+        return Err(TxError::IntrinsicInvalid("avail too late - past deadline".into()));
     }
 
-    // --- signature check (avail) ---
+    // In the new threshold encryption model, avail transactions contain
+    // threshold shares from validators rather than being from the original submitter
+    // For now, we'll simulate this by treating the avail as providing data availability
+    
+    // Basic validation of payload hash and size
+    if a.payload_size == 0 || a.payload_size > 1_048_576 {
+        return Err(TxError::IntrinsicInvalid("invalid payload size".into()));
+    }
+    
+    // Verify that the payload hash matches what was committed
+    let expected_payload_hash = meta.encrypted_payload.commitment_hash();
+    if a.payload_hash != expected_payload_hash {
+        return Err(TxError::IntrinsicInvalid("payload hash mismatch".into()));
+    }
+
+    // Signature verification - the avail transaction must be properly signed
     let sender_bytes = string_bytes(&a.sender);
-    let preimage     = avail_signing_preimage(&a.commitment, &sender_bytes, CHAIN_ID);
+    let preimage = avail_signing_preimage(&a.commitment, &sender_bytes, CHAIN_ID);
 
     if !verify_ed25519(&a.pubkey, &a.sig, &preimage) {
         return Err(TxError::IntrinsicInvalid("bad avail signature".into()));
@@ -273,20 +287,9 @@ fn process_avail(
         return Err(TxError::IntrinsicInvalid("sender/pubkey mismatch".into()));
     }
 
-
-    // owner-only Avail (v1)   ------ TO BE CHANGED LATER: It now avoids griefing where a third party could force you to pay an Avail fee. Later, when we move to TE, “Avail” becomes a committee root and this logic naturally disappears.
-    let owner = meta.owner.clone();
-    
-    // timing window [ready_at .. deadline]
-    let ready_at = meta.included_at + DECRYPTION_DELAY;
-    let deadline = ready_at + REVEAL_WINDOW;
-    if current_height < ready_at || current_height > deadline {
-        return Err(TxError::IntrinsicInvalid("avail outside valid window".into()));
-    }
-
-    // fee paid by owner (v1)  --- TO BE CHANGED LATER
+    // Fee payment - in production this would be paid by validators providing shares
     let avail_fee = fee_state.avail_base;
-    let bal = balances.entry(owner).or_insert(0);
+    let bal = balances.entry(a.sender.clone()).or_insert(0);
     if *bal < avail_fee {
         return Err(TxError::IntrinsicInvalid("insufficient funds for avail fee".into()));
     }
@@ -303,9 +306,7 @@ fn process_avail(
         *tb = tb.saturating_add(tres);
     }
 
-    available.insert(a.commitment);
-
-    // idempotent insert
+    // Mark commitment as available
     let first_time = available.insert(a.commitment);
     if first_time {
         events.push(Event::AvailabilityRecorded { commitment: a.commitment });
@@ -338,9 +339,10 @@ pub fn process_commit(
     // --- 1) Signature + identity ---
     let sender_bytes = string_bytes(&c.sender);
     let al_bytes_for_sig = access_list_bytes(&c.access_list); // canonical bytes for signing
+    let encrypted_payload_hash = c.encrypted_payload.commitment_hash();
     let preimage = commit_signing_preimage(
         &c.commitment,
-        &c.ciphertext_hash,
+        &encrypted_payload_hash,
         &sender_bytes,
         &al_bytes_for_sig,
         CHAIN_ID,
@@ -432,6 +434,9 @@ pub fn process_commit(
             consumed: false,
             included_at: current_height,
             access_list: al.clone(),
+            encrypted_payload: c.encrypted_payload.clone(),
+            decryption_shares: Vec::new(),
+            is_decrypted: false,
         },
     );
 
@@ -526,6 +531,8 @@ pub fn process_block(
     fee_state: &FeeState,
     proposer: &Address,
     burned_total: &mut u64,
+    threshold_engine: &ThresholdEngine,
+    chain: &crate::chain::Chain,
 ) -> Result<BodyResult, BlockError> {
     #[cfg(test)]
     PROCESS_BLOCK_CALLS.with(|c| c.set(c.get() + 1));
@@ -598,6 +605,51 @@ pub fn process_block(
         }
     }
 
+    // 1.5) Threshold decryption phase - decrypt available commitments that have enough shares
+    for (commitment_hash, meta) in commitments.iter_mut() {
+        // Only attempt decryption for commitments that:
+        // 1. Are available (have been posted)
+        // 2. Are not already decrypted 
+        // 3. Are past the decryption delay
+        if available.contains(commitment_hash) 
+            && !meta.is_decrypted 
+            && block.header.height >= meta.included_at + DECRYPTION_DELAY {
+            
+            // Get collected shares from chain state
+            if let Some(shares) = chain.get_threshold_shares(commitment_hash) {
+                // Check if we can decrypt this commitment
+                if threshold_engine.can_decrypt(shares) {
+                    // Attempt decryption using collected shares
+                    match threshold_engine.decrypt(&meta.encrypted_payload, shares) {
+                        Ok(_decrypted_data) => {
+                            // Mark as decrypted and emit event
+                            meta.is_decrypted = true;
+                            // Update the commitment meta with the shares for persistence
+                            meta.decryption_shares = shares.clone();
+                            events.push(Event::ThresholdDecryptionComplete { 
+                                commitment: *commitment_hash 
+                            });
+                            
+                            // The decrypted data is now available for reveal matching
+                            // It's validated during the reveal process in process_reveal
+                        }
+                        Err(ThresholdError::InsufficientShares { .. }) => {
+                            // Not enough shares yet - this is expected and not an error
+                            continue;
+                        }
+                        Err(e) => {
+                            // Other decryption errors indicate a problem with the commitment
+                            return Err(BlockError::IntrinsicInvalid(
+                                format!("threshold decryption failed for commitment {}: {}", 
+                                    hex::encode(commitment_hash), e)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 2) Process block-level reveals (sorted for deterministic nonce progression)
     let mut reveals_sorted = block.reveals.clone();
     reveals_sorted.sort_by(|a, b| a.sender.cmp(&b.sender).then(a.tx.nonce.cmp(&b.tx.nonce)));
@@ -666,13 +718,21 @@ mod tests {
         let tx_ser = tx_bytes(&tx);
         let al_bytes = access_list_bytes(&tx.access_list);
         let cmt = commitment_hash(&tx_ser, &al_bytes, &salt, CHAIN_ID);
-        let pre = commit_signing_preimage(&cmt, &[0u8; 32], &string_bytes(sender), &al_bytes, CHAIN_ID);
+        // Create mock encrypted payload for testing
+        let mock_encrypted_payload = crate::mempool::encrypted::ThresholdCiphertext {
+            ephemeral_pk: [0u8; 48],
+            encrypted_data: vec![0u8; 64], // Mock encrypted transaction data
+            tag: [0u8; 32],
+            epoch: 0,
+        };
+        let encrypted_payload_hash = mock_encrypted_payload.commitment_hash();
+        let pre = commit_signing_preimage(&cmt, &encrypted_payload_hash, &string_bytes(sender), &al_bytes, CHAIN_ID);
         let sig = sk.sign(&pre);
         let commit_tx = CommitTx {
             commitment: cmt,
             sender: sender.clone(),
             access_list: tx.access_list.clone(),
-            ciphertext_hash: [0u8; 32],
+            encrypted_payload: mock_encrypted_payload,
             pubkey: sk.verifying_key().to_bytes(),
             sig: sig.to_bytes(),
         };

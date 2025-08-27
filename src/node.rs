@@ -8,6 +8,7 @@ use crate::state::{Balances, Nonces, Commitments, Available};
 use crate::chain::{ApplyResult, Chain, DEFAULT_BUNDLE_LEN};
 use crate::stf::process_block;
 use crate::types::{Block, Hash, HotStuffState, Pacemaker, QC, RevealTx, AvailTx, CommitTx, Tx};
+use crate::mempool::encrypted::ThresholdCiphertext;
 use bitvec::vec::BitVec;
 use std::sync::Arc;
 use ed25519_dalek::{SigningKey, Signer};
@@ -599,6 +600,8 @@ impl Node {
             &self.chain.fee_state,
             &proposer_addr,
             &mut sim_burned_total,
+            &self.chain.threshold_engine,
+            &self.chain,
         ).map_err(|e| ProduceError::HeaderBuild(format!("body simulation failed: {e:?}")))?;
     
         // 5) Fill header with the computed roots and gas
@@ -766,7 +769,12 @@ mod tests {
             commitment,
             sender: sender.clone(),
             access_list: tx.access_list.clone(),
-            ciphertext_hash: [0u8; 32],
+            encrypted_payload: ThresholdCiphertext {
+                ephemeral_pk: [0u8; 48],
+                encrypted_data: vec![0u8; 32],
+                tag: [0u8; 32],
+                epoch: 1,
+            },
             pubkey: signer.verifying_key().to_bytes(),
             sig,
         };
