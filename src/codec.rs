@@ -3,15 +3,15 @@
 use sha2::{Digest, Sha256};
 
 use crate::crypto::bls::{BlsSignatureBytes, SignerBitmap};
+use crate::types::Tx;
 use crate::types::{AccessList, BlockHeader, ExecOutcome, Hash, Receipt, StateKey, Transaction};
-use crate::types::{Tx};
 
 pub const CODEC_VERSION: u8 = 1;
 pub const DOM_TX: &[u8] = b"TX";
 pub const DOM_RCPT: &[u8] = b"RCPT";
 pub const DOM_HDR: &[u8] = b"HDR";
-const TAG_COMMIT:   u8 = 1;
-const TAG_AVAIL:    u8 = 2;
+const TAG_COMMIT: u8 = 1;
+const TAG_AVAIL: u8 = 2;
 const QC_COMMIT_VERSION: u8 = 1;
 
 #[inline]
@@ -22,7 +22,7 @@ fn encode_bitmap_lsb0(bitmap: &SignerBitmap) -> Vec<u8> {
     for (i, bit) in bitmap.iter().by_vals().enumerate() {
         if bit {
             let byte = i / 8;
-            let off  = i % 8;
+            let off = i % 8;
             out[byte] |= 1u8 << off;
         }
     }
@@ -35,7 +35,7 @@ pub fn qc_commitment(
     agg_sig: &BlsSignatureBytes,
     bitmap: &SignerBitmap,
 ) -> [u8; 32] {
-    let mut v = Vec::with_capacity(1 + 8 + block_id.len() + 96 + (bitmap.len() + 7)/8 + 8);
+    let mut v = Vec::with_capacity(1 + 8 + block_id.len() + 96 + (bitmap.len() + 7) / 8 + 8);
     v.push(QC_COMMIT_VERSION);
     v.extend_from_slice(&view.to_be_bytes());
     v.extend_from_slice(block_id);
@@ -65,7 +65,7 @@ pub fn put_u32(v: &mut Vec<u8>, x: u32) {
 fn put_str(dst: &mut Vec<u8>, s: &str) {
     let len = s.len() as u32;
     dst.extend_from_slice(&len.to_le_bytes()); // 4 bytes
-    dst.extend_from_slice(s.as_bytes());       // the bytes
+    dst.extend_from_slice(s.as_bytes()); // the bytes
 }
 
 pub fn string_bytes(s: &str) -> Vec<u8> {
@@ -124,14 +124,13 @@ fn put_access_list(v: &mut Vec<u8>, al: &AccessList) {
     fn key_order<'a>(k: &'a StateKey) -> (u8, &'a str) {
         match k {
             StateKey::Balance(acct) => (0, acct.as_str()),
-            StateKey::Nonce(acct)   => (1, acct.as_str()),
+            StateKey::Nonce(acct) => (1, acct.as_str()),
         }
     }
 
     let mut reads = al.reads.clone();
     let mut writes = al.writes.clone();
 
-    
     reads.sort_by(|a, b| key_order(a).cmp(&key_order(b)));
     writes.sort_by(|a, b| key_order(a).cmp(&key_order(b)));
 
@@ -142,11 +141,11 @@ fn put_access_list(v: &mut Vec<u8>, al: &AccessList) {
         for k in ks {
             match k {
                 StateKey::Balance(acct) => {
-                    v.push(0);           // tag for Balance
-                    put_str(v, acct);    // len + bytes
+                    v.push(0); // tag for Balance
+                    put_str(v, acct); // len + bytes
                 }
                 StateKey::Nonce(acct) => {
-                    v.push(1);           // tag for Nonce
+                    v.push(1); // tag for Nonce
                     put_str(v, acct);
                 }
             }
@@ -178,9 +177,9 @@ pub fn header_signing_bytes(h: &BlockHeader) -> Vec<u8> {
     put_u64(&mut v, h.proposer_id);
 
     // --- Vortex PoS fields ---
-    v.push(h.bundle_len);                 
+    v.push(h.bundle_len);
     v.extend_from_slice(&h.vrf_preout);
-    v.extend_from_slice(&h.vrf_output);        
+    v.extend_from_slice(&h.vrf_output);
     put_u64(&mut v, h.vrf_proof.len() as u64);
     v.extend_from_slice(&h.vrf_proof);
     put_u64(&mut v, h.view);
@@ -192,13 +191,13 @@ pub fn header_signing_bytes(h: &BlockHeader) -> Vec<u8> {
 pub fn header_bytes(h: &BlockHeader) -> Vec<u8> {
     let mut v = vec![CODEC_VERSION];
     v.extend_from_slice(DOM_HDR);
-    
+
     v.extend_from_slice(&h.parent_hash);
     put_u64(&mut v, h.height);
     v.extend_from_slice(&h.txs_root);
     v.extend_from_slice(&h.receipts_root);
     put_u64(&mut v, h.gas_used);
-    v.extend_from_slice(&h.randomness);       
+    v.extend_from_slice(&h.randomness);
     v.extend_from_slice(&h.reveal_set_root);
     v.extend_from_slice(&h.il_root);
     put_u64(&mut v, h.exec_base_fee);
@@ -210,9 +209,9 @@ pub fn header_bytes(h: &BlockHeader) -> Vec<u8> {
     put_u64(&mut v, h.proposer_id);
 
     // --- Vortex PoS fields ---
-    v.push(h.bundle_len);           
-    v.extend_from_slice(&h.vrf_preout);      
-    v.extend_from_slice(&h.vrf_output);        
+    v.push(h.bundle_len);
+    v.extend_from_slice(&h.vrf_preout);
+    v.extend_from_slice(&h.vrf_output);
     put_u64(&mut v, h.vrf_proof.len() as u64);
     v.extend_from_slice(&h.vrf_proof);
     put_u64(&mut v, h.view);
@@ -232,7 +231,7 @@ pub fn header_id(h: &BlockHeader) -> Hash {
 }
 
 pub fn put_bytes(v: &mut Vec<u8>, bytes: &[u8]) {
-    put_u32(v, bytes.len() as u32);      // 4-byte little-endian length
+    put_u32(v, bytes.len() as u32); // 4-byte little-endian length
     v.extend_from_slice(bytes);
 }
 
@@ -242,22 +241,29 @@ pub fn tx_enum_bytes(tx: &Tx) -> Vec<u8> {
     match tx {
         Tx::Commit(c) => {
             v.push(TAG_COMMIT);
-            v.extend_from_slice(&c.commitment);        // 32
-            let payload_hash = c.encrypted_payload.commitment_hash();
-            v.extend_from_slice(&payload_hash);   // 32
-            put_str(&mut v, &c.sender);                // canonical
-            put_access_list(&mut v, &c.access_list);   // canonical
-            v.extend_from_slice(&c.pubkey);            // 32
-            v.extend_from_slice(&c.sig);               // 64
+            v.extend_from_slice(&c.commitment); // 32
+
+            // --- encrypted payload ---
+            let payload = &c.encrypted_payload;
+            v.extend_from_slice(&payload.ephemeral_pk); // 48
+            put_u32(&mut v, payload.encrypted_data.len() as u32); // len + data
+            v.extend_from_slice(&payload.encrypted_data);
+            v.extend_from_slice(&payload.tag); // 32
+            put_u64(&mut v, payload.epoch); // 8
+
+            put_str(&mut v, &c.sender); // canonical
+            put_access_list(&mut v, &c.access_list); // canonical
+            v.extend_from_slice(&c.pubkey); // 32
+            v.extend_from_slice(&c.sig); // 64
         }
         Tx::Avail(a) => {
             v.push(TAG_AVAIL);
-            v.extend_from_slice(&a.commitment);        // 32
-            v.extend_from_slice(&a.payload_hash);      // 32
+            v.extend_from_slice(&a.commitment); // 32
+            v.extend_from_slice(&a.payload_hash); // 32
             v.extend_from_slice(&a.payload_size.to_le_bytes()); // 8
-            put_str(&mut v, &a.sender);                // canonical
-            v.extend_from_slice(&a.pubkey);            // 32
-            v.extend_from_slice(&a.sig);               // 64
+            put_str(&mut v, &a.sender); // canonical
+            v.extend_from_slice(&a.pubkey); // 32
+            v.extend_from_slice(&a.sig); // 64
         }
     }
     v
@@ -266,33 +272,42 @@ pub fn tx_enum_bytes(tx: &Tx) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Tx, CommitTx, AvailTx, AccessList, StateKey, Hash};
+    use crate::mempool::encrypted::ThresholdCiphertext;
+    use crate::types::{AccessList, AvailTx, CommitTx, Hash, StateKey, Tx};
 
     // ---------- tiny manual decoder (for tests only) ----------
 
     fn rd_u32(i: &mut usize, b: &[u8]) -> Result<u32, &'static str> {
-        if *i + 4 > b.len() { return Err("truncated u32"); }
-        let v = u32::from_le_bytes(b[*i..*i+4].try_into().unwrap());
+        if *i + 4 > b.len() {
+            return Err("truncated u32");
+        }
+        let v = u32::from_le_bytes(b[*i..*i + 4].try_into().unwrap());
         *i += 4;
         Ok(v)
     }
     fn rd_u64(i: &mut usize, b: &[u8]) -> Result<u64, &'static str> {
-        if *i + 8 > b.len() { return Err("truncated u64"); }
-        let v = u64::from_le_bytes(b[*i..*i+8].try_into().unwrap());
+        if *i + 8 > b.len() {
+            return Err("truncated u64");
+        }
+        let v = u64::from_le_bytes(b[*i..*i + 8].try_into().unwrap());
         *i += 8;
         Ok(v)
     }
     fn rd_fixed<const N: usize>(i: &mut usize, b: &[u8]) -> Result<[u8; N], &'static str> {
-        if *i + N > b.len() { return Err("truncated fixed"); }
+        if *i + N > b.len() {
+            return Err("truncated fixed");
+        }
         let mut out = [0u8; N];
-        out.copy_from_slice(&b[*i..*i+N]);
+        out.copy_from_slice(&b[*i..*i + N]);
         *i += N;
         Ok(out)
     }
     fn rd_str(i: &mut usize, b: &[u8]) -> Result<String, &'static str> {
         let n = rd_u32(i, b)? as usize;
-        if *i + n > b.len() { return Err("truncated str"); }
-        let s = std::str::from_utf8(&b[*i..*i+n]).map_err(|_| "utf8")?;
+        if *i + n > b.len() {
+            return Err("truncated str");
+        }
+        let s = std::str::from_utf8(&b[*i..*i + n]).map_err(|_| "utf8")?;
         *i += n;
         Ok(s.to_string())
         // NOTE: this mirrors put_str (len + bytes)
@@ -303,14 +318,19 @@ mod tests {
             let n = rd_u32(i, b)? as usize;
             let mut out = Vec::with_capacity(n);
             for _ in 0..n {
-                if *i >= b.len() { return Err("truncated key tag"); }
-                let tag = b[*i]; *i += 1;
+                if *i >= b.len() {
+                    return Err("truncated key tag");
+                }
+                let tag = b[*i];
+                *i += 1;
                 match tag {
-                    0 => { // Balance
+                    0 => {
+                        // Balance
                         let acct = rd_str(i, b)?;
                         out.push(StateKey::Balance(acct));
                     }
-                    1 => { // Nonce
+                    1 => {
+                        // Nonce
                         let acct = rd_str(i, b)?;
                         out.push(StateKey::Nonce(acct));
                     }
@@ -328,64 +348,96 @@ mod tests {
         let mut i = 0usize;
 
         // version
-        if i >= bytes.len() { return Err("empty".into()); }
-        let ver = bytes[i]; i += 1;
+        if i >= bytes.len() {
+            return Err("empty".into());
+        }
+        let ver = bytes[i];
+        i += 1;
         if ver != CODEC_VERSION {
             return Err("version mismatch".into());
         }
 
-        if i >= bytes.len() { return Err("truncated tag".into()); }
-        let tag = bytes[i]; i += 1;
+        if i >= bytes.len() {
+            return Err("truncated tag".into());
+        }
+        let tag = bytes[i];
+        i += 1;
 
         match tag {
             TAG_COMMIT => {
-                let commitment: Hash      = rd_fixed::<32>(&mut i, bytes).map_err(|e| e.to_string())?;
-                let ciphertext_hash: Hash = rd_fixed::<32>(&mut i, bytes).map_err(|e| e.to_string())?;
+                let commitment: Hash = rd_fixed::<32>(&mut i, bytes).map_err(|e| e.to_string())?;
+                let ephemeral_pk: [u8; 48] =
+                    rd_fixed::<48>(&mut i, bytes).map_err(|e| e.to_string())?;
+                let enc_len = rd_u32(&mut i, bytes).map_err(|e| e.to_string())? as usize;
+                if i + enc_len > bytes.len() {
+                    return Err("truncated encrypted_data".into());
+                }
+                let encrypted_data = bytes[i..i + enc_len].to_vec();
+                i += enc_len;
+                let tag: [u8; 32] = rd_fixed::<32>(&mut i, bytes).map_err(|e| e.to_string())?;
+                let epoch = rd_u64(&mut i, bytes).map_err(|e| e.to_string())?;
                 let sender = rd_str(&mut i, bytes).map_err(|e| e.to_string())?;
                 let access_list = decode_access_list(&mut i, bytes).map_err(|e| e.to_string())?;
                 let pubkey: [u8; 32] = rd_fixed::<32>(&mut i, bytes).map_err(|e| e.to_string())?;
-                let sig:    [u8; 64] = rd_fixed::<64>(&mut i, bytes).map_err(|e| e.to_string())?;
+                let sig: [u8; 64] = rd_fixed::<64>(&mut i, bytes).map_err(|e| e.to_string())?;
 
-                // Create mock encrypted payload from the legacy ciphertext_hash
-                // In production, this would need proper migration logic
-                let mock_encrypted_payload = crate::mempool::encrypted::ThresholdCiphertext {
-                    ephemeral_pk: [0u8; 48],
-                    encrypted_data: ciphertext_hash.to_vec(), // Use hash as placeholder data
-                    tag: [0u8; 32],
-                    epoch: 0,
-                };
-                
                 Ok(Tx::Commit(CommitTx {
-                    commitment, sender, access_list, encrypted_payload: mock_encrypted_payload, pubkey, sig
+                    commitment,
+                    sender,
+                    access_list,
+                    encrypted_payload: ThresholdCiphertext {
+                        ephemeral_pk,
+                        encrypted_data,
+                        tag,
+                        epoch,
+                    },
+                    pubkey,
+                    sig,
                 }))
             }
             TAG_AVAIL => {
                 let commitment: Hash = rd_fixed::<32>(&mut i, bytes).map_err(|e| e.to_string())?;
-                let payload_hash: Hash = rd_fixed::<32>(&mut i, bytes).map_err(|e| e.to_string())?;
-                let payload_size_bytes: [u8; 8] = rd_fixed::<8>(&mut i, bytes).map_err(|e| e.to_string())?;
+                let payload_hash: Hash =
+                    rd_fixed::<32>(&mut i, bytes).map_err(|e| e.to_string())?;
+                let payload_size_bytes: [u8; 8] =
+                    rd_fixed::<8>(&mut i, bytes).map_err(|e| e.to_string())?;
                 let payload_size = u64::from_le_bytes(payload_size_bytes);
                 let sender = rd_str(&mut i, bytes).map_err(|e| e.to_string())?;
                 let pubkey: [u8; 32] = rd_fixed::<32>(&mut i, bytes).map_err(|e| e.to_string())?;
-                let sig:    [u8; 64] = rd_fixed::<64>(&mut i, bytes).map_err(|e| e.to_string())?;
-                Ok(Tx::Avail(AvailTx { commitment, sender, payload_hash, payload_size, pubkey, sig }))
+                let sig: [u8; 64] = rd_fixed::<64>(&mut i, bytes).map_err(|e| e.to_string())?;
+                Ok(Tx::Avail(AvailTx {
+                    commitment,
+                    sender,
+                    payload_hash,
+                    payload_size,
+                    pubkey,
+                    sig,
+                }))
             }
             _ => Err("unknown tag".into()),
         }
     }
 
     // ---------- helpers for constructing test data ----------
-    fn nz32(b: u8) -> [u8; 32] { [b; 32] }
-    fn nz64(b: u8) -> [u8; 64] { [b; 64] }
+    fn nz32(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+    fn nz64(b: u8) -> [u8; 64] {
+        [b; 64]
+    }
     fn dummy_al() -> AccessList {
         AccessList {
-            reads:  vec![StateKey::Balance("Alice".into()), StateKey::Nonce("Alice".into())],
+            reads: vec![
+                StateKey::Balance("Alice".into()),
+                StateKey::Nonce("Alice".into()),
+            ],
             writes: vec![StateKey::Balance("Bob".into())],
         }
     }
 
     #[test]
     fn codec_roundtrip_commit_manual_decode() {
-        let mock_encrypted_payload = crate::mempool::encrypted::ThresholdCiphertext {
+        let mock_encrypted_payload = ThresholdCiphertext {
             ephemeral_pk: [0x22u8; 48],
             encrypted_data: vec![0x33u8; 64],
             tag: [0x44u8; 32],
@@ -435,12 +487,15 @@ mod tests {
         enc[0] = CODEC_VERSION.wrapping_add(1); // flip version
 
         let err = decode_tx(&enc).expect_err("should reject unknown version");
-        assert!(err.contains("version"), "expected version error, got: {err}");
+        assert!(
+            err.contains("version"),
+            "expected version error, got: {err}"
+        );
     }
 
     #[test]
     fn codec_rejects_truncated_buffer() {
-        let mock_encrypted_payload = crate::mempool::encrypted::ThresholdCiphertext {
+        let mock_encrypted_payload = ThresholdCiphertext {
             ephemeral_pk: [0x66u8; 48],
             encrypted_data: vec![0x77u8; 64],
             tag: [0x88u8; 32],
