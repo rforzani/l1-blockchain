@@ -11,7 +11,7 @@
 //! - All operations use proper domain separation and are non-malleable
 
 use blst::min_pk as mpk;
-use blst::{blst_scalar, blst_fr, blst_p1, blst_p1_affine, BLST_ERROR};
+use blst::{blst_scalar, blst_fr};
 use serde::{Serialize, Deserialize};
 use serde_with::{serde_as, Bytes};
 use sha2::{Digest, Sha256};
@@ -669,19 +669,21 @@ pub mod dkg {
                 }
             }
             
-            // Convert scalar back to bytes
-            let mut share_bytes = [0u8; 32];
-            unsafe {
-                let mut uint64_array = [0u64; 4];
-                blst::blst_uint64_from_fr(uint64_array.as_mut_ptr(), &result);
-                for (i, &val) in uint64_array.iter().enumerate() {
-                    let bytes = val.to_le_bytes();
-                    share_bytes[i*8..(i+1)*8].copy_from_slice(&bytes);
-                }
-            }
-            
-            // Ensure each share is a valid BLS scalar 
-            share_bytes[31] &= 0x1f;
+            // Convert scalar back to canonical big-endian bytes and ensure validity
+            let share_bytes = unsafe {
+                // Convert the field element to a scalar then to big-endian bytes
+                let mut scalar = blst_scalar::default();
+                blst::blst_scalar_from_fr(&mut scalar, &result);
+
+                let mut tmp = [0u8; 32];
+                blst::blst_bendian_from_scalar(tmp.as_mut_ptr(), &scalar);
+
+                // Re-create a SecretKey to guarantee the bytes are valid for blst
+                mpk::SecretKey::from_bytes(&tmp)
+                    .map(|sk| sk.to_bytes())
+                    .expect("share scalar within curve order")
+            };
+
             shares.insert(validator_id, share_bytes);
         }
         
