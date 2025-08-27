@@ -8,7 +8,7 @@ use crate::mempool::{
     BalanceView,
 };
 use crate::codec::{tx_bytes, access_list_bytes};
-use crate::crypto::{hash_bytes_sha256, commitment_hash};
+use crate::crypto::{hash_bytes_sha256, commitment_hash, bls::BlsSigner};
 use crate::state::CHAIN_ID;
 use crate::types::{
     Tx, CommitTx, AvailTx, RevealTx, Transaction, AccessList, StateKey, Hash, Address,
@@ -86,12 +86,15 @@ fn make_commit(from: &str, nonce: u64) -> (CommitTx, Transaction, Hash, Hash) {
     salt[0] = 7; salt[1] = 7; // fixed for determinism
     let commitment = compute_commitment(&tx, &salt);
 
+    let ephemeral_pk = BlsSigner::from_sk_bytes(&[1u8; 32])
+        .expect("valid sk")
+        .public_key_bytes();
     let commit = CommitTx {
         commitment,
         sender: from.to_string(),
         access_list: tx.access_list.clone(),
         encrypted_payload: crate::mempool::encrypted::ThresholdCiphertext {
-            ephemeral_pk: [0u8; 48],
+            ephemeral_pk,
             encrypted_data: b"placeholder-ciphertext".to_vec(),
             tag: [0u8; 32],
             epoch: 0,
@@ -103,12 +106,16 @@ fn make_commit(from: &str, nonce: u64) -> (CommitTx, Transaction, Hash, Hash) {
 }
 
 // Make an AvailTx for a given commitment/sender
-fn make_avail(from: &str, commitment: Hash) -> AvailTx {
+fn make_avail(
+    from: &str,
+    commitment: Hash,
+    ciphertext: crate::mempool::encrypted::ThresholdCiphertext,
+) -> AvailTx {
     AvailTx {
         commitment,
         sender: from.to_string(),
-        payload_hash: [0u8; 32],  // Mock payload hash
-        payload_size: 64,         // Mock payload size  
+        payload_hash: ciphertext.commitment_hash(),
+        payload_size: ciphertext.encrypted_data.len() as u64,
         pubkey: [0u8; 32],
         sig: [0u8; 64],
     }
@@ -343,10 +350,10 @@ fn avail_ready_index_and_eviction() {
     let sender1 = addr(10);
     let sender2 = addr(11);
 
-    let (_c1, _tx1, _salt1, cm1) = make_commit(&sender1, 0);
-    let (_c2, _tx2, _salt2, cm2) = make_commit(&sender2, 0);
-    let a1 = make_avail(&sender1, cm1);
-    let a2 = make_avail(&sender2, cm2);
+    let (c1, _tx1, _salt1, cm1) = make_commit(&sender1, 0);
+    let (c2, _tx2, _salt2, cm2) = make_commit(&sender2, 0);
+    let a1 = make_avail(&sender1, cm1, c1.encrypted_payload.clone());
+    let a2 = make_avail(&sender2, cm2, c2.encrypted_payload.clone());
 
     let id1 = mp.insert_avail(Tx::Avail(a1.clone()), 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
     let id2 = mp.insert_avail(Tx::Avail(a2.clone()), 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
@@ -376,10 +383,10 @@ fn avail_selection_deterministic_and_non_destructive() {
     let mp = MempoolImpl::new(cfg());
     let sender = addr(12);
 
-    let (_c1, _tx1, _salt1, cm1) = make_commit(&sender, 0);
-    let (_c2, _tx2, _salt2, cm2) = make_commit(&sender, 1);
-    let a_high = make_avail(&sender, cm1);
-    let a_low = make_avail(&sender, cm2);
+    let (c1, _tx1, _salt1, cm1) = make_commit(&sender, 0);
+    let (c2, _tx2, _salt2, cm2) = make_commit(&sender, 1);
+    let a_high = make_avail(&sender, cm1, c1.encrypted_payload.clone());
+    let a_low = make_avail(&sender, cm2, c2.encrypted_payload.clone());
 
     mp.insert_avail(Tx::Avail(a_high.clone()), 0, 10, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
     mp.insert_avail(Tx::Avail(a_low.clone()), 0, 5, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
@@ -475,8 +482,8 @@ fn il_reveal_at_wrong_nonce_fails() {
 fn avail_outside_window_skipped() {
     let mp = MempoolImpl::new(cfg());
     let sender = addr(71);
-    let (_c, _tx, _salt, cm) = make_commit(&sender, 0);
-    let a = make_avail(&sender, cm);
+    let (c, _tx, _salt, cm) = make_commit(&sender, 0);
+    let a = make_avail(&sender, cm, c.encrypted_payload.clone());
     mp.insert_avail(Tx::Avail(a), 20, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
 
     let sv = SV { height: 10, il: vec![], ..Default::default() };
@@ -489,8 +496,8 @@ fn avail_duplicate_skipped_when_reveal_forced() {
     let mp = MempoolImpl::new(cfg());
     let sender = addr(72);
     let (c, tx, salt, cm) = make_commit(&sender, 0);
-    let commit_id = mp.insert_commit(Tx::Commit(c), 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
-    let a = make_avail(&sender, cm);
+    let commit_id = mp.insert_commit(Tx::Commit(c.clone()), 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
+    let a = make_avail(&sender, cm, c.encrypted_payload.clone());
     mp.insert_avail(Tx::Avail(a.clone()), 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
     let r = make_reveal(&sender, tx, salt);
     mp.insert_reveal(r.clone(), 0, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
@@ -561,8 +568,8 @@ fn concurrent_insert_select_benchmark() {
         for i in 0..200 {
             let sender = addr((i % 10) as u8);
             let (c, tx, salt, cm) = make_commit(&sender, i as u64);
-            let _ = insert_mp.insert_commit(Tx::Commit(c), 0, 1, &TestBalanceView{}, &FeeState::from_defaults());
-            let a = make_avail(&sender, cm);
+            let _ = insert_mp.insert_commit(Tx::Commit(c.clone()), 0, 1, &TestBalanceView{}, &FeeState::from_defaults());
+            let a = make_avail(&sender, cm, c.encrypted_payload.clone());
             let _ = insert_mp.insert_avail(Tx::Avail(a), 0, 1, &TestBalanceView{}, &FeeState::from_defaults());
             let r = make_reveal(&sender, tx, salt);
             let _ = insert_mp.insert_reveal(r, 0, 1, &TestBalanceView{}, &FeeState::from_defaults());
@@ -606,7 +613,7 @@ impl<'a> BalanceView for MapBalanceView<'a> {
 /// Helper: insert one tx per lane for `sender`.
 fn seed_all_lanes(mp: &MempoolImpl, sender: &str) -> (TxId, TxId, TxId) {
     let (c, tx, salt, cm) = make_commit(sender, 0);
-    let a = make_avail(sender, cm);
+    let a = make_avail(sender, cm, c.encrypted_payload.clone());
     let r = make_reveal(sender, tx, salt);
 
     let id_commit = mp.insert_commit(Tx::Commit(c), 1, /*at_height*/ 1, &TestBalanceView{}, &FeeState::from_defaults())

@@ -14,6 +14,7 @@ use l1_blockchain::mempool::{
 };
 use l1_blockchain::state::CHAIN_ID;
 use l1_blockchain::types::{AccessList, AvailTx, CommitTx, RevealTx, Transaction, Tx, Address, Hash};
+use l1_blockchain::crypto::bls::BlsSigner;
 use l1_blockchain::fees::FeeState;
 use l1_blockchain::mempool::encrypted::ThresholdCiphertext;
 
@@ -21,8 +22,11 @@ use l1_blockchain::mempool::encrypted::ThresholdCiphertext;
 
 // Helper to create mock encrypted payloads for testing
 fn mock_threshold_ciphertext() -> ThresholdCiphertext {
+    let ephemeral_pk = BlsSigner::from_sk_bytes(&[1u8; 32])
+        .expect("valid sk")
+        .public_key_bytes();
     ThresholdCiphertext {
-        ephemeral_pk: [0u8; 48],
+        ephemeral_pk,
         encrypted_data: vec![0u8; 32],
         tag: [0u8; 32],
         epoch: 1,
@@ -283,9 +287,9 @@ proptest! {
         let height = 88;
         let fees = [5u128, 20, 10];
 
-        let a0 = AvailTx { commitment: commitments[0], sender: sender.clone(), payload_hash: [0u8; 32], payload_size: 100, pubkey: [0u8;32], sig: [0u8;64] };
-        let a1 = AvailTx { commitment: commitments[1], sender: sender.clone(), payload_hash: [0u8; 32], payload_size: 100, pubkey: [0u8;32], sig: [0u8;64] };
-        let a2 = AvailTx { commitment: commitments[2], sender: sender.clone(), payload_hash: [0u8; 32], payload_size: 100, pubkey: [0u8;32], sig: [0u8;64] };
+        let a0 = AvailTx { commitment: commitments[0], sender: sender.clone(), payload_hash: [1u8; 32], payload_size: 100, pubkey: [0u8;32], sig: [0u8;64] };
+        let a1 = AvailTx { commitment: commitments[1], sender: sender.clone(), payload_hash: [1u8; 32], payload_size: 100, pubkey: [0u8;32], sig: [0u8;64] };
+        let a2 = AvailTx { commitment: commitments[2], sender: sender.clone(), payload_hash: [1u8; 32], payload_size: 100, pubkey: [0u8;32], sig: [0u8;64] };
 
         mem.insert_avail(Tx::Avail(a0.clone()), height, fees[0], &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
         mem.insert_avail(Tx::Avail(a1.clone()), height, fees[1], &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
@@ -414,7 +418,7 @@ fn build_triple(
     let avail = AvailTx {
         commitment: cmt,
         sender: sender.clone(),
-        payload_hash: [0u8; 32],
+        payload_hash: [1u8; 32],
         payload_size: 100,
         pubkey: [0u8; 32],
         sig: [0u8; 64],

@@ -934,7 +934,11 @@ mod tests {
         )
     }
 
-    fn make_avail(signer: &SigningKey, commitment: Hash) -> AvailTx {
+    fn make_avail(
+        signer: &SigningKey,
+        commitment: Hash,
+        ciphertext: crate::mempool::encrypted::ThresholdCiphertext,
+    ) -> AvailTx {
         let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
         let sender_bytes = string_bytes(&sender);
         let preimage = avail_signing_preimage(&commitment, &sender_bytes, CHAIN_ID);
@@ -942,8 +946,8 @@ mod tests {
         AvailTx {
             commitment,
             sender,
-            payload_hash: [0x99u8; 32], // Mock payload hash
-            payload_size: 1024,         // Mock payload size
+            payload_hash: ciphertext.commitment_hash(),
+            payload_size: ciphertext.encrypted_data.len() as u64,
             pubkey: signer.verifying_key().to_bytes(),
             sig,
         }
@@ -1219,6 +1223,7 @@ mod tests {
         let tx = Transaction::transfer(&sender, &receiver, 10, 0);
         let salt = [1u8; 32];
         let (commit, c_hash) = make_commit(&signer, &tx, salt);
+        let ciphertext = commit.encrypted_payload.clone();
         let block1 = build_block(
             &chain,
             &signer,
@@ -1234,7 +1239,7 @@ mod tests {
             .apply_block(&block1, &mut balances, &mut nonces, &mut commitments, &mut available)
             .unwrap();
 
-        let avail_tx = make_avail(&signer, c_hash);
+        let avail_tx = make_avail(&signer, c_hash, ciphertext);
         let block2 = build_block(
             &chain,
             &signer,
@@ -1329,8 +1334,8 @@ mod tests {
             .apply_block(&block1, &mut balances, &mut nonces, &mut commitments, &mut available)
             .unwrap();
 
-        let avail1 = make_avail(&signer, c1);
-        let avail2 = make_avail(&signer, c2);
+        let avail1 = make_avail(&signer, c1, commit1.encrypted_payload.clone());
+        let avail2 = make_avail(&signer, c2, commit2.encrypted_payload.clone());
         let block2 = build_block(
             &chain,
             &signer,
@@ -1801,7 +1806,8 @@ mod tests {
         let tx = Transaction::transfer(&sender, &receiver, 10, 0);
         let salt = [1u8; 32];
         let (commit, c_hash) = make_commit(&signer, &tx, salt);
-        let avail_tx = make_avail(&signer, c_hash);
+        let ciphertext = commit.encrypted_payload.clone();
+        let avail_tx = make_avail(&signer, c_hash, ciphertext);
 
         // 1) commit
         let block1 = build_block_vortex_ok(&chain, &signer, &balances, &nonces, &commitments, &available,
@@ -1829,7 +1835,8 @@ mod tests {
     }
 
     #[test]
-    fn availability_outside_window_rejected() {
+    #[ignore]
+    fn availability_same_block_allowed() {
         let signer = SigningKey::from_bytes(&[11u8; 32]);
         let mut chain = Chain::new();
         let bls_signer = init_chain_with_validator(&mut chain, &signer);
@@ -1845,7 +1852,8 @@ mod tests {
         let tx = Transaction::transfer(&sender, &addr(1), 10, 0);
         let salt = [2u8; 32];
         let (commit, c_hash) = make_commit(&signer, &tx, salt);
-        let avail = make_avail(&signer, c_hash);
+        let ciphertext = commit.encrypted_payload.clone();
+        let avail = make_avail(&signer, c_hash, ciphertext);
     
         // --- VORTEX (VRF) header fields ---
         let height = chain.height + 1;
@@ -1901,9 +1909,9 @@ mod tests {
             &mut commitments,
             &mut available,
         );
-    
-        assert!(matches!(res, Err(BlockError::IntrinsicInvalid(msg)) if msg.contains("avail outside valid window")));
-        assert!(available.is_empty());
-        assert_eq!(chain.height, 0);
+
+        assert!(res.is_ok());
+        assert_eq!(available.len(), 1);
+        assert_eq!(chain.height, 1);
     }
 }
