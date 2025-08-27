@@ -566,10 +566,18 @@ impl Node {
             header,
             justify_qc,
         );
-        // Package selected transactions into a batch referenced by digest
-        let batch = Batch::new(cand.txs.clone(), Vec::new(), proposer_id, [0u8; 64]);
+        // Package selected transactions into a batch referenced by digest.
+        // The batch references the current DAG frontier as its parents so the
+        // batch store maintains proper parent/child relationships.
+        let parents = self.chain.batch_store.frontier();
+        let batch = Batch::new(cand.txs.clone(), parents.clone(), proposer_id, [0u8; 64]);
         self.chain.batch_store.insert(batch.clone());
-        block.batch_digests.push(batch.id);
+
+        // Record the digest list for this block: include parents so replicas can
+        // fetch any missing batches before executing the new one.
+        let mut digests = parents;
+        digests.push(batch.id);
+        block.batch_digests = digests;
     
         // 4) Simulate execution to compute canonical roots/gas/receipts (does not mutate Chain)
         let mut sim_balances    = self.balances.clone();

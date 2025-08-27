@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
+use std::sync::{mpsc, Arc, RwLock};
+use std::thread;
 
 use sha2::{Digest, Sha256};
 
@@ -84,4 +85,51 @@ impl BatchStore {
             .map(|s| s.into_iter().collect())
             .unwrap_or_default()
     }
+
+    /// Return the digests of batches that currently have no children. These
+    /// represent the "frontier" of the batch DAG and are used as parents for
+    /// newly created batches.
+    pub fn frontier(&self) -> Vec<Hash> {
+        let batches = self.batches.read().unwrap();
+        let children = self.children.read().unwrap();
+        batches
+            .keys()
+            .filter(|id| !children.contains_key(*id))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Handle to a spawned worker thread. Send transaction lists to the worker
+/// and it will produce and gossip a batch.
+pub struct WorkerHandle {
+    pub tx: mpsc::Sender<Vec<Tx>>,
+}
+
+/// Spawn `n` worker threads. Each worker listens for incoming transactions,
+/// forms a signed `Batch` referencing the current DAG frontier as parents and
+/// inserts it into `store`. Produced batches are gossiped on the returned
+/// `Receiver`.
+pub fn spawn_workers(
+    n: usize,
+    store: Arc<BatchStore>,
+    producer: ValidatorId,
+) -> (Vec<WorkerHandle>, mpsc::Receiver<Batch>) {
+    let (gossip_tx, gossip_rx) = mpsc::channel();
+    let mut handles = Vec::new();
+    for _ in 0..n {
+        let (tx, rx) = mpsc::channel::<Vec<Tx>>();
+        let store_cloned = store.clone();
+        let gossip = gossip_tx.clone();
+        thread::spawn(move || {
+            while let Ok(txs) = rx.recv() {
+                let parents = store_cloned.frontier();
+                let batch = Batch::new(txs, parents, producer, [0u8; 64]);
+                store_cloned.insert(batch.clone());
+                let _ = gossip.send(batch);
+            }
+        });
+        handles.push(WorkerHandle { tx });
+    }
+    (handles, gossip_rx)
 }

@@ -79,3 +79,42 @@ fn block_resolves_batches_by_digest() {
         .collect();
     assert_eq!(fetched, vec![tx]);
 }
+
+#[test]
+fn dag_links_children() {
+    let store = BatchStore::new();
+    let tx = sample_commit();
+    // Parent batch without parents.
+    let parent = Batch::new(vec![tx.clone()], vec![], ValidatorId::from(1u64), [0u8;64]);
+    // Child references parent.
+    let child = Batch::new(vec![tx.clone()], vec![parent.id], ValidatorId::from(2u64), [0u8;64]);
+    store.insert(parent.clone());
+    store.insert(child.clone());
+
+    let children = store.children_of(&parent.id);
+    assert_eq!(children, vec![child.id]);
+    let fetched_child = store.get(&child.id).unwrap();
+    assert_eq!(fetched_child.parents, vec![parent.id]);
+}
+
+#[test]
+fn block_fetches_parent_and_child_batches() {
+    let store = BatchStore::new();
+    let tx = sample_commit();
+    let parent = Batch::new(vec![tx.clone()], vec![], ValidatorId::from(1u64), [0u8;64]);
+    let child = Batch::new(vec![tx.clone()], vec![parent.id], ValidatorId::from(2u64), [0u8;64]);
+    store.insert(parent.clone());
+    store.insert(child.clone());
+
+    let mut block = dummy_block();
+    block.batch_digests.push(parent.id);
+    block.batch_digests.push(child.id);
+
+    let fetched: Vec<Tx> = block
+        .batch_digests
+        .iter()
+        .flat_map(|d| store.get(d).unwrap().txs.clone())
+        .collect();
+    // Both parent and child payloads should be present.
+    assert_eq!(fetched.len(), 2);
+}
