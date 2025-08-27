@@ -74,7 +74,6 @@ fn create_test_chain() -> Chain {
 }
 
 #[test]
-#[ignore]
 fn test_full_commit_avail_decrypt_flow() {
     let mut chain = create_test_chain();
     let mut balances = Balances::new();

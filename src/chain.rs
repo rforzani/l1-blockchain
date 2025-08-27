@@ -1835,7 +1835,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn availability_same_block_allowed() {
         let signer = SigningKey::from_bytes(&[11u8; 32]);
         let mut chain = Chain::new();
