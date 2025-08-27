@@ -13,7 +13,7 @@ use l1_blockchain::mempool::{ThresholdEngine, ThresholdShare};
 use l1_blockchain::pos::registry::{Validator, ValidatorSet, ValidatorStatus};
 use l1_blockchain::state::CHAIN_ID;
 use l1_blockchain::state::{Available, Balances, Commitments, Nonces};
-use l1_blockchain::stf::{process_block, process_commit};
+use l1_blockchain::stf::{process_block, process_commit, TxError};
 use l1_blockchain::types::{
     AccessList, AvailTx, Block, BlockHeader, CommitTx, Event, StateKey,
 };
@@ -197,6 +197,20 @@ fn test_full_commit_avail_decrypt_flow() {
         pubkey: verifying_key.to_bytes(),
         sig: avail_sig.to_bytes(),
     };
+
+    // Avail before ready_at should be rejected
+    let early_attempt = l1_blockchain::stf::process_avail(
+        &avail_tx,
+        &mut commitments,
+        &mut available,
+        1, // current_height too early (included_at + 1 required)
+        &mut events,
+        &mut balances,
+        &fee_state,
+        &proposer,
+        &mut burned_total,
+    );
+    assert!(matches!(early_attempt, Err(TxError::IntrinsicInvalid(ref m)) if m == "avail too early"));
 
     // Process the avail transaction to mark commitment as available
     let avail_receipt = l1_blockchain::stf::process_avail(

@@ -1937,17 +1937,46 @@ mod tests {
         let ciphertext = commit.encrypted_payload.clone();
         let avail = make_avail(&signer, c_hash, ciphertext);
     
-        let block = build_block_vortex_ok(
-            &chain,
-            &signer,
-            &bls_signer,
-            &balances,
-            &nonces,
-            &commitments,
-            &available,
-            vec![Tx::Commit(commit), Tx::Avail(avail)],
-            vec![],
-        );
+        let height = chain.height + 1;
+        let slot = height;
+        let epoch = chain.clock.current_epoch(slot);
+        let bundle_len = DEFAULT_BUNDLE_LEN;
+        let proposer_id: u64 = 1;
+        let (vrf_output, vrf_preout, vrf_proof) = fake_vrf_fields(proposer_id);
+        let (qc, qc_hash) = make_qc(&chain, &bls_signer);
+
+        let mut block = Block {
+            header: BlockHeader {
+                parent_hash: chain.tip_hash,
+                height,
+                txs_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                randomness: chain.tip_hash,
+                reveal_set_root: [0u8; 32],
+                il_root: [0u8; 32],
+                exec_base_fee: chain.fee_state.exec_base,
+                commit_base_fee: chain.fee_state.commit_base,
+                avail_base_fee: chain.fee_state.avail_base,
+                timestamp: 0,
+                slot,
+                epoch,
+                proposer_id,
+                bundle_len,
+                vrf_output,
+                vrf_proof,
+                vrf_preout,
+                view: 0,
+                justify_qc_hash: qc_hash,
+                signature: [0u8; 64],
+            },
+            transactions: vec![Tx::Commit(commit), Tx::Avail(avail)],
+            reveals: vec![],
+            batch_digests: vec![],
+            justify_qc: qc,
+        };
+        let preimage = header_signing_bytes(&block.header);
+        block.header.signature = signer.sign(&preimage).to_bytes();
 
         let res = chain.apply_block(
             &block,
@@ -1957,8 +1986,8 @@ mod tests {
             &mut available,
         );
 
-        assert!(res.is_ok());
-        assert_eq!(available.len(), 1);
-        assert_eq!(chain.height, 1);
+        assert!(matches!(res, Err(BlockError::IntrinsicInvalid(msg)) if msg.contains("avail too early")));
+        assert_eq!(available.len(), 0);
+        assert_eq!(chain.height, 0);
     }
 }

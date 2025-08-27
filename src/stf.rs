@@ -255,6 +255,9 @@ pub fn process_avail(
     // Validate timing - avail transactions can be submitted during the commitment window
     let ready_at = meta.included_at + DECRYPTION_DELAY;
     let deadline = ready_at + REVEAL_WINDOW;
+    if current_height < ready_at {
+        return Err(TxError::IntrinsicInvalid("avail too early".into()));
+    }
     if current_height >= deadline {
         return Err(TxError::IntrinsicInvalid("avail too late - past deadline".into()));
     }
