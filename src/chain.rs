@@ -1918,7 +1918,7 @@ mod tests {
     }
 
     #[test]
-    fn availability_same_block_allowed() {
+    fn availability_same_block_not_allowed() {
         let signer = SigningKey::from_bytes(&[11u8; 32]);
         let mut chain = Chain::new();
         let bls_signer = init_chain_with_validator(&mut chain, &signer);
