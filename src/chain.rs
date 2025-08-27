@@ -362,31 +362,30 @@ impl Chain {
             return Err(BlockError::IntrinsicInvalid("bad block signature".into()));
         }
 
-        // QC verification: only perform if all active validators have BLS keys
-        if let Some(active_bls_pks) = self.collect_active_bls_pubkeys() {
-            let computed_qc_hash = qc_commitment(
-                block.justify_qc.view,
-                &block.justify_qc.block_id,
-                &block.justify_qc.agg_sig,
-                &block.justify_qc.bitmap,
-            );
-            
-            // Check that justify_qc_hash in header matches computed QC commitment
-            if block.header.justify_qc_hash != computed_qc_hash {
-                return Err(BlockError::IntrinsicInvalid(
-                    "justify_qc_hash mismatch".into()
-                ));
-            }
-            
-            // Verify the QC BLS signature against active validator keys
-            verify_qc(
-                &block.justify_qc.block_id,
-                block.justify_qc.view,
-                &block.justify_qc.agg_sig,
-                &block.justify_qc.bitmap,
-                &active_bls_pks,
-            ).map_err(|_| BlockError::IntrinsicInvalid("QC signature verification failed".into()))?;
+        // QC verification: all active validators must have BLS keys
+        let active_bls_pks = self.collect_active_bls_pubkeys()?;
+        let computed_qc_hash = qc_commitment(
+            block.justify_qc.view,
+            &block.justify_qc.block_id,
+            &block.justify_qc.agg_sig,
+            &block.justify_qc.bitmap,
+        );
+
+        // Check that justify_qc_hash in header matches computed QC commitment
+        if block.header.justify_qc_hash != computed_qc_hash {
+            return Err(BlockError::IntrinsicInvalid(
+                "justify_qc_hash mismatch".into()
+            ));
         }
+
+        // Verify the QC BLS signature against active validator keys
+        verify_qc(
+            &block.justify_qc.block_id,
+            block.justify_qc.view,
+            &block.justify_qc.agg_sig,
+            &block.justify_qc.bitmap,
+            &active_bls_pks,
+        ).map_err(|_| BlockError::IntrinsicInvalid("QC signature verification failed".into()))?;
 
         let mut sim_balances = balances.clone();
         let mut sim_nonces = nonces.clone();
@@ -502,31 +501,30 @@ impl Chain {
             }
         }
 
-        // QC verification: only perform if all active validators have BLS keys
-        if let Some(active_bls_pks) = self.collect_active_bls_pubkeys() {
-            let computed_qc_hash = qc_commitment(
-                block.justify_qc.view,
-                &block.justify_qc.block_id,
-                &block.justify_qc.agg_sig,
-                &block.justify_qc.bitmap,
-            );
-            
-            // Check that justify_qc_hash in header matches computed QC commitment
-            if block.header.justify_qc_hash != computed_qc_hash {
-                return Err(BlockError::IntrinsicInvalid(
-                    "justify_qc_hash mismatch".into()
-                ));
-            }
-            
-            // Verify the QC BLS signature against active validator keys
-            verify_qc(
-                &block.justify_qc.block_id,
-                block.justify_qc.view,
-                &block.justify_qc.agg_sig,
-                &block.justify_qc.bitmap,
-                &active_bls_pks,
-            ).map_err(|_| BlockError::IntrinsicInvalid("QC signature verification failed".into()))?;
+        // QC verification: all active validators must have BLS keys
+        let active_bls_pks = self.collect_active_bls_pubkeys()?;
+        let computed_qc_hash = qc_commitment(
+            block.justify_qc.view,
+            &block.justify_qc.block_id,
+            &block.justify_qc.agg_sig,
+            &block.justify_qc.bitmap,
+        );
+
+        // Check that justify_qc_hash in header matches computed QC commitment
+        if block.header.justify_qc_hash != computed_qc_hash {
+            return Err(BlockError::IntrinsicInvalid(
+                "justify_qc_hash mismatch".into()
+            ));
         }
+
+        // Verify the QC BLS signature against active validator keys
+        verify_qc(
+            &block.justify_qc.block_id,
+            block.justify_qc.view,
+            &block.justify_qc.agg_sig,
+            &block.justify_qc.bitmap,
+            &active_bls_pks,
+        ).map_err(|_| BlockError::IntrinsicInvalid("QC signature verification failed".into()))?;
 
         verify_block_roots(&block.header, block, &self.batch_store, &apply.receipts)
             .map_err(BlockError::RootMismatch)?;
@@ -605,18 +603,22 @@ impl Chain {
     }
 
     /// Collect BLS public keys from active validators in stable order.
-    /// Returns None if any active validator is missing a BLS key.
-    fn collect_active_bls_pubkeys(&self) -> Option<Vec<[u8; 48]>> {
+    /// Returns an error if any active validator is missing a BLS key.
+    fn collect_active_bls_pubkeys(&self) -> Result<Vec<[u8; 48]>, BlockError> {
         let mut out = Vec::new();
         for v in &self.validator_set.validators {
             if v.status == ValidatorStatus::Active {
                 match v.bls_pubkey {
                     Some(pk) => out.push(pk),
-                    None => return None, // Skip QC verification if any validator lacks BLS key
+                    None => {
+                        return Err(BlockError::IntrinsicInvalid(
+                            "active validator missing BLS key".into(),
+                        ))
+                    }
                 }
             }
         }
-        Some(out)
+        Ok(out)
     }
 }
 
@@ -639,7 +641,7 @@ mod tests {
     use crate::types::{
         Block, BlockHeader, Tx, CommitTx, AvailTx, RevealTx, Transaction, Hash, QC,
     };
-    use crate::crypto::bls::BlsSignatureBytes;
+    use crate::crypto::bls::{BlsSignatureBytes, BlsSigner, BlsAggregate, vote_msg};
     use bitvec::vec::BitVec;
     use crate::pos::registry::{StakingConfig, Validator, ValidatorSet, ValidatorStatus};
 
@@ -658,13 +660,10 @@ mod tests {
         (out, preout, proof)
     }
 
-    fn dummy_qc() -> QC {
-        QC { view: 0, block_id: [0u8;32], agg_sig: BlsSignatureBytes([0u8;96]), bitmap: BitVec::new() }
-    }
-
     fn build_block(
         chain: &Chain,
         signer: &SigningKey,
+        bls_signer: &BlsSigner,
         balances: &Balances,
         nonces: &Nonces,
         commitments: &Commitments,
@@ -694,6 +693,9 @@ mod tests {
         let vrf_preout = [0u8; 32];
         let vrf_proof: Vec<u8> = Vec::new();
     
+        // Build QC for current tip
+        let (qc, qc_hash) = make_qc(&chain, &bls_signer);
+
         let mut block = Block {
             header: BlockHeader {
                 // consensus lineage
@@ -727,7 +729,7 @@ mod tests {
 
                 // HotStuff fields
                 view: 0,
-                justify_qc_hash: [0u8; 32],
+                justify_qc_hash: qc_hash,
 
                 // signature filled after STF + preimage build
                 signature:       [0u8; 64],
@@ -735,7 +737,7 @@ mod tests {
             transactions,
             reveals,
             batch_digests: Vec::new(),
-            justify_qc: dummy_qc(),
+            justify_qc: qc,
         };
     
         // Simulate STF to compute canonical roots/gas
@@ -777,6 +779,7 @@ mod tests {
     fn build_empty_block(
         chain: &Chain,
         signer: &SigningKey,
+        bls_signer: &BlsSigner,
         balances: &Balances,
         nonces: &Nonces,
         commitments: &Commitments,
@@ -785,6 +788,7 @@ mod tests {
         build_block(
             chain,
             signer,
+            bls_signer,
             balances,
             nonces,
             commitments,
@@ -855,40 +859,56 @@ mod tests {
     }
 
     #[cfg(test)]
-    pub fn init_chain_with_validator(chain: &mut Chain, signer: &SigningKey) {
+    pub fn init_chain_with_validator(chain: &mut Chain, signer: &SigningKey) -> BlsSigner {
         use crate::crypto::vrf::SchnorrkelVrfSigner;
 
         let cfg = StakingConfig { min_stake: 1, unbonding_epochs: 1, max_validators: u32::MAX };
-    
+
         // Deterministic VRF key for tests (DO NOT use this pattern for prod key mgmt)
         let vrf_seed = hash_bytes_sha256(b"l1-blockchain/test-vrf-seed:v1");
         let vrf      = SchnorrkelVrfSigner::from_deterministic_seed(vrf_seed);
-    
+
+        let bls_signer = BlsSigner::from_sk_bytes(&[1u8;32]).unwrap();
         let v = Validator {
             id: 1,
             ed25519_pubkey: signer.verifying_key().to_bytes(),
-            bls_pubkey: None,
+            bls_pubkey: Some(bls_signer.public_key_bytes()),
             vrf_pubkey: vrf.public_bytes(),   // <-- REQUIRED
             stake: 1,
             status: ValidatorStatus::Active,
         };
-    
+
         let set  = ValidatorSet::from_genesis(0, &cfg, vec![v]);
         let seed = hash_bytes_sha256(b"l1-blockchain/test-epoch-seed:v1");
         chain.init_genesis(set, seed);
+
+        bls_signer
+    }
+
+    fn make_qc(chain: &Chain, bls_signer: &BlsSigner) -> (QC, [u8;32]) {
+        let msg = vote_msg(&chain.tip_hash, chain.height);
+        let mut agg = BlsAggregate::new();
+        let sig = bls_signer.sign(&msg);
+        agg.push(&sig.0);
+        let agg_sig = agg.finalize().unwrap();
+        let mut bitmap = BitVec::repeat(false, 1);
+        bitmap.set(0, true);
+        let qc = QC { view: chain.height, block_id: chain.tip_hash, agg_sig, bitmap };
+        let qc_hash = qc_commitment(qc.view, &qc.block_id, &qc.agg_sig, &qc.bitmap);
+        (qc, qc_hash)
     }
 
     #[test]
     fn apply_block1_advances_tip() {
         let signer = SigningKey::from_bytes(&[1u8; 32]);
         let mut chain = Chain::new();
-        init_chain_with_validator(&mut chain, &signer);
+        let bls_signer = init_chain_with_validator(&mut chain, &signer);
         let mut balances = Balances::default();
         let mut nonces = Nonces::default();
         let mut commitments = Commitments::default();
         let mut available = Available::default();
 
-        let block = build_empty_block(&chain, &signer, &balances, &nonces, &commitments, &available);
+        let block = build_empty_block(&chain, &signer, &bls_signer, &balances, &nonces, &commitments, &available);
         chain
             .apply_block(&block, &mut balances, &mut nonces, &mut commitments, &mut available)
             .unwrap();
@@ -978,13 +998,13 @@ mod tests {
     fn applying_same_height_fails() {
         let signer = SigningKey::from_bytes(&[2u8; 32]);
         let mut chain = Chain::new();
-        init_chain_with_validator(&mut chain, &signer);
+        let bls_signer = init_chain_with_validator(&mut chain, &signer);
         let mut balances = Balances::default();
         let mut nonces = Nonces::default();
         let mut commitments = Commitments::default();
         let mut available = Available::default();
 
-        let block1 = build_empty_block(&chain, &signer, &balances, &nonces, &commitments, &available);
+        let block1 = build_empty_block(&chain, &signer, &bls_signer, &balances, &nonces, &commitments, &available);
         chain
             .apply_block(&block1, &mut balances, &mut nonces, &mut commitments, &mut available)
             .unwrap();
@@ -1006,19 +1026,19 @@ mod tests {
     fn applying_2_blocks_works_correctly() {
         let signer = SigningKey::from_bytes(&[3u8; 32]);
         let mut chain = Chain::new();
-        init_chain_with_validator(&mut chain, &signer);
+        let bls_signer = init_chain_with_validator(&mut chain, &signer);
         let mut balances = Balances::default();
         let mut nonces = Nonces::default();
         let mut commitments = Commitments::default();
         let mut available = Available::default();
 
-        let block1 = build_empty_block(&chain, &signer, &balances, &nonces, &commitments, &available);
+        let block1 = build_empty_block(&chain, &signer, &bls_signer, &balances, &nonces, &commitments, &available);
         chain
             .apply_block(&block1, &mut balances, &mut nonces, &mut commitments, &mut available)
             .unwrap();
         assert_eq!(chain.height, 1);
 
-        let block2 = build_empty_block(&chain, &signer, &balances, &nonces, &commitments, &available);
+        let block2 = build_empty_block(&chain, &signer, &bls_signer, &balances, &nonces, &commitments, &available);
         chain
             .apply_block(&block2, &mut balances, &mut nonces, &mut commitments, &mut available)
             .unwrap();
@@ -1036,7 +1056,7 @@ mod tests {
     fn tamper_block_no_state_change() {
         let signer = SigningKey::from_bytes(&[4u8; 32]);
         let mut chain = Chain::new();
-        init_chain_with_validator(&mut chain, &signer);
+        let bls_signer = init_chain_with_validator(&mut chain, &signer);
         let mut balances = Balances::default();
         let mut nonces = Nonces::default();
         let mut commitments = Commitments::default();
@@ -1052,6 +1072,7 @@ mod tests {
         let block = build_block(
             &chain,
             &signer,
+            &bls_signer,
             &balances,
             &nonces,
             &commitments,
@@ -1085,7 +1106,7 @@ mod tests {
     fn inclusion_list_due_must_be_included() {
         let signer = SigningKey::from_bytes(&[5u8; 32]);
         let mut chain = Chain::new();
-        init_chain_with_validator(&mut chain, &signer);
+        let bls_signer = init_chain_with_validator(&mut chain, &signer);
         let mut balances = Balances::default();
         let mut nonces = Nonces::default();
         let mut commitments = Commitments::default();
@@ -1102,6 +1123,7 @@ mod tests {
         let block1 = build_block(
             &chain,
             &signer,
+            &bls_signer,
             &balances,
             &nonces,
             &commitments,
@@ -1117,6 +1139,7 @@ mod tests {
         let block2 = build_block(
             &chain,
             &signer,
+            &bls_signer,
             &balances,
             &nonces,
             &commitments,
@@ -1132,6 +1155,7 @@ mod tests {
             let b = build_block(
                 &chain,
                 &signer,
+                &bls_signer,
                 &balances,
                 &nonces,
                 &commitments,
@@ -1148,6 +1172,7 @@ mod tests {
         let block5 = build_block(
             &chain,
             &signer,
+            &bls_signer,
             &Balances::default(),
             &Nonces::default(),
             &Commitments::default(),
@@ -1170,7 +1195,7 @@ mod tests {
     fn reveal_bundle_executes_multiple_reveals_and_satisfies_inclusion_list() {
         let signer = SigningKey::from_bytes(&[6u8; 32]);
         let mut chain = Chain::new();
-        init_chain_with_validator(&mut chain, &signer);
+        let bls_signer = init_chain_with_validator(&mut chain, &signer);
         let mut balances = Balances::default();
         let mut nonces = Nonces::default();
         let mut commitments = Commitments::default();
@@ -1193,6 +1218,7 @@ mod tests {
         let block1 = build_block(
             &chain,
             &signer,
+            &bls_signer,
             &balances,
             &nonces,
             &commitments,
@@ -1209,6 +1235,7 @@ mod tests {
         let block2 = build_block(
             &chain,
             &signer,
+            &bls_signer,
             &balances,
             &nonces,
             &commitments,
@@ -1224,6 +1251,7 @@ mod tests {
             let b = build_block(
                 &chain,
                 &signer,
+                &bls_signer,
                 &balances,
                 &nonces,
                 &commitments,
@@ -1241,6 +1269,7 @@ mod tests {
         let block5 = build_block(
             &chain,
             &signer,
+            &bls_signer,
             &balances,
             &nonces,
             &commitments,
@@ -1266,7 +1295,7 @@ mod tests {
     
         let signer = SigningKey::from_bytes(&[7u8; 32]);
         let mut chain = Chain::new();
-        init_chain_with_validator(&mut chain, &signer); // sets validator id=1 with a deterministic VRF pubkey
+        let bls_signer = init_chain_with_validator(&mut chain, &signer); // sets validator id=1 with a deterministic VRF pubkey
     
         let mut balances    = Balances::default();
         let mut nonces      = Nonces::default();
@@ -1297,6 +1326,16 @@ mod tests {
         let (vrf_output, vrf_preout, vrf_proof) = fake_vrf_fields(proposer_id);
     
         // --- Build header with Vortex fields filled (non-empty proof == VRF path) ---
+        let msg = vote_msg(&chain.tip_hash, chain.height);
+        let mut agg = BlsAggregate::new();
+        let sig = bls_signer.sign(&msg);
+        agg.push(&sig.0);
+        let agg_sig = agg.finalize().unwrap();
+        let mut bitmap = BitVec::repeat(false, 1);
+        bitmap.set(0, true);
+        let qc = QC { view: chain.height, block_id: chain.tip_hash, agg_sig, bitmap };
+        let qc_hash = qc_commitment(qc.view, &qc.block_id, &qc.agg_sig, &qc.bitmap);
+
         let mut block = Block {
             header: BlockHeader {
                 parent_hash:     chain.tip_hash,
@@ -1323,13 +1362,13 @@ mod tests {
                 vrf_output,
                 vrf_proof,
                 view: 0,
-                justify_qc_hash: [0u8;32],
+                justify_qc_hash: qc_hash,
                 signature: [0u8; 64],
             },
             transactions: txs,
             reveals: vec![],
             batch_digests: Vec::new(),
-            justify_qc: dummy_qc(),
+            justify_qc: qc,
         };
     
         // Sign the header
@@ -1353,7 +1392,7 @@ mod tests {
     fn too_many_pending_commits_for_owner_is_rejected() {
         let signer = SigningKey::from_bytes(&[8u8; 32]);
         let mut chain = Chain::new();
-        init_chain_with_validator(&mut chain, &signer);
+        let bls_signer = init_chain_with_validator(&mut chain, &signer);
     
         let mut balances    = Balances::default();
         let mut nonces      = Nonces::default();
@@ -1382,6 +1421,7 @@ mod tests {
         let proposer_id: u64 = 1;
         let (vrf_output, vrf_preout, vrf_proof) = fake_vrf_fields(proposer_id);
     
+        let (qc, qc_hash) = make_qc(&chain, &bls_signer);
         let mut block = Block {
             header: BlockHeader {
                 parent_hash:     chain.tip_hash,
@@ -1404,13 +1444,13 @@ mod tests {
                 vrf_proof,
                 vrf_preout,
                 view: 0,
-                justify_qc_hash: [0u8;32],
+                justify_qc_hash: qc_hash,
                 signature: [0u8; 64],
             },
             transactions: txs,
             reveals: vec![],
             batch_digests: Vec::new(),
-            justify_qc: dummy_qc(),
+            justify_qc: qc,
         };
     
         // Sign after all header fields are set (including VRF fields)
@@ -1434,7 +1474,7 @@ mod tests {
     fn duplicate_commit_in_same_block_is_rejected() {
         let signer = SigningKey::from_bytes(&[9u8; 32]);
         let mut chain = Chain::new();
-        init_chain_with_validator(&mut chain, &signer);
+        let bls_signer = init_chain_with_validator(&mut chain, &signer);
     
         let mut balances    = Balances::default();
         let mut nonces      = Nonces::default();
@@ -1458,6 +1498,7 @@ mod tests {
         let proposer_id: u64 = 1;
         let (vrf_output, vrf_preout, vrf_proof) = fake_vrf_fields(proposer_id);
     
+        let (qc, qc_hash) = make_qc(&chain, &bls_signer);
         let mut block = Block {
             header: BlockHeader {
                 parent_hash:     chain.tip_hash,
@@ -1480,13 +1521,13 @@ mod tests {
                 vrf_proof,
                 vrf_preout,
                 view: 0,
-                justify_qc_hash: [0u8;32],
+                justify_qc_hash: qc_hash,
                 signature: [0u8; 64],
             },
             transactions: vec![Tx::Commit(commit.clone()), Tx::Commit(commit.clone())],
             reveals: vec![],
             batch_digests: Vec::new(),
-            justify_qc: dummy_qc(),
+            justify_qc: qc,
         };
     
         // Sign after all header fields are set (including VRF fields)
@@ -1510,7 +1551,7 @@ mod tests {
     fn inclusion_list_due_but_missing_reveal_rejects_block() {
         let signer = SigningKey::from_bytes(&[10u8; 32]);
         let mut chain = Chain::new();
-        init_chain_with_validator(&mut chain, &signer);
+        let bls_signer = init_chain_with_validator(&mut chain, &signer);
     
         let mut balances    = Balances::default();
         let mut nonces      = Nonces::default();
@@ -1540,6 +1581,7 @@ mod tests {
             let bundle_len  = DEFAULT_BUNDLE_LEN;
             let proposer_id: u64 = 1;
             let (vrf_output, vrf_preout, vrf_proof) = fake_vrf_fields(proposer_id);
+            let (qc, qc_hash) = make_qc(chain, &bls_signer);
 
             let mut block = Block {
                 header: BlockHeader {
@@ -1563,13 +1605,13 @@ mod tests {
                     vrf_proof,
                     vrf_preout,
                     view: 0,
-                    justify_qc_hash: [0u8;32],
+                    justify_qc_hash: qc_hash,
                     signature: [0u8; 64],
                 },
                 transactions: txs,
                 reveals,
                 batch_digests: Vec::new(),
-                justify_qc: dummy_qc(),
+                justify_qc: qc,
             };
 
             // simulate STF to compute roots/gas
@@ -1614,6 +1656,7 @@ mod tests {
             let bundle_len  = DEFAULT_BUNDLE_LEN;
             let proposer_id: u64 = 1;
             let (vrf_output, vrf_preout, vrf_proof) = fake_vrf_fields(proposer_id);
+            let (qc, qc_hash) = make_qc(chain, &bls_signer);
 
             let mut block = Block {
                 header: BlockHeader {
@@ -1637,13 +1680,13 @@ mod tests {
                     vrf_proof,
                     vrf_preout,
                     view: 0,
-                    justify_qc_hash: [0u8;32],
+                    justify_qc_hash: qc_hash,
                     signature: [0u8; 64],
                 },
                 transactions: txs,
                 reveals,
                 batch_digests: Vec::new(),
-                justify_qc: dummy_qc(),
+                justify_qc: qc,
             };
 
             // Sign as usual; STF will run inside apply_block and return IntrinsicInvalid
@@ -1686,7 +1729,7 @@ mod tests {
     fn availability_outside_window_rejected() {
         let signer = SigningKey::from_bytes(&[11u8; 32]);
         let mut chain = Chain::new();
-        init_chain_with_validator(&mut chain, &signer);
+        let bls_signer = init_chain_with_validator(&mut chain, &signer);
     
         let mut balances    = Balances::default();
         let mut nonces      = Nonces::default();
@@ -1711,6 +1754,7 @@ mod tests {
         let proposer_id: u64 = 1;
         let (vrf_output, vrf_preout, vrf_proof) = fake_vrf_fields(proposer_id);
     
+        let (qc, qc_hash) = make_qc(&chain, &bls_signer);
         let mut block = Block {
             header: BlockHeader {
                 parent_hash:     chain.tip_hash,
@@ -1733,14 +1777,14 @@ mod tests {
                 vrf_proof,
                 vrf_preout,
                 view: 0,
-                justify_qc_hash: [0u8;32],
+                justify_qc_hash: qc_hash,
                 signature: [0u8; 64],
             },
             // Commit and Avail in the SAME block → Avail is too early and must be rejected
             transactions: vec![Tx::Commit(commit), Tx::Avail(avail)],
             reveals: vec![],
             batch_digests: Vec::new(),
-            justify_qc: dummy_qc(),
+            justify_qc: qc,
         };
     
         // Sign after all header fields are set (including VRF fields)
