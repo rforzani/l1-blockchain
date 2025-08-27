@@ -21,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_SLOT_MS: u64 = 1_000;     // 1s slots for dev;
 const DEFAULT_EPOCH_SLOTS: u64 = 1_024; // power-of-two for easy math
 pub const DEFAULT_BUNDLE_LEN: u8 = 4;
+pub const DEFAULT_TAU: f64 = 0.5;
 
 pub struct Chain {
     pub tip_hash: Hash,
@@ -39,6 +40,7 @@ pub struct Chain {
     pub batch_store: BatchStore,
     /// VRF tie-break cache: maps bundle_start to (proposer_id, vrf_output)
     bundle_winners: HashMap<u64, (ValidatorId, [u8; 32])>,
+    pub tau: f64,
 }
 
 #[derive(Clone)]
@@ -100,6 +102,7 @@ impl Chain {
             epoch_accumulator,
             batch_store: BatchStore::new(),
             bundle_winners: HashMap::new(),
+            tau: DEFAULT_TAU,
         }
     }
 
@@ -211,7 +214,7 @@ impl Chain {
 
             // (e) Stake-weighted threshold check using shared helper
             let total = self.validator_set.total_stake();
-            if !vrf_eligible(v.stake, total, &header.vrf_output) {
+            if !vrf_eligible(v.stake, total, &header.vrf_output, self.tau) {
                 // Not eligible this bundle → reject
                 return Err(BlockError::NotScheduledLeader);
             }

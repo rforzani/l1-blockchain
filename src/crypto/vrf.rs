@@ -134,20 +134,28 @@ pub fn build_vrf_msg(epoch_seed: &[u8; 32], bundle_start_slot: u64, proposer_id:
 /// Returns true if a validator with `stake` in a validator set with `total`
 /// stake is eligible given a 32-byte VRF output. The output is first hashed to
 /// derive an unbiased 64-bit value which is then compared against the
-/// stake-weighted threshold `(stake / total) * 2^64`.
-pub fn vrf_eligible(stake: u128, total: u128, out: &VrfOutput) -> bool {
-    if total == 0 {
+/// stake-weighted threshold derived from the probabilistic formula
+/// `1 - (1 - τ)^{stake/total}` where `τ` (tau) is a configurable base
+/// probability. When `τ` is 0 the validator is never eligible; when `τ` is 1
+/// and `stake > 0` the validator is always eligible.
+pub fn vrf_eligible(stake: u128, total: u128, out: &VrfOutput, tau: f64) -> bool {
+    if total == 0 || stake == 0 {
         return false;
     }
-    if stake >= total {
-        // Single-validator or full stake – effectively always eligible.
+    let tau = tau.clamp(0.0, 1.0);
+    if tau <= 0.0 {
+        return false;
+    }
+
+    let exponent = (stake as f64) / (total as f64);
+    let prob = 1.0 - (1.0 - tau).powf(exponent);
+    if prob >= 1.0 {
         return true;
     }
 
     let h = crate::crypto::hash_bytes_sha256(out);
     let r64 = u64::from_be_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]]);
-    let num = stake << 64;
-    let thr = (num / total) as u64;
+    let thr = (prob * (u64::MAX as f64)) as u64;
     r64 < thr
 }
 
@@ -159,26 +167,41 @@ mod tests {
     #[test]
     fn zero_total_stake_not_eligible() {
         let out = [0u8; 32];
-        assert!(!vrf_eligible(10, 0, &out));
+        assert!(!vrf_eligible(10, 0, &out, 0.5));
     }
 
     #[test]
-    fn single_validator_always_eligible() {
+    fn tau_zero_never_eligible() {
         let out = [0u8; 32];
-        assert!(vrf_eligible(100, 100, &out));
+        assert!(!vrf_eligible(100, 1000, &out, 0.0));
     }
 
     #[test]
-    fn threshold_boundaries() {
+    fn tau_one_always_eligible() {
+        let out = [0u8; 32];
+        assert!(vrf_eligible(1, 100, &out, 1.0));
+    }
+
+    #[test]
+    fn threshold_boundaries_vary_with_tau() {
         let out = [0u8; 32];
         let h = hash_bytes_sha256(&out);
         let r64 = u64::from_be_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]]);
         let total = 1u128 << 64; // 2^64
+        let tau = 0.5;
+        let r = (r64 as f64) / (u64::MAX as f64);
+        let s = (1.0f64 - r).ln() / (1.0f64 - tau).ln();
+        let mut stake = (s * (total as f64)).floor() as u128;
+
+        // Adjust downward until the validator is just below the threshold.
+        while vrf_eligible(stake, total, &out, tau) {
+            stake -= 1;
+        }
 
         // Exactly at threshold -> not eligible
-        assert!(!vrf_eligible(r64 as u128, total, &out));
+        assert!(!vrf_eligible(stake, total, &out, tau));
 
         // Just over threshold -> eligible
-        assert!(vrf_eligible((r64 as u128) + 1, total, &out));
+        assert!(vrf_eligible(stake + 1, total, &out, tau));
     }
 }

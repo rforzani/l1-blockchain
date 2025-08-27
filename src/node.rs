@@ -67,6 +67,7 @@ pub struct ConsensusConfig {
     pub genesis_qc: QC,
     pub pacemaker: PacemakerConfig,
     pub genesis_block_id: Hash,
+    pub tau: f64,
 }
 
 pub struct Node {
@@ -151,6 +152,7 @@ impl Node {
         my_validator_id: Option<ValidatorId>,
     ) -> Result<Self> {
         let mut node = Self::new(mempool, ed25519);
+        node.chain.tau = consensus_cfg.tau;
 
         // Active-set BLS pubkeys (stable index order)
         let active_bls_pks: Vec<[u8; 48]> = node
@@ -461,7 +463,7 @@ impl Node {
             .chain
             .schedule
             .fallback_leader_for_bundle(bundle_start);
-        if !vrf_eligible(me.stake, total, &vrf_out) {
+        if !vrf_eligible(me.stake, total, &vrf_out, self.chain.tau) {
             // Not elected via VRF. Only continue if we're the deterministic fallback leader.
             if fallback != Some(proposer_id) {
                 return Err(ProduceError::NotProposer { slot, leader: fallback, mine: Some(proposer_id) });
