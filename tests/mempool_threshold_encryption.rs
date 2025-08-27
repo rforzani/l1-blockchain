@@ -1,20 +1,20 @@
 //! Comprehensive tests for the threshold encryption system
 
-use super::encrypted::*;
-use super::encrypted::dkg;
-use crate::crypto::bls::BlsSigner;
-use crate::types::{CommitTx, AvailTx, Hash};
+use l1_blockchain::mempool::encrypted::*;
+use l1_blockchain::mempool::encrypted::dkg;
+use l1_blockchain::crypto::bls::BlsSigner;
+use l1_blockchain::types::{CommitTx, AvailTx, AccessList};
 use std::collections::HashMap;
 
 /// Test data structure for setting up mock validators
 struct MockValidator {
-    id: crate::pos::registry::ValidatorId,
+    id: l1_blockchain::pos::registry::ValidatorId,
     bls_signer: BlsSigner,
     threshold_key_share: [u8; 32],
 }
 
 impl MockValidator {
-    fn new(id: crate::pos::registry::ValidatorId, seed: u8) -> Self {
+    fn new(id: l1_blockchain::pos::registry::ValidatorId, seed: u8) -> Self {
         // Generate proper BLS12-381 private key with sufficient entropy
         let mut sk_bytes = [0u8; 32];
         for i in 0..32 {
@@ -41,12 +41,12 @@ impl MockValidator {
 /// Setup a test scenario with N validators
 fn setup_test_validators(n: usize) -> Vec<MockValidator> {
     (1..=n)
-        .map(|i| MockValidator::new(i as crate::pos::registry::ValidatorId, i as u8))
+        .map(|i| MockValidator::new(i as l1_blockchain::pos::registry::ValidatorId, i as u8))
         .collect()
 }
 
 /// Create a threshold public key and engine setup from mock validators
-fn setup_threshold_system(validators: &[MockValidator], threshold: usize, epoch: u64) -> (ThresholdPublicKey, ThresholdEngine, HashMap<crate::pos::registry::ValidatorId, [u8; 32]>) {
+fn setup_threshold_system(validators: &[MockValidator], threshold: usize, epoch: u64) -> (ThresholdPublicKey, ThresholdEngine, HashMap<l1_blockchain::pos::registry::ValidatorId, [u8; 32]>) {
     // Collect BLS public keys
     let validator_pks: Vec<[u8; 48]> = validators.iter().map(|v| v.bls_public_key()).collect();
     
@@ -230,7 +230,7 @@ fn test_integration_with_commit_tx() {
     let commit_tx = CommitTx {
         commitment: [1u8; 32], // Mock commitment
         sender: "0x1234567890123456789012345678901234567890".to_string(),
-        access_list: crate::types::AccessList { reads: vec![], writes: vec![] },
+        access_list: AccessList { reads: vec![], writes: vec![] },
         encrypted_payload: encrypted_payload.clone(),
         pubkey: [2u8; 32],
         sig: [3u8; 64],

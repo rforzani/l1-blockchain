@@ -13,9 +13,6 @@ pub mod workers;
 pub use workers::{Batch, BatchStore};
 pub mod encrypted;
 pub use encrypted::{ThresholdEngine, ThresholdCiphertext, ThresholdShare, ThresholdError};
-mod tests;
-#[cfg(test)]
-mod encrypted_tests;
 
 #[derive(Clone, Debug)]
 pub struct MempoolConfig {
@@ -198,7 +195,6 @@ impl MempoolImpl {
         &self.config
     }
 
-    #[cfg(test)]
     pub fn debug_read(
         &self,
     ) -> (

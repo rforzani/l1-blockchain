@@ -1,19 +1,18 @@
-// src/mempool/tests.rs
-#![allow(unused)]
+//! Integration tests for the mempool system
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
-use crate::mempool::{
+use l1_blockchain::mempool::{
     BlockSelectionLimits, CommitmentId, Mempool, MempoolConfig, MempoolImpl, SelectError, TxId,
     BalanceView,
 };
-use crate::codec::{tx_bytes, access_list_bytes};
-use crate::crypto::{hash_bytes_sha256, commitment_hash, bls::BlsSigner};
-use crate::state::CHAIN_ID;
-use crate::types::{
+use l1_blockchain::codec::{tx_bytes, access_list_bytes};
+use l1_blockchain::crypto::{commitment_hash, bls::BlsSigner};
+use l1_blockchain::state::CHAIN_ID;
+use l1_blockchain::types::{
     Tx, CommitTx, AvailTx, RevealTx, Transaction, AccessList, StateKey, Hash, Address,
 };
-use crate::fees::FeeState;
+use l1_blockchain::fees::FeeState;
 
 // -------------------------- tiny helpers for building txs --------------------------
 
@@ -93,7 +92,7 @@ fn make_commit(from: &str, nonce: u64) -> (CommitTx, Transaction, Hash, Hash) {
         commitment,
         sender: from.to_string(),
         access_list: tx.access_list.clone(),
-        encrypted_payload: crate::mempool::encrypted::ThresholdCiphertext {
+        encrypted_payload: l1_blockchain::mempool::encrypted::ThresholdCiphertext {
             ephemeral_pk,
             encrypted_data: b"placeholder-ciphertext".to_vec(),
             tag: [0u8; 32],
@@ -109,7 +108,7 @@ fn make_commit(from: &str, nonce: u64) -> (CommitTx, Transaction, Hash, Hash) {
 fn make_avail(
     from: &str,
     commitment: Hash,
-    ciphertext: crate::mempool::encrypted::ThresholdCiphertext,
+    ciphertext: l1_blockchain::mempool::encrypted::ThresholdCiphertext,
 ) -> AvailTx {
     AvailTx {
         commitment,
@@ -139,7 +138,7 @@ struct SV {
     pending_room: HashMap<String, u32>,
 }
 
-impl crate::mempool::StateView for SV {
+impl l1_blockchain::mempool::StateView for SV {
     fn current_height(&self) -> u64 {
         self.height
     }
@@ -203,7 +202,7 @@ fn commit_duplicate_rejected() {
     c2.commitment = cm; // same commitment
     mp.insert_commit(Tx::Commit(c1), 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).expect("first commit");
     let err = mp.insert_commit(Tx::Commit(c2), 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap_err();
-    assert!(matches!(err, crate::mempool::AdmissionError::Duplicate));
+    assert!(matches!(err, l1_blockchain::mempool::AdmissionError::Duplicate));
 }
 
 #[test]
@@ -222,7 +221,7 @@ fn commit_pending_cap_enforced() {
     // Third should hit the cap
     let (c3, _, _, _) = make_commit(&sender, 2);
     let err = mp.insert_commit(Tx::Commit(c3), 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap_err();
-    assert!(matches!(err, crate::mempool::AdmissionError::MempoolFullForAccount));
+    assert!(matches!(err, l1_blockchain::mempool::AdmissionError::MempoolFullForAccount));
 }
 
 #[test]
@@ -239,7 +238,7 @@ fn reveal_sender_mismatch_rejected() {
         salt: [9u8; 32],
     };
     let err = mp.insert_reveal(r, 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap_err();
-    assert!(matches!(err, crate::mempool::AdmissionError::InvalidSignature));
+    assert!(matches!(err, l1_blockchain::mempool::AdmissionError::InvalidSignature));
 }
 
 #[test]
@@ -256,7 +255,7 @@ fn reveal_commitment_mismatch_rejected() {
     salt8[0] = 8;
     let r_bad = make_reveal(&sender, tx, salt8);
     let err = mp.insert_reveal(r_bad, 101, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap_err();
-    assert!(matches!(err, crate::mempool::AdmissionError::MismatchedCommitment));
+    assert!(matches!(err, l1_blockchain::mempool::AdmissionError::MismatchedCommitment));
 }
 
 #[test]
@@ -333,7 +332,7 @@ fn selection_missing_reveal_payload_logged_and_skipped() {
     let rid = mp.insert_reveal(r, 100, 1, &TestBalanceView{}, &FeeState::from_defaults()).unwrap();
 
     {
-        let mut reveals = mp.reveals.write().unwrap();
+        let (_commits, _avails, mut reveals) = mp.debug_write();
         reveals.payload_by_id.remove(&rid);
     }
 
@@ -366,7 +365,7 @@ fn avail_ready_index_and_eviction() {
     }
 
     {
-        let mut avails_lock = mp.avails.write().unwrap();
+        let (_commits, mut avails_lock, _reveals) = mp.debug_write();
         avails_lock.evict_by_id(&id1);
     }
 
@@ -548,9 +547,9 @@ fn extra_reveal_nonce_continuity_enforced() {
 
 // ------------------------------ tiny assertions ------------------------------
 
-fn matches_bad_access_list(err: crate::mempool::AdmissionError) {
+fn matches_bad_access_list(err: l1_blockchain::mempool::AdmissionError) {
     match err {
-        crate::mempool::AdmissionError::BadAccessList => {}
+        l1_blockchain::mempool::AdmissionError::BadAccessList => {}
         other => panic!("expected BadAccessList, got {:?}", other),
     }
 }
