@@ -52,7 +52,7 @@ fn create_test_validator_set(n_validators: usize, epoch: u64) -> (ValidatorSet, 
     // Generate private shares
     let master_seed = [42u8; 32];
     let validator_ids: Vec<_> = (1..=n_validators).map(|i| i as u64).collect();
-    let private_shares = dkg::generate_private_shares(&validator_ids, &master_seed, epoch);
+    let private_shares = dkg::generate_private_shares(&validator_ids, &master_seed, epoch, threshold);
     
     for (validator_id, share) in private_shares {
         engine.add_validator_share(validator_id, share);
