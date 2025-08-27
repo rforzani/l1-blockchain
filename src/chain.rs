@@ -888,6 +888,89 @@ mod tests {
         )
     }
 
+    fn build_block_vortex_ok(
+        chain: &Chain,
+        signer: &SigningKey,
+        bls_signer: &BlsSigner,
+        balances: &Balances,
+        nonces: &Nonces,
+        commitments: &Commitments,
+        available: &Available,
+        txs: Vec<Tx>,
+        reveals: Vec<RevealTx>,
+    ) -> Block {
+        let height = chain.height + 1;
+        let slot = height; // dev policy: one block per slot
+        let epoch = chain.clock.current_epoch(slot);
+        let bundle_len = DEFAULT_BUNDLE_LEN;
+        let proposer_id: u64 = 1;
+        let (vrf_output, vrf_preout, vrf_proof) = fake_vrf_fields(proposer_id);
+        let (qc, qc_hash) = make_qc(chain, bls_signer);
+
+        let mut block = Block {
+            header: BlockHeader {
+                parent_hash: chain.tip_hash,
+                height,
+                txs_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                gas_used: 0,
+                randomness: chain.tip_hash,
+                reveal_set_root: [0u8; 32],
+                il_root: [0u8; 32],
+                exec_base_fee: chain.fee_state.exec_base,
+                commit_base_fee: chain.fee_state.commit_base,
+                avail_base_fee: chain.fee_state.avail_base,
+                timestamp: 0,
+                slot,
+                epoch,
+                proposer_id,
+                bundle_len,
+                vrf_output,
+                vrf_proof,
+                vrf_preout,
+                view: 0,
+                justify_qc_hash: qc_hash,
+                signature: [0u8; 64],
+            },
+            transactions: txs,
+            reveals,
+            batch_digests: Vec::new(),
+            justify_qc: qc,
+        };
+
+        let mut sim_balances = balances.clone();
+        let mut sim_nonces = nonces.clone();
+        let mut sim_commitments = commitments.clone();
+        let mut sim_available = available.clone();
+        let proposer_addr = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
+        let mut sim_burned = 0u64;
+
+        let body = process_block(
+            &block,
+            &chain.batch_store,
+            &mut sim_balances,
+            &mut sim_nonces,
+            &mut sim_commitments,
+            &mut sim_available,
+            &chain.fee_state,
+            &proposer_addr,
+            &mut sim_burned,
+            &chain.threshold_engine,
+            chain,
+        )
+        .expect("process_block should succeed for valid blocks");
+
+        block.header.txs_root = body.txs_root;
+        block.header.receipts_root = body.receipts_root;
+        block.header.reveal_set_root = body.reveal_set_root;
+        block.header.il_root = body.il_root;
+        block.header.gas_used = body.gas_total;
+
+        let preimage = header_signing_bytes(&block.header);
+        block.header.signature = signer.sign(&preimage).to_bytes();
+        block
+    }
+
     fn addr(i: u8) -> String {
         format!(
             "0x{:02x}{:02x}000000000000000000000000000000000000",
@@ -1854,53 +1937,18 @@ mod tests {
         let ciphertext = commit.encrypted_payload.clone();
         let avail = make_avail(&signer, c_hash, ciphertext);
     
-        // --- VORTEX (VRF) header fields ---
-        let height = chain.height + 1;
-        let slot   = height; // dev policy: one block per slot
-        let epoch  = chain.clock.current_epoch(slot);
-    
-        let bundle_len: u8 = DEFAULT_BUNDLE_LEN;
-    
-        let proposer_id: u64 = 1;
-        let (vrf_output, vrf_preout, vrf_proof) = fake_vrf_fields(proposer_id);
-    
-        let (qc, qc_hash) = make_qc(&chain, &bls_signer);
-        let mut block = Block {
-            header: BlockHeader {
-                parent_hash:     chain.tip_hash,
-                height,
-                txs_root:        [0u8; 32],
-                receipts_root:   [0u8; 32],
-                gas_used:        0,
-                randomness:      chain.tip_hash,
-                reveal_set_root: [0u8; 32],
-                il_root:         [0u8; 32],
-                exec_base_fee:   chain.fee_state.exec_base,
-                commit_base_fee: chain.fee_state.commit_base,
-                avail_base_fee:  chain.fee_state.avail_base,
-                timestamp:       0,
-                slot,
-                epoch,
-                proposer_id,
-                bundle_len,
-                vrf_output,
-                vrf_proof,
-                vrf_preout,
-                view: 0,
-                justify_qc_hash: qc_hash,
-                signature: [0u8; 64],
-            },
-            // Commit and Avail in the SAME block → Avail is too early and must be rejected
-            transactions: vec![Tx::Commit(commit), Tx::Avail(avail)],
-            reveals: vec![],
-            batch_digests: Vec::new(),
-            justify_qc: qc,
-        };
-    
-        // Sign after all header fields are set (including VRF fields)
-        let preimage = header_signing_bytes(&block.header);
-        block.header.signature = signer.sign(&preimage).to_bytes();
-    
+        let block = build_block_vortex_ok(
+            &chain,
+            &signer,
+            &bls_signer,
+            &balances,
+            &nonces,
+            &commitments,
+            &available,
+            vec![Tx::Commit(commit), Tx::Avail(avail)],
+            vec![],
+        );
+
         let res = chain.apply_block(
             &block,
             &mut balances,
