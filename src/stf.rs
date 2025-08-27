@@ -15,6 +15,7 @@ use crate::mempool::BatchStore;
 use crate::types::AvailTx;
 use crate::types::CommitmentMeta;
 use crate::types::{Block, Receipt, ExecOutcome, Hash, BlockHeader, Transaction, StateKey, Tx, Event, RevealTx, CommitTx, AccessList, Address};
+use hex;
 use std::collections::HashSet;
 use std::fmt;
 #[cfg(test)]
@@ -52,6 +53,7 @@ pub enum BlockError {
     NotScheduledLeader,
     ProposerKeyMismatch,
     BadSignature,
+    MissingBatch(Hash),
 }
 
 impl fmt::Display for BlockError {
@@ -67,6 +69,7 @@ impl fmt::Display for BlockError {
             BlockError::NotScheduledLeader                      => write!(f, "Not Scheduled Leader"),
             BlockError::ProposerKeyMismatch                     => write!(f, "Proposer Key Mismatch"),
             BlockError::BadSignature                            => write!(f, "Bad Signature"),
+            BlockError::MissingBatch(h)                         => write!(f, "Missing batch: {}", hex::encode(h)),
         }
     }
 }
@@ -543,9 +546,10 @@ pub fn process_block(
     // Gather all transactions: those directly in the block plus those fetched via batch digests.
     let mut all_txs: Vec<Tx> = block.transactions.clone();
     for d in &block.batch_digests {
-        if let Some(batch) = batch_store.get(d) {
-            all_txs.extend(batch.txs);
-        }
+        let batch = batch_store
+            .get(d)
+            .ok_or(BlockError::MissingBatch(*d))?;
+        all_txs.extend(batch.txs);
     }
 
     let avail_count = all_txs.iter().filter(|t| matches!(t, Tx::Avail(_))).count();
