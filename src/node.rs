@@ -756,10 +756,20 @@ mod tests {
         let tx_ser = tx_bytes(&tx);
         let al_bytes = access_list_bytes(&tx.access_list);
         let commitment = commitment_hash(&tx_ser, &al_bytes, &salt, crate::state::CHAIN_ID);
+        let ephemeral_pk = BlsSigner::from_sk_bytes(&[1u8; 32])
+            .expect("valid sk")
+            .public_key_bytes();
+        let encrypted_payload = ThresholdCiphertext {
+            ephemeral_pk,
+            encrypted_data: vec![0u8; 32],
+            tag: [0u8; 32],
+            epoch: 1,
+        };
         let sender_bytes = string_bytes(&sender);
+        let payload_hash = encrypted_payload.commitment_hash();
         let preimage = commit_signing_preimage(
             &commitment,
-            &[0u8; 32],
+            &payload_hash,
             &sender_bytes,
             &al_bytes,
             crate::state::CHAIN_ID,
@@ -769,12 +779,7 @@ mod tests {
             commitment,
             sender: sender.clone(),
             access_list: tx.access_list.clone(),
-            encrypted_payload: ThresholdCiphertext {
-                ephemeral_pk: [0u8; 48],
-                encrypted_data: vec![0u8; 32],
-                tag: [0u8; 32],
-                epoch: 1,
-            },
+            encrypted_payload,
             pubkey: signer.verifying_key().to_bytes(),
             sig,
         };

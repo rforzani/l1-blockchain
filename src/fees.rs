@@ -166,7 +166,8 @@ mod tests {
     use crate::types::{Transaction, CommitTx, BlockHeader, Hash};
     use crate::codec::{tx_bytes, access_list_bytes, string_bytes, header_bytes};
     use crate::crypto::{
-        addr_from_pubkey, addr_hex, commitment_hash, commit_signing_preimage, hash_bytes_sha256,
+        addr_from_pubkey, addr_hex, commitment_hash, commit_signing_preimage,
+        hash_bytes_sha256, bls::BlsSigner,
     };
     use crate::mempool::encrypted::ThresholdCiphertext;
     use ed25519_dalek::{SigningKey, Signer};
@@ -316,18 +317,21 @@ mod tests {
         let tx_ser = tx_bytes(tx);
         let al_bytes = access_list_bytes(&tx.access_list);
         let commitment = commitment_hash(&tx_ser, &al_bytes, &salt, CHAIN_ID);
+        let ephemeral_pk = BlsSigner::from_sk_bytes(&[1u8; 32])
+            .expect("valid sk")
+            .public_key_bytes();
         let encrypted_payload = ThresholdCiphertext {
-            ephemeral_pk: [0u8; 48],
+            ephemeral_pk,
             encrypted_data: vec![0u8; 32],
             tag: [0u8; 32],
             epoch: 1,
         };
         let sender = addr_hex(&addr_from_pubkey(&signer.verifying_key().to_bytes()));
         let sender_bytes = string_bytes(&sender);
-        let encrypted_data_hash = hash_bytes_sha256(&encrypted_payload.encrypted_data);
+        let payload_hash = encrypted_payload.commitment_hash();
         let preimage = commit_signing_preimage(
             &commitment,
-            &encrypted_data_hash,
+            &payload_hash,
             &sender_bytes,
             &al_bytes,
             CHAIN_ID,
