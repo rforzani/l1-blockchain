@@ -2,9 +2,10 @@
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
-use crate::codec::{header_bytes, header_signing_bytes};
+use crate::codec::{header_bytes, header_signing_bytes, qc_commitment};
 use crate::crypto::vrf::{build_vrf_msg, vrf_eligible, SchnorrkelVrf, VrfPubkey, VrfVerifier};
 use crate::crypto::{addr_from_pubkey, addr_hex, hash_bytes_sha256, verify_ed25519};
+use crate::crypto::bls::verify_qc;
 use crate::fees::{update_commit_base, update_exec_base, FeeState, FEE_PARAMS};
 use crate::pos::registry::{StakingConfig, ValidatorSet, ValidatorStatus, ValidatorId};
 use crate::pos::schedule::{AliasSchedule, ProposerSchedule};
@@ -361,6 +362,32 @@ impl Chain {
             return Err(BlockError::IntrinsicInvalid("bad block signature".into()));
         }
 
+        // QC verification: only perform if all active validators have BLS keys
+        if let Some(active_bls_pks) = self.collect_active_bls_pubkeys() {
+            let computed_qc_hash = qc_commitment(
+                block.justify_qc.view,
+                &block.justify_qc.block_id,
+                &block.justify_qc.agg_sig,
+                &block.justify_qc.bitmap,
+            );
+            
+            // Check that justify_qc_hash in header matches computed QC commitment
+            if block.header.justify_qc_hash != computed_qc_hash {
+                return Err(BlockError::IntrinsicInvalid(
+                    "justify_qc_hash mismatch".into()
+                ));
+            }
+            
+            // Verify the QC BLS signature against active validator keys
+            verify_qc(
+                &block.justify_qc.block_id,
+                block.justify_qc.view,
+                &block.justify_qc.agg_sig,
+                &block.justify_qc.bitmap,
+                &active_bls_pks,
+            ).map_err(|_| BlockError::IntrinsicInvalid("QC signature verification failed".into()))?;
+        }
+
         let mut sim_balances = balances.clone();
         let mut sim_nonces = nonces.clone();
         let mut sim_commitments = commitments.clone();
@@ -475,6 +502,32 @@ impl Chain {
             }
         }
 
+        // QC verification: only perform if all active validators have BLS keys
+        if let Some(active_bls_pks) = self.collect_active_bls_pubkeys() {
+            let computed_qc_hash = qc_commitment(
+                block.justify_qc.view,
+                &block.justify_qc.block_id,
+                &block.justify_qc.agg_sig,
+                &block.justify_qc.bitmap,
+            );
+            
+            // Check that justify_qc_hash in header matches computed QC commitment
+            if block.header.justify_qc_hash != computed_qc_hash {
+                return Err(BlockError::IntrinsicInvalid(
+                    "justify_qc_hash mismatch".into()
+                ));
+            }
+            
+            // Verify the QC BLS signature against active validator keys
+            verify_qc(
+                &block.justify_qc.block_id,
+                block.justify_qc.view,
+                &block.justify_qc.agg_sig,
+                &block.justify_qc.bitmap,
+                &active_bls_pks,
+            ).map_err(|_| BlockError::IntrinsicInvalid("QC signature verification failed".into()))?;
+        }
+
         verify_block_roots(&block.header, block, &self.batch_store, &apply.receipts)
             .map_err(BlockError::RootMismatch)?;
 
@@ -549,6 +602,21 @@ impl Chain {
     /// Commitments that are due (deadline == `height`) and already available.
     pub fn commitments_due_and_available(&self, height: u64) -> Vec<Hash> {
         self.avail_due.get(&height).cloned().unwrap_or_default()
+    }
+
+    /// Collect BLS public keys from active validators in stable order.
+    /// Returns None if any active validator is missing a BLS key.
+    fn collect_active_bls_pubkeys(&self) -> Option<Vec<[u8; 48]>> {
+        let mut out = Vec::new();
+        for v in &self.validator_set.validators {
+            if v.status == ValidatorStatus::Active {
+                match v.bls_pubkey {
+                    Some(pk) => out.push(pk),
+                    None => return None, // Skip QC verification if any validator lacks BLS key
+                }
+            }
+        }
+        Some(out)
     }
 }
 
