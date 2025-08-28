@@ -10,11 +10,24 @@ use crate::{
 };
 
 pub fn compute_roots_for(block: &Block, batches: &BatchStore, receipts: &[Receipt]) -> (Hash, Hash, Hash) {
-    // Gather all transactions from referenced batches
+    // Gather all transactions: direct + via batches, de-duplicated by tx hash (must match STF processing)
+    use std::collections::HashSet as StdHashSet;
+    // Start with in-block transactions intact
     let mut txs: Vec<crate::types::Tx> = block.transactions.clone();
+    let mut seen_in_block: StdHashSet<Hash> = StdHashSet::new();
+    for tx in &block.transactions {
+        let h = hash_bytes_sha256(&tx_enum_bytes(tx));
+        seen_in_block.insert(h);
+    }
+    // Append batch transactions only if not already present in block.transactions
     for d in &block.batch_digests {
         if let Some(batch) = batches.get(d) {
-            txs.extend(batch.txs);
+            for tx in batch.txs {
+                let h = hash_bytes_sha256(&tx_enum_bytes(&tx));
+                if !seen_in_block.contains(&h) {
+                    txs.push(tx);
+                }
+            }
         }
     }
     // txs_root from all transactions (reveals are NOT part of txs_root)

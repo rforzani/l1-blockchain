@@ -553,13 +553,27 @@ pub fn process_block(
     let mut revealed_this_block: HashSet<Hash> = HashSet::new();
     let mut il_due: Vec<Hash> = Vec::new();
 
-    // Gather all transactions: those directly in the block plus those fetched via batch digests.
+    // Gather all transactions: direct in-block plus those via batch digests, with de-duplication by tx hash.
+    use std::collections::HashSet as StdHashSet;
+    // Start with in-block transactions intact (including duplicates if any).
     let mut all_txs: Vec<Tx> = block.transactions.clone();
+    // Record only hashes present in block.transactions to avoid cross-source double counting.
+    let mut seen_in_block: StdHashSet<Hash> = StdHashSet::new();
+    for tx in &block.transactions {
+        let h = hash_bytes_sha256(&tx_enum_bytes(tx));
+        seen_in_block.insert(h);
+    }
+    // Append batch transactions, skipping only those already present in block.transactions.
     for d in &block.batch_digests {
         let batch = batch_store
             .get(d)
             .ok_or(BlockError::MissingBatch(*d))?;
-        all_txs.extend(batch.txs);
+        for tx in batch.txs {
+            let h = hash_bytes_sha256(&tx_enum_bytes(&tx));
+            if !seen_in_block.contains(&h) {
+                all_txs.push(tx);
+            }
+        }
     }
 
     let avail_count = all_txs.iter().filter(|t| matches!(t, Tx::Avail(_))).count();
