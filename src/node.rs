@@ -13,7 +13,7 @@ use crate::types::{Block, Hash, HotStuffState, Pacemaker, QC, RevealTx, AvailTx,
 use crate::mempool::encrypted::ThresholdCiphertext;
 use bitvec::vec::BitVec;
 use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use ed25519_dalek::{SigningKey, Signer};
 use crate::crypto::{addr_from_pubkey, addr_hex, hash_bytes_sha256};
 use crate::codec::{header_signing_bytes, qc_commitment};
@@ -91,6 +91,8 @@ pub struct Node {
     block_store: HashMap<Hash, Block>,
     /// Last view this node proposed in (to avoid multi-proposing per view)
     last_proposed_view: Option<u64>,
+    /// Pending commit targets (header ids) awaiting prerequisites (block/parent)
+    pending_commits: HashSet<Hash>,
 }
 
 struct NodeStateView<'a> {
@@ -153,6 +155,7 @@ impl Node {
             consensus_network: None,
             block_store: HashMap::new(),
             last_proposed_view: None,
+            pending_commits: HashSet::new(),
         }
     }
 
@@ -330,8 +333,42 @@ impl Node {
         }
         let block = match self.block_store.get(&commit_id) {
             Some(b) => b.clone(),
-            None => return Err(format!("Committed block {} not found in store", hex::encode(commit_id))),
+            None => {
+                // We have not yet received the proposal for this block; defer.
+                self.pending_commits.insert(commit_id);
+                return Ok(());
+            }
         };
+
+        // Apply only in-order and on the current tip.
+        if block.header.parent_hash != self.chain.tip_hash {
+            self.pending_commits.insert(commit_id);
+            return Ok(()); // wait until parent is applied
+        }
+        if block.header.height != self.chain.height + 1 {
+            self.pending_commits.insert(commit_id);
+            return Ok(()); // not the next height, wait
+        }
+
+        // Ensure the batch payload referenced by this block exists locally.
+        if !block.batch_digests.is_empty() {
+            let parent_count = block.batch_digests.len().saturating_sub(1);
+            let parents = if parent_count > 0 {
+                block.batch_digests[..parent_count].to_vec()
+            } else { Vec::new() };
+            if let Some(&expected_id) = block.batch_digests.last() {
+                if self.chain.batch_store.get(&expected_id).is_none() {
+                    let batch = Batch::new(block.transactions.clone(), parents, block.header.proposer_id, [0u8; 64]);
+                    if batch.id == expected_id {
+                        self.chain.batch_store.insert(batch);
+                    } else {
+                        // Batch payload mismatch; cannot apply yet.
+                        self.pending_commits.insert(commit_id);
+                        return Ok(());
+                    }
+                }
+            }
+        }
 
         // Apply and verify. This mutates chain.tip_hash, height, fees, and writes to balances/nonces/etc.
         let _res = self
@@ -365,7 +402,27 @@ impl Node {
         let view = StateBalanceView { balances: &self.balances };
         self.mempool.revalidate_affordability(&view, &self.chain.fee_state);
         self.mempool.evict_stale(self.chain.height);
+        // Applied successfully; remove from pending and try cascade
+        self.pending_commits.remove(&commit_id);
+        self.try_apply_pending_commits();
         Ok(())
+    }
+
+    /// Attempt to apply any pending commits that have become applicable.
+    fn try_apply_pending_commits(&mut self) {
+        loop {
+            let pend: Vec<Hash> = self.pending_commits.iter().copied().collect();
+            let mut progressed = false;
+            for h in pend {
+                let before = self.pending_commits.contains(&h);
+                let _ = self.apply_committed_block(h);
+                let after = self.pending_commits.contains(&h);
+                if before && !after {
+                    progressed = true;
+                }
+            }
+            if !progressed { break; }
+        }
     }
 
     /// Process incoming consensus messages from the network
@@ -393,6 +450,7 @@ impl Node {
                         if let Err(e) = self.apply_committed_block(committed) {
                             eprintln!("Failed to apply committed block: {}", e);
                         }
+                        self.try_apply_pending_commits();
                         committed_blocks.push(committed);
                     }
                 }
@@ -401,6 +459,7 @@ impl Node {
                         if let Err(e) = self.apply_committed_block(committed) {
                             eprintln!("Failed to apply committed block from QC: {}", e);
                         }
+                        self.try_apply_pending_commits();
                         committed_blocks.push(committed);
                     }
                 }
@@ -430,21 +489,27 @@ impl Node {
             // Ensure we have the batch payload referenced by this block in our store
             if !block.batch_digests.is_empty() {
                 let parent_count = block.batch_digests.len().saturating_sub(1);
-                if parent_count > 0 {
-                    let parents = block.batch_digests[..parent_count].to_vec();
-                    let expected_id = block.batch_digests[parent_count];
-                    let batch = Batch::new(block.transactions.clone(), parents.clone(), block.header.proposer_id, [0u8; 64]);
+                let parents = if parent_count > 0 {
+                    block.batch_digests[..parent_count].to_vec()
+                } else { Vec::new() };
+                if let Some(&expected_id) = block.batch_digests.last() {
+                    let batch = Batch::new(block.transactions.clone(), parents, block.header.proposer_id, [0u8; 64]);
                     if batch.id == expected_id {
                         if self.chain.batch_store.get(&batch.id).is_none() {
                             self.chain.batch_store.insert(batch);
                         }
                     } else {
-                        eprintln!("Warning: batch id mismatch for proposed block: expected {}, computed {}",
-                                  hex::encode(expected_id), hex::encode(batch.id));
+                        eprintln!(
+                            "Warning: batch id mismatch for proposed block: expected {}, computed {}",
+                            hex::encode(expected_id),
+                            hex::encode(batch.id)
+                        );
                     }
                 }
             }
 
+            // New information might unblock pending commits; perform after releasing hotstuff borrow
+        
             // Generate and send vote if we should vote on this proposal
             if let Some(vote) = hotstuff.maybe_vote_self(&block) {
                 // First, count our own vote locally so our aggregator can reach quorum
@@ -469,6 +534,8 @@ impl Node {
                 }
             }
         }
+        // Now that any borrows have ended, try cascading pending commits
+        self.try_apply_pending_commits();
         Ok(())
     }
 
