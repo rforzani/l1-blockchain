@@ -1,6 +1,7 @@
 // src/p2p.rs
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, broadcast};
@@ -515,42 +516,75 @@ pub fn simple_leader_election(view: u64, num_validators: usize) -> ValidatorId {
 
 /// Create a P2P network for testing with multiple validators
 pub async fn create_test_network(validator_ids: Vec<ValidatorId>) -> Result<Vec<ConsensusNetwork>, anyhow::Error> {
+    // Allocate a unique base port range per invocation to avoid collisions
+    static NEXT_BASE_PORT: AtomicU16 = AtomicU16::new(20000);
+    let base_port = NEXT_BASE_PORT.fetch_add(97, Ordering::SeqCst);
+
     let mut networks = Vec::new();
     let mut listen_ports = Vec::new();
-    
-    // Create networks on different ports
+
+    // Helper to pick a currently free TCP port on 127.0.0.1
+    fn pick_free_port() -> Option<u16> {
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .ok()
+            .and_then(|sock| sock.local_addr().ok().map(|a| a.port()))
+    }
+
+    // Create networks on unique ports with retries to avoid EADDRINUSE.
     for (i, &id) in validator_ids.iter().enumerate() {
-        let port = 9000 + i as u16; // Use different ports for each validator
-        let config = P2PConfig {
-            listen_addr: format!("/ip4/127.0.0.1/tcp/{}", port).parse()?,
-            bootstrap_peers: Vec::new(),
-            max_peers: 50,
-        };
-        
-        let network = ConsensusNetwork::new(id, config).await?;
-        listen_ports.push(port);
-        networks.push(network);
-        
-        // Give time for the network to start listening
+        let mut attempt = 0u8;
+        loop {
+            // Prefer ephemeral free port; fall back to jittered base if needed.
+            let candidate = pick_free_port().unwrap_or_else(|| base_port.saturating_add((i as u16).saturating_mul(3)));
+            let config = P2PConfig {
+                listen_addr: format!("/ip4/127.0.0.1/tcp/{}", candidate).parse()?,
+                bootstrap_peers: Vec::new(),
+                max_peers: 50,
+            };
+
+            match ConsensusNetwork::new(id, config.clone()).await {
+                Ok(network) => {
+                    listen_ports.push(candidate);
+                    networks.push(network);
+                    break;
+                }
+                Err(e) => {
+                    let msg = format!("{}", e);
+                    if msg.contains("Address already in use") && attempt < 30 {
+                        attempt += 1;
+                        // try another ephemeral and also probe farther in our range
+                        continue;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        // Give time for the network to start listening on the selected port
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    
-    // Connect each network to all others
+
+    // Connect each network to all others using the determined listen ports
     for (i, network) in networks.iter().enumerate() {
         for (j, &port) in listen_ports.iter().enumerate() {
             if i != j {
                 let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", port).parse()?;
                 if let Err(e) = network.connect_peer(addr) {
-                    warn!("Failed to connect validator {} to validator {}: {}", 
-                         network.validator_id(), validator_ids[j], e);
+                    warn!(
+                        "Failed to connect validator {} to validator {}: {}",
+                        network.validator_id(),
+                        validator_ids[j],
+                        e
+                    );
                 }
             }
         }
     }
-    
+
     // Give time for connections to establish
     tokio::time::sleep(Duration::from_millis(500)).await;
-    
+
     Ok(networks)
 }
 

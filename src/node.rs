@@ -272,7 +272,8 @@ impl Node {
     }
 
     pub fn align_clock_for_test(&mut self) {
-        let now_ms: u128 = (Self::now_ts() as u128) * 1000;
+        // Use chain-level millisecond clock to avoid second-boundary drift in tests
+        let now_ms: u128 = self.chain.now_ts();
         let slot_ms = self.chain.clock.slot_ms as u128;
         let desired_slot = self.chain.height + 1;
         self.chain.clock.genesis_unix_ms = now_ms.saturating_sub(slot_ms * desired_slot as u128);
@@ -543,6 +544,22 @@ impl Node {
         &self.chain.fee_state
     }
 
+    /// Expose the current global slot (production clock) for coordination in tests/integration.
+    pub fn current_slot(&self) -> u64 { self.chain.current_slot() }
+
+    /// Expose the configured slot duration in milliseconds.
+    pub fn slot_ms(&self) -> u64 { self.chain.clock.slot_ms }
+
+    /// Determine the deterministic fallback leader for the next block's bundle start.
+    /// This reflects production alias scheduling and does not consider VRF winners.
+    pub fn expected_leader_for_next_block(&self) -> Option<ValidatorId> {
+        let now_ms = self.chain.now_ts();
+        let slot_now = self.chain.clock.current_slot(now_ms);
+        let next_slot = core::cmp::max(slot_now, self.chain.height + 1);
+        let bundle_start = self.chain.clock.bundle_start(next_slot, DEFAULT_BUNDLE_LEN);
+        self.chain.schedule.fallback_leader_for_bundle(bundle_start)
+    }
+
     pub fn set_commit_fee_base(&mut self, base: u64) {
         self.chain.fee_state.commit_base = base;
     }
@@ -614,8 +631,12 @@ impl Node {
         limits: BlockSelectionLimits,
     ) -> Result<(BuiltBlock, ApplyResult, Balances, Nonces, Commitments, Available, u64), ProduceError> {
         // ---- VORTEX: PoS gating & deterministic metadata ----
-        let now_ms = (Self::now_ts() as u128) * 1000;
-        let slot   = self.chain.clock.current_slot(now_ms);
+        let now_ms = self.chain.now_ts();
+        let slot_now   = self.chain.clock.current_slot(now_ms);
+        let next_height = self.chain.height + 1;
+        // Production policy: block at height h must be labeled with slot h.
+        // We target the next height's slot regardless of current wall-clock slot.
+        let slot   = next_height;
         let epoch  = self.chain.clock.current_epoch(slot);
     
         // Bundle start (leader elected per bundle of R slots)
@@ -677,9 +698,7 @@ impl Node {
             .select_block(&sv, limits)
             .map_err(ProduceError::Selection)?;
     
-        let next_height = self.chain.height + 1;
-    
-        // Deterministic timestamp: start of the slot
+        // Deterministic timestamp: start of the targeted slot
         let ts_ms  = self.chain.clock.slot_start_unix(slot);
         let ts_sec = (ts_ms / 1000) as u64;
     

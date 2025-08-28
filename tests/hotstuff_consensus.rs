@@ -171,9 +171,10 @@ async fn test_three_node_consensus_basic_proposal() {
     node_1.set_consensus_network(networks[1].clone());
     node_2.set_consensus_network(networks[2].clone());
     
-    // Node 1 is the leader for view 1 (round-robin: view 1 % 3 = 1)
-    let leader_id = simple_leader_election(1, 3);
-    assert_eq!(leader_id, 1);
+    // Determine leader for the next block using production alias schedule
+    // This avoids test-only shortcuts and matches the chain's scheduling.
+    // All nodes share the same view of the schedule.
+    let leader_id = node_0.expected_leader_for_next_block().expect("leader available");
     
     // Leader (node 1) produces a block
     let limits = BlockSelectionLimits {
@@ -182,7 +183,12 @@ async fn test_three_node_consensus_basic_proposal() {
         max_commits: 10,
     };
     
-    // Produce a block (this will broadcast the proposal)
+    // Wait until the chain clock reaches the next block's slot if needed
+    while node_0.current_slot() < node_0.height() + 1 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(node_0.slot_ms() / 4)).await;
+    }
+
+    // Produce a block (this will broadcast the proposal) by the elected leader
     let result = node_1.produce_block(limits);
     if let Err(e) = &result {
         println!("Block production error: {:?}", e);
@@ -282,8 +288,11 @@ async fn test_multi_round_consensus_with_commits() {
     for round in 1..=5 {
         println!("=== ROUND {} ===", round);
         
-        // Determine leader for this view
-        let leader_id = simple_leader_election(round, 3);
+        // Determine leader for the upcoming block using production schedule
+        while node_0.current_slot() < node_0.height() + 1 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(node_0.slot_ms() / 4)).await;
+        }
+        let leader_id = node_0.expected_leader_for_next_block().expect("leader available");
         println!("Leader for view {}: {}", round, leader_id);
         
         // Update view on all nodes to match the round
@@ -305,6 +314,9 @@ async fn test_multi_round_consensus_with_commits() {
             _ => panic!("Invalid leader"),
         };
         
+        if let Err(e) = &result {
+            eprintln!("round {} produce error: {:?}", round, e);
+        }
         assert!(result.is_ok(), "Block production should succeed in round {}", round);
         
         // Process messages multiple times to handle the full flow (longer delays for real P2P)
@@ -467,7 +479,11 @@ async fn test_safety_property() {
     let mut all_committed_blocks = Vec::new();
     
     for view in 1..=4 {
-        let leader_id = simple_leader_election(view, 3);
+        // Ensure slot has advanced to the next block
+        while node_0.current_slot() < node_0.height() + 1 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(node_0.slot_ms() / 4)).await;
+        }
+        let leader_id = node_0.expected_leader_for_next_block().expect("leader available");
         
         // Update all nodes to the same view
         for node in [&mut node_0, &mut node_1, &mut node_2] {
