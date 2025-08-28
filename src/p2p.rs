@@ -165,7 +165,8 @@ impl ConsensusNetwork {
                 // Gossipsub configuration
                 let gossipsub_config = gossipsub::ConfigBuilder::default()
                     .heartbeat_interval(Duration::from_secs(1))
-                    .validation_mode(ValidationMode::Strict)
+                    // Permissive validation to avoid requiring explicit app-level accepts in devnet
+                    .validation_mode(ValidationMode::Permissive)
                     .message_id_fn(|message| {
                         use std::collections::hash_map::DefaultHasher;
                         use std::hash::{Hash, Hasher};
@@ -452,8 +453,9 @@ impl NetworkTask {
             
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 info!("Connection established with peer: {}", peer_id);
-                // For now, we don't have a way to map peer_id to validator_id
-                // This would need to be part of the handshake/identify protocol
+                // Track connections for metrics; validator mapping is unknown here.
+                let mut peers = self.peers.lock().unwrap();
+                peers.entry(peer_id).or_insert(self.validator_id);
             }
             
             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {

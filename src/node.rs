@@ -324,6 +324,10 @@ impl Node {
 
     /// Apply a committed block identified by its header id (as returned by HotStuff 2-chain rule)
     fn apply_committed_block(&mut self, commit_id: Hash) -> Result<(), String> {
+        if commit_id == [0u8; 32] {
+            // No-op: genesis has no concrete block to apply.
+            return Ok(());
+        }
         let block = match self.block_store.get(&commit_id) {
             Some(b) => b.clone(),
             None => return Err(format!("Committed block {} not found in store", hex::encode(commit_id))),
@@ -443,13 +447,25 @@ impl Node {
 
             // Generate and send vote if we should vote on this proposal
             if let Some(vote) = hotstuff.maybe_vote_self(&block) {
-                // Determine the leader of the next view (who should collect votes)
+                // First, count our own vote locally so our aggregator can reach quorum
+                if let Some(qc) = hotstuff.on_vote(vote.clone()) {
+                    // If our self-vote completes a QC, broadcast it immediately
+                    if let Some(network) = self.consensus_network.as_ref() {
+                        if let Err(e) = network.broadcast_qc(qc.clone()) {
+                            eprintln!("Failed to broadcast QC: {}", e);
+                        }
+                    }
+                    let now_ms = (Self::now_ts() as u128) * 1000;
+                    let _ = hotstuff.on_qc_self(qc, now_ms);
+                }
+
+                // Then, broadcast the vote to all peers
                 let num_validators = hotstuff.validator_pks.len();
                 let next_leader = simple_leader_election(vote.view + 1, num_validators);
-                
                 if let Some(network) = self.consensus_network.as_ref() {
-                    network.send_vote(vote, next_leader)
-                        .map_err(|e| format!("Failed to send vote: {}", e))?;
+                    if let Err(e) = network.send_vote(vote, next_leader) {
+                        eprintln!("Failed to send vote: {}", e);
+                    }
                 }
             }
         }
@@ -801,9 +817,16 @@ impl Node {
             (qc, hash)
         };
 
+        // Choose parent based on consensus state if enabled; otherwise use local tip
+        let parent_hash = if let Some(h) = self.hotstuff.as_ref() {
+            h.state.high_qc.block_id
+        } else {
+            self.chain.tip_hash
+        };
+
         // 3) Build a block with an unsigned header; STF computes roots/gas then we sign
         let mut header = crate::types::BlockHeader {
-            parent_hash:     self.chain.tip_hash,
+            parent_hash:     parent_hash,
             height:          next_height,
             txs_root:        [0u8; 32], // filled after STF run
             receipts_root:   [0u8; 32], // filled after STF run

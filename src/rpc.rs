@@ -159,6 +159,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
+        .route("/consensus", get(consensus_status))
         .route("/balance/:addr", get(balance))
         .route("/mempool/commit", post(submit_commit))
         .route("/mempool/avail",  post(submit_avail))
@@ -173,6 +174,54 @@ async fn status(State(state): State<AppState>) -> Json<StatusResp> {
     let node = state.node.lock().unwrap();
     let tip = hex::encode(node.tip_hash());
     Json(StatusResp { height: node.height(), tip })
+}
+
+#[derive(Serialize)]
+struct ConsensusStatusResp {
+    enabled: bool,
+    validator_id: Option<u64>,
+    view: Option<u64>,
+    high_qc_view: Option<u64>,
+    locked_view: Option<u64>,
+    locked_block: Option<String>,
+    pacemaker_base_timeout_ms: Option<u64>,
+    pacemaker_current_timeout_ms: Option<u64>,
+    p2p_peer_id: Option<String>,
+    connected_peers: Option<usize>,
+}
+
+async fn consensus_status(State(state): State<AppState>) -> Json<ConsensusStatusResp> {
+    let node = state.node.lock().unwrap();
+    let mut resp = ConsensusStatusResp {
+        enabled: false,
+        validator_id: None,
+        view: None,
+        high_qc_view: None,
+        locked_view: None,
+        locked_block: None,
+        pacemaker_base_timeout_ms: None,
+        pacemaker_current_timeout_ms: None,
+        p2p_peer_id: None,
+        connected_peers: None,
+    };
+
+    if let Some(hs) = node.hotstuff() {
+        resp.enabled = true;
+        resp.validator_id = Some(hs.validator_id as u64);
+        resp.view = Some(hs.state.current_view);
+        resp.high_qc_view = Some(hs.state.high_qc.view);
+        resp.locked_view = Some(hs.state.locked_block.1);
+        resp.locked_block = Some(hex::encode(hs.state.locked_block.0));
+        resp.pacemaker_base_timeout_ms = Some(hs.state.pacemaker.base_timeout_ms);
+        resp.pacemaker_current_timeout_ms = Some(hs.state.pacemaker.current_timeout_ms);
+    }
+
+    if let Some(net) = node.consensus_network() {
+        resp.p2p_peer_id = Some(net.peer_id().to_string());
+        resp.connected_peers = Some(net.connected_peers());
+    }
+
+    Json(resp)
 }
 
 async fn balance(State(state): State<AppState>, Path(addr): Path<String>) -> Json<BalanceResp> {
