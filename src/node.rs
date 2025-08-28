@@ -13,6 +13,7 @@ use crate::types::{Block, Hash, HotStuffState, Pacemaker, QC, RevealTx, AvailTx,
 use crate::mempool::encrypted::ThresholdCiphertext;
 use bitvec::vec::BitVec;
 use std::sync::Arc;
+use std::collections::HashMap;
 use ed25519_dalek::{SigningKey, Signer};
 use crate::crypto::{addr_from_pubkey, addr_hex, hash_bytes_sha256};
 use crate::codec::{header_signing_bytes, qc_commitment};
@@ -86,6 +87,10 @@ pub struct Node {
     bls_signer: Option<BlsSigner>,
     hotstuff: Option<HotStuff>,
     consensus_network: Option<ConsensusNetwork>,
+    /// Ephemeral store of proposed blocks by header id for commit on QC
+    block_store: HashMap<Hash, Block>,
+    /// Last view this node proposed in (to avoid multi-proposing per view)
+    last_proposed_view: Option<u64>,
 }
 
 struct NodeStateView<'a> {
@@ -146,6 +151,8 @@ impl Node {
             bls_signer: None,
             hotstuff: None,
             consensus_network: None,
+            block_store: HashMap::new(),
+            last_proposed_view: None,
         }
     }
 
@@ -315,6 +322,48 @@ impl Node {
         self.hotstuff = Some(hotstuff);
     }
 
+    /// Apply a committed block identified by its header id (as returned by HotStuff 2-chain rule)
+    fn apply_committed_block(&mut self, commit_id: Hash) -> Result<(), String> {
+        let block = match self.block_store.get(&commit_id) {
+            Some(b) => b.clone(),
+            None => return Err(format!("Committed block {} not found in store", hex::encode(commit_id))),
+        };
+
+        // Apply and verify. This mutates chain.tip_hash, height, fees, and writes to balances/nonces/etc.
+        let _res = self
+            .chain
+            .apply_block(&block, &mut self.balances, &mut self.nonces, &mut self.commitments, &mut self.available)
+            .map_err(|e| format!("apply_block failed: {:?}", e))?;
+
+        // Best-effort mempool maintenance: mark included txs and revalidate
+        let mut included: Vec<TxId> = Vec::new();
+        for tx in &block.transactions {
+            match tx {
+                Tx::Commit(c) => {
+                    let enc = crate::codec::tx_enum_bytes(&Tx::Commit(c.clone()));
+                    included.push(TxId(crate::crypto::hash_bytes_sha256(&enc)));
+                }
+                Tx::Avail(a) => {
+                    let enc = crate::codec::tx_enum_bytes(&Tx::Avail(a.clone()));
+                    included.push(TxId(crate::crypto::hash_bytes_sha256(&enc)));
+                }
+                _ => {}
+            }
+        }
+        for r in &block.reveals {
+            let mut buf = crate::codec::tx_bytes(&r.tx);
+            buf.extend_from_slice(&r.salt);
+            included.push(TxId(crate::crypto::hash_bytes_sha256(&buf)));
+        }
+        if !included.is_empty() {
+            self.mempool.mark_included(&included, self.chain.height);
+        }
+        let view = StateBalanceView { balances: &self.balances };
+        self.mempool.revalidate_affordability(&view, &self.chain.fee_state);
+        self.mempool.evict_stale(self.chain.height);
+        Ok(())
+    }
+
     /// Process incoming consensus messages from the network
     pub fn process_consensus_messages(&mut self) -> Result<Vec<Hash>, String> {
         let mut committed_blocks = Vec::new();
@@ -337,11 +386,17 @@ impl Node {
                 }
                 ConsensusMessage::Vote { vote, sender_id } => {
                     if let Some(committed) = self.handle_vote(vote, sender_id)? {
+                        if let Err(e) = self.apply_committed_block(committed) {
+                            eprintln!("Failed to apply committed block: {}", e);
+                        }
                         committed_blocks.push(committed);
                     }
                 }
                 ConsensusMessage::QC { qc, sender_id } => {
                     if let Some(committed) = self.handle_qc(qc, sender_id)? {
+                        if let Err(e) = self.apply_committed_block(committed) {
+                            eprintln!("Failed to apply committed block from QC: {}", e);
+                        }
                         committed_blocks.push(committed);
                     }
                 }
@@ -364,6 +419,28 @@ impl Node {
             hotstuff.on_block_proposal(block.clone(), now_ms)
                 .map_err(|e| format!("Block proposal validation failed: {:?}", e))?;
 
+            // Store block for potential future commit
+            let bid = crate::codec::header_id(&block.header);
+            self.block_store.insert(bid, block.clone());
+
+            // Ensure we have the batch payload referenced by this block in our store
+            if !block.batch_digests.is_empty() {
+                let parent_count = block.batch_digests.len().saturating_sub(1);
+                if parent_count > 0 {
+                    let parents = block.batch_digests[..parent_count].to_vec();
+                    let expected_id = block.batch_digests[parent_count];
+                    let batch = Batch::new(block.transactions.clone(), parents.clone(), block.header.proposer_id, [0u8; 64]);
+                    if batch.id == expected_id {
+                        if self.chain.batch_store.get(&batch.id).is_none() {
+                            self.chain.batch_store.insert(batch);
+                        }
+                    } else {
+                        eprintln!("Warning: batch id mismatch for proposed block: expected {}, computed {}",
+                                  hex::encode(expected_id), hex::encode(batch.id));
+                    }
+                }
+            }
+
             // Generate and send vote if we should vote on this proposal
             if let Some(vote) = hotstuff.maybe_vote_self(&block) {
                 // Determine the leader of the next view (who should collect votes)
@@ -382,24 +459,16 @@ impl Node {
     /// Handle an incoming vote (only leaders aggregate votes)
     fn handle_vote(&mut self, vote: Vote, sender_id: ValidatorId) -> Result<Option<Hash>, String> {
         if let Some(hotstuff) = self.hotstuff.as_mut() {
-            // Check if I'm the leader for this view
-            let num_validators = hotstuff.validator_pks.len();
-            let expected_leader = simple_leader_election(vote.view, num_validators);
-            
-            if expected_leader == hotstuff.validator_id {
-                // I'm the leader, try to aggregate this vote
-                if let Some(qc) = hotstuff.on_vote(vote) {
-                    // We have a QC! Broadcast it and update our state
-                    if let Some(network) = self.consensus_network.as_ref() {
-                        network.broadcast_qc(qc.clone())
-                            .map_err(|e| format!("Failed to broadcast QC: {}", e))?;
-                    }
-                    
-                    // Process the QC locally
-                    let now_ms = (Self::now_ts() as u128) * 1000;
-                    return Ok(hotstuff.on_qc_self(qc, now_ms)
-                        .map_err(|e| format!("Failed to process QC: {:?}", e))?);
+            // Aggregate votes regardless of whether we believe we are the leader.
+            // In this devnet, any node that reaches quorum will broadcast the QC.
+            if let Some(qc) = hotstuff.on_vote(vote) {
+                if let Some(network) = self.consensus_network.as_ref() {
+                    network.broadcast_qc(qc.clone())
+                        .map_err(|e| format!("Failed to broadcast QC: {}", e))?;
                 }
+                let now_ms = (Self::now_ts() as u128) * 1000;
+                return Ok(hotstuff.on_qc_self(qc, now_ms)
+                    .map_err(|e| format!("Failed to process QC: {:?}", e))?);
             }
         }
         Ok(None)
@@ -765,7 +834,7 @@ impl Node {
             signature: [0u8; 64], // filled after signing below
         };
         let mut block = crate::types::Block::new_with_reveals(
-            Vec::new(),
+            cand.txs.clone(),
             cand.reveals.clone(),
             header,
             justify_qc,
@@ -850,6 +919,14 @@ impl Node {
         &mut self,
         limits: BlockSelectionLimits,
     ) -> Result<(BuiltBlock, ApplyResult), ProduceError> {
+        // In networked mode, propose at most once per view.
+        if self.consensus_network.is_some() {
+            if let Some(hs) = self.hotstuff.as_ref() {
+                if self.last_proposed_view == Some(hs.state.current_view) {
+                    return Err(ProduceError::HeaderBuild("already proposed in this view".into()));
+                }
+            }
+        }
         let (
             built,
             apply,
@@ -859,36 +936,44 @@ impl Node {
             available,
             burned_total,
         ) = self.simulate_block(limits)?;
+        // In consensus (networked) mode, do NOT locally commit.
+        // Let HotStuff decide commits via QCs so all replicas advance together.
+        let res = if self.consensus_network.is_none() {
+            let res = self.chain
+                .commit_simulated_block(
+                    &built.block,
+                    apply.clone(),
+                    balances.clone(),
+                    nonces.clone(),
+                    commitments.clone(),
+                    available.clone(),
+                )
+                .map_err(|e| ProduceError::HeaderBuild(format!("commit failed: {e:?}")))?;
 
-        let res = self.chain
-            .commit_simulated_block(
-                &built.block,
-                apply.clone(),
-                balances.clone(),
-                nonces.clone(),
-                commitments.clone(),
-                available.clone(),
-            )
-            .map_err(|e| ProduceError::HeaderBuild(format!("commit failed: {e:?}")))?;
+            self.balances = balances;
+            self.nonces = nonces;
+            self.commitments = commitments;
+            self.available = available;
+            let _ = burned_total; // state already applied via commit_simulated_block
 
-        self.balances = balances;
-        self.nonces = nonces;
-        self.commitments = commitments;
-        self.available = available;
-        let _ = burned_total; // state already applied via commit_simulated_block
+            let all_ids: Vec<TxId> = built
+                .selected_ids
+                .commit.iter()
+                .chain(&built.selected_ids.avail)
+                .chain(&built.selected_ids.reveal)
+                .cloned()
+                .collect();
+            self.mempool.mark_included(&all_ids, self.chain.height);
 
-        let all_ids: Vec<TxId> = built
-            .selected_ids
-            .commit.iter()
-            .chain(&built.selected_ids.avail)
-            .chain(&built.selected_ids.reveal)
-            .cloned()
-            .collect();
-        self.mempool.mark_included(&all_ids, self.chain.height);
+            let view = StateBalanceView { balances: &self.balances };
+            self.mempool.revalidate_affordability(&view, &self.chain.fee_state);
+            self.mempool.evict_stale(self.chain.height);
 
-        let view = StateBalanceView { balances: &self.balances };
-        self.mempool.revalidate_affordability(&view, &self.chain.fee_state);
-        self.mempool.evict_stale(self.chain.height);
+            res
+        } else {
+            // Networked mode: skip local commit and return a dummy ApplyResult copy for callers that log it.
+            apply.clone()
+        };
 
         // HotStuff: broadcast proposal and handle consensus
         if let Some(hs) = self.hotstuff.as_mut() {
@@ -899,10 +984,24 @@ impl Node {
             // As leader, validate the proposal we're about to broadcast
             let _ = hs.on_block_proposal(built.block.clone(), now_ms);
 
+            // Store our own proposed block so we can commit it on QC later
+            let bid = crate::codec::header_id(&built.block.header);
+            self.block_store.insert(bid, built.block.clone());
+
             // Broadcast the proposal to all validators
             if let Some(network) = self.consensus_network.as_ref() {
                 if let Err(e) = network.broadcast_proposal(built.block.clone()) {
                     eprintln!("Failed to broadcast proposal: {}", e);
+                }
+
+                // Also cast and send our own vote for the proposal so quorum can be reached (3/3 in n=3).
+                if let Some(vote) = hs.maybe_vote_self(&built.block) {
+                    // We route via send_vote, which currently broadcasts in the P2P layer.
+                    // The next leader id is not strictly required since the network broadcasts.
+                    let next_leader = 0 as ValidatorId; // placeholder; send_vote broadcasts anyway
+                    if let Err(e) = network.send_vote(vote, next_leader) {
+                        eprintln!("Failed to send self vote: {}", e);
+                    }
                 }
             } else {
                 // Fallback to single-process mode for backward compatibility
@@ -914,6 +1013,12 @@ impl Node {
             }
         }
 
+        // Record that we proposed in this view (networked mode)
+        if self.consensus_network.is_some() {
+            if let Some(hs) = self.hotstuff.as_ref() {
+                self.last_proposed_view = Some(hs.state.current_view);
+            }
+        }
         Ok((built, res))
     }
 
