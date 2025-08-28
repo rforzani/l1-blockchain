@@ -2,6 +2,8 @@ use crate::consensus::dev_loop::DevNode;
 use crate::consensus::HotStuff;
 use crate::crypto::bls::{verify_qc, BlsSigner, BlsSignatureBytes, BlsAggregate, vote_msg};
 use crate::fees::FeeState;
+use crate::p2p::{ConsensusNetwork, ConsensusMessage, simple_leader_election};
+use crate::types::Vote;
 // src/node.rs
 use crate::mempool::{BalanceView, BlockSelectionLimits, CommitmentId, Mempool, MempoolImpl, SelectError, StateView, TxId, Batch, AdmissionError};
 use crate::state::{Balances, Nonces, Commitments, Available};
@@ -83,6 +85,7 @@ pub struct Node {
     vrf_signer: Option<SchnorrkelVrfSigner>,
     bls_signer: Option<BlsSigner>,
     hotstuff: Option<HotStuff>,
+    consensus_network: Option<ConsensusNetwork>,
 }
 
 struct NodeStateView<'a> {
@@ -141,7 +144,8 @@ impl Node {
             proposer_pubkey,
             vrf_signer: None,
             bls_signer: None,
-            hotstuff: None
+            hotstuff: None,
+            consensus_network: None,
         }
     }
 
@@ -285,6 +289,165 @@ impl Node {
         self
     }
 
+    /// Set the consensus network for this node
+    pub fn set_consensus_network(&mut self, network: ConsensusNetwork) {
+        self.consensus_network = Some(network);
+    }
+
+    /// Get the consensus network (if set)
+    pub fn consensus_network(&self) -> Option<&ConsensusNetwork> {
+        self.consensus_network.as_ref()
+    }
+
+    /// Get mutable reference to HotStuff state (for testing)
+    pub fn hotstuff_mut(&mut self) -> Option<&mut HotStuff> {
+        self.hotstuff.as_mut()
+    }
+
+    /// Get reference to HotStuff state (for testing)
+    pub fn hotstuff(&self) -> Option<&HotStuff> {
+        self.hotstuff.as_ref()
+    }
+
+    /// Set HotStuff instance (for testing)
+    pub fn set_hotstuff(&mut self, hotstuff: HotStuff) {
+        self.hotstuff = Some(hotstuff);
+    }
+
+    /// Process incoming consensus messages from the network
+    pub fn process_consensus_messages(&mut self) -> Result<Vec<Hash>, String> {
+        let mut committed_blocks = Vec::new();
+        
+        // Collect all messages first to avoid borrowing conflicts
+        let mut messages = Vec::new();
+        if let Some(network) = self.consensus_network.as_ref() {
+            while let Some(msg) = network.try_recv_message() {
+                messages.push(msg);
+            }
+        }
+        
+        // Now process all collected messages
+        for msg in messages {
+            match msg {
+                ConsensusMessage::Proposal { block, sender_id } => {
+                    if let Err(e) = self.handle_proposal(block, sender_id) {
+                        eprintln!("Error handling proposal from {}: {}", sender_id, e);
+                    }
+                }
+                ConsensusMessage::Vote { vote, sender_id } => {
+                    if let Some(committed) = self.handle_vote(vote, sender_id)? {
+                        committed_blocks.push(committed);
+                    }
+                }
+                ConsensusMessage::QC { qc, sender_id } => {
+                    if let Some(committed) = self.handle_qc(qc, sender_id)? {
+                        committed_blocks.push(committed);
+                    }
+                }
+                ConsensusMessage::ViewChange { view, sender_id, timeout_qc } => {
+                    self.handle_view_change(view, sender_id, timeout_qc)?;
+                }
+            }
+        }
+        
+        Ok(committed_blocks)
+    }
+
+    /// Handle an incoming block proposal
+    fn handle_proposal(&mut self, block: Block, sender_id: ValidatorId) -> Result<(), String> {
+        if let Some(hotstuff) = self.hotstuff.as_mut() {
+            let now_ms = (Self::now_ts() as u128) * 1000;
+            
+            // Validate the proposal
+            hotstuff.observe_block_header(&block.header);
+            hotstuff.on_block_proposal(block.clone(), now_ms)
+                .map_err(|e| format!("Block proposal validation failed: {:?}", e))?;
+
+            // Generate and send vote if we should vote on this proposal
+            if let Some(vote) = hotstuff.maybe_vote_self(&block) {
+                // Determine the leader of the next view (who should collect votes)
+                let num_validators = hotstuff.validator_pks.len();
+                let next_leader = simple_leader_election(vote.view + 1, num_validators);
+                
+                if let Some(network) = self.consensus_network.as_ref() {
+                    network.send_vote(vote, next_leader)
+                        .map_err(|e| format!("Failed to send vote: {}", e))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle an incoming vote (only leaders aggregate votes)
+    fn handle_vote(&mut self, vote: Vote, sender_id: ValidatorId) -> Result<Option<Hash>, String> {
+        if let Some(hotstuff) = self.hotstuff.as_mut() {
+            // Check if I'm the leader for this view
+            let num_validators = hotstuff.validator_pks.len();
+            let expected_leader = simple_leader_election(vote.view, num_validators);
+            
+            if expected_leader == hotstuff.validator_id {
+                // I'm the leader, try to aggregate this vote
+                if let Some(qc) = hotstuff.on_vote(vote) {
+                    // We have a QC! Broadcast it and update our state
+                    if let Some(network) = self.consensus_network.as_ref() {
+                        network.broadcast_qc(qc.clone())
+                            .map_err(|e| format!("Failed to broadcast QC: {}", e))?;
+                    }
+                    
+                    // Process the QC locally
+                    let now_ms = (Self::now_ts() as u128) * 1000;
+                    return Ok(hotstuff.on_qc_self(qc, now_ms)
+                        .map_err(|e| format!("Failed to process QC: {:?}", e))?);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Handle an incoming QC
+    fn handle_qc(&mut self, qc: QC, sender_id: ValidatorId) -> Result<Option<Hash>, String> {
+        if let Some(hotstuff) = self.hotstuff.as_mut() {
+            let now_ms = (Self::now_ts() as u128) * 1000;
+            return Ok(hotstuff.on_qc_self(qc, now_ms)
+                .map_err(|e| format!("Failed to process QC: {:?}", e))?);
+        }
+        Ok(None)
+    }
+
+    /// Handle a view change message
+    fn handle_view_change(&mut self, view: u64, sender_id: ValidatorId, timeout_qc: Option<QC>) -> Result<(), String> {
+        if let Some(hotstuff) = self.hotstuff.as_mut() {
+            // If we receive a valid timeout QC, we might need to advance our view
+            if let Some(qc) = timeout_qc {
+                let now_ms = (Self::now_ts() as u128) * 1000;
+                let _ = hotstuff.on_qc_self(qc, now_ms);
+            }
+            
+            // Could implement view synchronization logic here
+            // For now, we rely on timeouts to drive view changes
+        }
+        Ok(())
+    }
+
+    /// Check for pacemaker timeouts and advance view if necessary
+    pub fn check_pacemaker_timeout(&mut self) -> Result<(), String> {
+        if let Some(hotstuff) = self.hotstuff.as_mut() {
+            let now_ms = (Self::now_ts() as u128) * 1000;
+            hotstuff.on_new_slot(now_ms);
+            
+            // If we advanced view due to timeout, broadcast a view change
+            // This is a simplified version - production would be more sophisticated
+            if let Some(network) = self.consensus_network.as_ref() {
+                let current_view = hotstuff.state.current_view;
+                // Only broadcast if we think we should (could add more logic here)
+                if hotstuff.state.pacemaker.expired(now_ms) {
+                    let _ = network.broadcast_view_change(current_view, Some(hotstuff.state.high_qc.clone()));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Helper used by genesis init to fetch our VRF pubkey.
     fn my_vrf_pubkey(&self) -> [u8; 32] {
         self.vrf_signer
@@ -294,13 +457,20 @@ impl Node {
     }
 
     pub fn install_self_as_genesis_validator(&mut self, id: ValidatorId, stake: u128) -> BlsSigner {
+        // Create unique BLS key for each validator for testing
+        let mut bls_key = [1u8; 32];
+        bls_key[0] = (id + 10) as u8; // Make each validator have a unique key
+        self.install_self_as_genesis_validator_with_key(id, stake, &bls_key)
+    }
+
+    pub fn install_self_as_genesis_validator_with_key(&mut self, id: ValidatorId, stake: u128, bls_key: &[u8; 32]) -> BlsSigner {
         let cfg = StakingConfig {
             min_stake: 1,
             unbonding_epochs: 1,
             max_validators: u32::MAX,
         };
 
-        let bls_signer = BlsSigner::from_sk_bytes(&[1u8;32]).unwrap();
+        let bls_signer = BlsSigner::from_sk_bytes(bls_key).unwrap();
         let v = Validator {
             id,
             ed25519_pubkey: self.proposer_pubkey,
@@ -315,6 +485,20 @@ impl Node {
         self.chain.init_genesis(set, seed);
         self.bls_signer = Some(bls_signer.clone());
         bls_signer
+    }
+
+    /// Initialize a node with a multi-validator genesis set for testing
+    pub fn init_with_shared_validator_set(&mut self, validators: Vec<Validator>, my_bls_signer: BlsSigner) {
+        let cfg = StakingConfig {
+            min_stake: 1,
+            unbonding_epochs: 1,
+            max_validators: u32::MAX,
+        };
+
+        let set = ValidatorSet::from_genesis(0, &cfg, validators);
+        let seed = hash_bytes_sha256(b"l1-blockchain/test-epoch-seed:v1");
+        self.chain.init_genesis(set, seed);
+        self.bls_signer = Some(my_bls_signer);
     }
 
     #[inline]
@@ -687,19 +871,26 @@ impl Node {
         self.mempool.revalidate_affordability(&view, &self.chain.fee_state);
         self.mempool.evict_stale(self.chain.height);
 
-        // HotStuff: single-process vote aggregation and high_qc update.
+        // HotStuff: broadcast proposal and handle consensus
         if let Some(hs) = self.hotstuff.as_mut() {
-            // Track parent lineage for safety checks.
+            // Track parent lineage for safety checks
             hs.observe_block_header(&built.block.header);
 
             let now_ms = (Self::now_ts() as u128) * 1000;
-            // As leader, validate the proposal we're about to broadcast.
+            // As leader, validate the proposal we're about to broadcast
             let _ = hs.on_block_proposal(built.block.clone(), now_ms);
 
-            // Vote on the proposal and, if we are the leader, aggregate.
-            if let Some(vote) = hs.maybe_vote_self(&built.block) {
-                if let Some(qc) = hs.on_vote(vote) {
-                    let _ = hs.on_qc_self(qc, now_ms);
+            // Broadcast the proposal to all validators
+            if let Some(network) = self.consensus_network.as_ref() {
+                if let Err(e) = network.broadcast_proposal(built.block.clone()) {
+                    eprintln!("Failed to broadcast proposal: {}", e);
+                }
+            } else {
+                // Fallback to single-process mode for backward compatibility
+                if let Some(vote) = hs.maybe_vote_self(&built.block) {
+                    if let Some(qc) = hs.on_vote(vote) {
+                        let _ = hs.on_qc_self(qc, now_ms);
+                    }
                 }
             }
         }

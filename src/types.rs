@@ -3,10 +3,11 @@
 use bitvec::vec::BitVec;
 
 use crate::{codec::qc_commitment, crypto::bls::{BlsAggregate, BlsSignatureBytes}, pos::registry::ValidatorId, mempool::encrypted::ThresholdCiphertext};
+use serde_with::{serde_as, Bytes};
 
 pub type Address = String;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Transaction {
     pub from: Address,
     pub to: Address,
@@ -27,7 +28,7 @@ impl Transaction {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Block {
     pub transactions: Vec<Tx>,
     pub reveals: Vec<RevealTx>,
@@ -120,16 +121,21 @@ impl Pacemaker {
 
 pub type Hash = [u8; 32];
 
+#[serde_as]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Vote {
     pub view: u64,
+    #[serde_as(as = "Bytes")]
     pub block_id: Hash,
     pub voter_id: ValidatorId,
     pub bls_sig: BlsSignatureBytes,
 }
 
-#[derive(Debug, Clone)]
+#[serde_as]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QC {
     pub view: u64,               // the view these votes attest to
+    #[serde_as(as = "Bytes")]
     pub block_id: Hash,          // the block that was voted for
     pub agg_sig: BlsSignatureBytes,   // aggregated signature over (block_id||view)
     pub bitmap: BitVec,          // which validators signed (for auditing/slashing)
@@ -142,15 +148,22 @@ pub struct HotStuffState {
     pub pacemaker: Pacemaker,         // timeouts / timers per view
 }
 
-#[derive(Debug, Clone)]
+#[serde_as]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlockHeader {
+    #[serde_as(as = "Bytes")]
     pub parent_hash: Hash,
     pub height: u64,
+    #[serde_as(as = "Bytes")]
     pub txs_root: Hash,
+    #[serde_as(as = "Bytes")]
     pub receipts_root: Hash,
     pub gas_used: u64,
+    #[serde_as(as = "Bytes")]
     pub randomness: Hash,
+    #[serde_as(as = "Bytes")]
     pub reveal_set_root: Hash,
+    #[serde_as(as = "Bytes")]
     pub il_root: Hash,
     pub exec_base_fee: u64,
     pub commit_base_fee: u64,
@@ -159,22 +172,25 @@ pub struct BlockHeader {
     pub slot: u64,
     pub epoch: u64,
     pub proposer_id: ValidatorId,
+    #[serde_as(as = "Bytes")]
     pub signature: [u8; 64],
-    pub bundle_len: u8,         
+    pub bundle_len: u8,
+    #[serde_as(as = "Bytes")]         
     pub vrf_preout: [u8; 32],
+    #[serde_as(as = "Bytes")]
     pub vrf_output: [u8; 32], 
     pub vrf_proof:  Vec<u8>,  
-    pub view: u64,            
+    pub view: u64,
+    #[serde_as(as = "Bytes")]            
     pub justify_qc_hash: Hash,
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 
 /* Rules:
 	•	Under‑declare (write/read a key not listed) ⇒ IntrinsicInvalid.
 	•	Over‑declare (declare but don’t touch) ⇒ allowed (hurts parallelism, not correctness).
 	•	Scheduler lock order: for each tx, lock writes first (sorted), then reads, to avoid deadlocks.
  */
+#[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
 pub enum StateKey {
     Balance(Address),
     Nonce(Address),
@@ -190,7 +206,7 @@ When you run transactions in parallel, you must know which parts of state each t
 
 That declared set is the access list.
  */
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AccessList {
     pub reads: Vec<StateKey>,
     pub writes: Vec<StateKey>,
@@ -260,34 +276,45 @@ impl AccessList {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CommitTx {
+    #[serde_as(as = "Bytes")]
     pub commitment: Hash,
     pub sender: Address,
     pub access_list: AccessList,
     pub encrypted_payload: ThresholdCiphertext,
+    #[serde_as(as = "Bytes")]
     pub pubkey: [u8; 32],
+    #[serde_as(as = "Bytes")]
     pub sig: [u8; 64]
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AvailTx {
+    #[serde_as(as = "Bytes")]
     pub commitment: Hash,
     pub sender: Address,
+    #[serde_as(as = "Bytes")]
     pub payload_hash: Hash, // Hash of the encrypted payload for availability proof
     pub payload_size: u64,  // Size of encrypted payload in bytes
+    #[serde_as(as = "Bytes")]
     pub pubkey: [u8; 32],
+    #[serde_as(as = "Bytes")]
     pub sig: [u8; 64]
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RevealTx {
     pub tx: Transaction,
+    #[serde_as(as = "Bytes")]
     pub salt: Hash,
     pub sender: Address
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Tx {
     Commit(CommitTx),
     Avail(AvailTx),

@@ -100,9 +100,7 @@ impl HotStuff {
     }
 
     pub fn on_block_proposal(&mut self, block: Block, _now_ms: u128) -> Result<(), Error> {
-        if block.header.proposer_id != self.validator_id {
-            return Err(Error::Unimplemented);
-        }
+        // Any validator can validate proposals from any other validator
 
         let committed = qc_commitment(
             block.justify_qc.view,

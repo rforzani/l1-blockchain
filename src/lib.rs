@@ -14,3 +14,4 @@ pub mod consensus;
 pub mod pos;
 pub mod devnet;
 pub mod rpc;
+pub mod p2p;

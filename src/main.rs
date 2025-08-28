@@ -13,6 +13,7 @@ mod node;
 mod chain;
 mod verify;
 mod pos;
+mod p2p;
 
 use crate::state::{Balances, print_balances};
 use crate::types::Hash;
