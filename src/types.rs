@@ -92,7 +92,14 @@ pub struct Pacemaker {
 }
 
 impl Pacemaker {
-    pub fn new(base_timeout_ms: u64, max_timeout_ms: u64, backoff_num: u64, backoff_den: u64) -> Self {
+    pub fn new(
+        base_timeout_ms: u64,
+        max_timeout_ms: u64,
+        backoff_num: u64,
+        backoff_den: u64,
+        safety_num: u64,
+        safety_den: u64,
+    ) -> Self {
         Self {
             base_timeout_ms,
             current_timeout_ms: base_timeout_ms,
@@ -103,8 +110,8 @@ impl Pacemaker {
             latency_ewma_ms: base_timeout_ms,
             ewma_alpha_num: 1,
             ewma_alpha_den: 4,
-            safety_num: 3,
-            safety_den: 2,
+            safety_num: safety_num.max(1),
+            safety_den: safety_den.max(1),
         }
     }
 

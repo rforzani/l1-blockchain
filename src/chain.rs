@@ -18,7 +18,7 @@ use crate::verify::verify_block_roots;
 use std::collections::{HashMap, HashSet, BTreeMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_SLOT_MS: u64 = 1_000;     // 1s slots for dev;
+const DEFAULT_SLOT_MS: u64 = 500;       // 0.5s slots for dev
 const DEFAULT_EPOCH_SLOTS: u64 = 1_024; // power-of-two for easy math
 pub const DEFAULT_BUNDLE_LEN: u8 = 4;
 pub const DEFAULT_TAU: f64 = 0.5;
@@ -487,12 +487,8 @@ impl Chain {
     pub fn commit_simulated_block(
         &mut self,
         block: &Block,
-        apply: ApplyResult,
-        _balances: Balances,
-        _nonces: Nonces,
-        _commitments: Commitments,
-        _available: Available,
-    ) -> Result<ApplyResult, BlockError> {
+        apply: &ApplyResult,
+    ) -> Result<(), BlockError> {
         if block.header.height != self.height + 1 {
             return Err(BlockError::BadHeight { expected: self.height + 1, got: block.header.height });
         }
@@ -602,7 +598,7 @@ impl Chain {
             apply.commits_used,
         );
         self.burned_total = self.burned_total.saturating_add(apply.gas_total);
-        Ok(apply)
+        Ok(())
     }
 
     /// Check if a commitment has been included on-chain.

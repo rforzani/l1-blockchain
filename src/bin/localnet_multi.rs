@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis();
-        let mut pacemaker = l1_blockchain::types::Pacemaker::new(500, 8000, 3, 2);
+        let mut pacemaker = l1_blockchain::types::Pacemaker::new(500, 8000, 3, 2, 1, 1);
         pacemaker.on_enter_view(now_ms);
 
         let hs_state = HotStuffState {
@@ -125,14 +125,14 @@ async fn main() -> anyhow::Result<()> {
         node.set_hotstuff(hotstuff);
 
         // Shorter slot period for faster dev loops: set 500ms and align clock
-        node.set_slot_ms(400);
+        node.set_slot_ms(500);
         node.align_clock_for_test();
 
         let arc = Arc::new(Mutex::new(node));
         {
             let mut guard = arc.lock().unwrap();
             // Already set above; ensure state reflects these settings
-            guard.set_slot_ms(400);
+            guard.set_slot_ms(500);
             guard.align_clock_for_test();
         }
         nodes.push(arc);

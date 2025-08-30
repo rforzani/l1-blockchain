@@ -30,19 +30,20 @@ async fn main() -> anyhow::Result<()> {
     // single-validator genesis with stake
     node.install_self_as_genesis_validator(1, 1_000_000);
 
-    // make slot policy line up with tests/dev (so WrongSlot won't trip)
+    // Use 500ms slots for local dev and align
+    node.set_slot_ms(500);
     node.align_clock_for_test();
 
     // share the node with RPC + block loop
     let shared = Arc::new(Mutex::new(node));
 
-    // --- Block production loop: 1 block / second ---
+    // --- Block production loop: one block per 500ms slot ---
     {
         let shared2 = shared.clone();
         tokio::spawn(async move {
             // Use `interval` so that block production stays aligned to the
             // 1-second slot boundary even if producing a block takes time.
-            let mut ticker = tokio::time::interval(Duration::from_millis(1000));
+            let mut ticker = tokio::time::interval(Duration::from_millis(500));
             loop {
                 ticker.tick().await;
                 let mut n = shared2.lock().unwrap();

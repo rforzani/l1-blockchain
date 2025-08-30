@@ -72,6 +72,8 @@ pub struct PacemakerConfig {
     pub max_timeout_ms: u64,
     pub backoff_num: u64,
     pub backoff_den: u64,
+    pub safety_num: u64,
+    pub safety_den: u64,
 }
 
 #[derive(Clone)]
@@ -276,7 +278,14 @@ impl Node {
 
         // Pacemaker from config; start timer from Chain clock
         let pmc = &consensus_cfg.pacemaker;
-        let mut pacemaker = Pacemaker::new(pmc.base_timeout_ms, pmc.max_timeout_ms, pmc.backoff_num, pmc.backoff_den);
+        let mut pacemaker = Pacemaker::new(
+            pmc.base_timeout_ms,
+            pmc.max_timeout_ms,
+            pmc.backoff_num,
+            pmc.backoff_den,
+            pmc.safety_num,
+            pmc.safety_den,
+        );
         pacemaker.on_enter_view(node.chain.now_ts()); // ms since epoch as u128
 
         let hs_state = HotStuffState { current_view, locked_block, high_qc, pacemaker };
@@ -495,12 +504,12 @@ impl Node {
             match msg {
                 ConsensusMessage::Proposal { block, parent, sender_id } => {
                     // If sender included the parent block, store/validate it first
-                    if let Some(pb) = parent {
+                    if let Some(ref pb) = parent {
                         if let Err(e) = self.handle_proposal(pb, sender_id) {
                             eprintln!("Error handling parent proposal from {}: {}", sender_id, e);
                         }
                     }
-                    if let Err(e) = self.handle_proposal(block, sender_id) {
+                    if let Err(e) = self.handle_proposal(&block, sender_id) {
                         eprintln!("Error handling proposal from {}: {}", sender_id, e);
                     }
                 }
@@ -536,12 +545,12 @@ impl Node {
         let mut committed_blocks = Vec::new();
         match msg {
             crate::p2p::ConsensusMessage::Proposal { block, parent, sender_id } => {
-                if let Some(pb) = parent {
+                if let Some(ref pb) = parent {
                     if let Err(e) = self.handle_proposal(pb, sender_id) {
                         eprintln!("Error handling parent proposal from {}: {}", sender_id, e);
                     }
                 }
-                if let Err(e) = self.handle_proposal(block, sender_id) {
+                if let Err(e) = self.handle_proposal(&block, sender_id) {
                     eprintln!("Error handling proposal from {}: {}", sender_id, e);
                 }
             }
@@ -571,12 +580,12 @@ impl Node {
     }
 
     /// Handle an incoming block proposal
-    fn handle_proposal(&mut self, block: Block, sender_id: ValidatorId) -> Result<(), String> {
+    fn handle_proposal(&mut self, block: &Block, sender_id: ValidatorId) -> Result<(), String> {
         // 1) HotStuff header observation and validation
         if let Some(hs) = self.hotstuff.as_mut() {
             let now_ms = (Self::now_ts() as u128) * 1000;
             hs.observe_block_header(&block.header);
-            hs.on_block_proposal(block.clone(), now_ms)
+            hs.on_block_proposal(block, now_ms)
                 .map_err(|e| format!("Block proposal validation failed: {:?}", e))?;
         }
 
@@ -710,15 +719,30 @@ impl Node {
     pub fn check_pacemaker_timeout(&mut self) -> Result<(), String> {
         if let Some(hotstuff) = self.hotstuff.as_mut() {
             let now_ms = (Self::now_ts() as u128) * 1000;
+            // Check expiry before advancing view so we can notify peers first
+            let expired = hotstuff.state.pacemaker.expired(now_ms);
+            if expired {
+                if let Some(network) = self.consensus_network.as_ref() {
+                    let view = hotstuff.state.current_view;
+                    let _ = network.broadcast_view_change(view, Some(hotstuff.state.high_qc.clone()));
+                }
+            }
+            // Capture current view, then advance the view (bumps backoff and resets timer)
+            let prev_view = hotstuff.state.current_view;
             hotstuff.on_new_slot(now_ms);
-            
-            // If we advanced view due to timeout, broadcast a view change
-            // This is a simplified version - production would be more sophisticated
-            if let Some(network) = self.consensus_network.as_ref() {
-                let current_view = hotstuff.state.current_view;
-                // Only broadcast if we think we should (could add more logic here)
-                if hotstuff.state.pacemaker.expired(now_ms) {
-                    let _ = network.broadcast_view_change(current_view, Some(hotstuff.state.high_qc.clone()));
+
+            // If we advanced to a higher view, and we're the leader for that view, propose immediately
+            let next_view = hotstuff.state.current_view;
+            let my_id = hotstuff.validator_id;
+            let n = hotstuff.validator_pks.len();
+            let advanced = next_view > prev_view;
+            // Drop the borrow before calling into self.produce_block
+            drop(hotstuff);
+            if advanced {
+                let leader = crate::p2p::simple_leader_election(next_view, n);
+                if my_id == leader && self.last_proposed_view != Some(next_view) {
+                    // Ignore errors here; the periodic producer will also try.
+                    let _ = self.produce_block(crate::consensus::dev_loop::DEFAULT_LIMITS);
                 }
             }
         }
@@ -832,9 +856,8 @@ impl Node {
     /// Determine the deterministic fallback leader for the next block's bundle start.
     /// This reflects production alias scheduling and does not consider VRF winners.
     pub fn expected_leader_for_next_block(&self) -> Option<ValidatorId> {
-        let now_ms = self.chain.now_ts();
-        let slot_now = self.chain.clock.current_slot(now_ms);
-        let next_slot = core::cmp::max(slot_now, self.chain.height + 1);
+        // Predict strictly based on chain height, not wall-clock.
+        let next_slot = self.chain.height + 1;
         let bundle_start = self.chain.clock.bundle_start(next_slot, DEFAULT_BUNDLE_LEN);
         self.chain.schedule.fallback_leader_for_bundle(bundle_start)
     }
@@ -1119,9 +1142,9 @@ impl Node {
         block.header.signature = sig;
     
         let apply = ApplyResult {
-            receipts: body.receipts.clone(),
+            receipts: body.receipts,
             gas_total: body.gas_total,
-            events: body.events.clone(),
+            events: body.events,
             exec_reveals_used: body.exec_reveals_used,
             commits_used: body.commits_used,
             burned_total: sim_burned_total
@@ -1152,16 +1175,22 @@ impl Node {
         // In networked mode, propose at most once per view, and only if leader.
         if self.consensus_network.is_some() {
             if let Some(hs) = self.hotstuff.as_ref() {
-                // Only the expected leader for the upcoming block should propose.
-                // Use the chain's proposer schedule (fallback or VRF-aware) when available.
-                if let Some(exp) = self.expected_leader_for_next_block() {
-                    if hs.validator_id != exp {
-                        return Err(ProduceError::NotProposer {
-                            slot: self.chain.height + 1,
-                            leader: Some(exp),
-                            mine: Some(hs.validator_id),
-                        });
-                    }
+                // In HotStuff mode, leaders are view-based; however, our production
+                // alias schedule may also specify an expected proposer for the next
+                // slot. Allow proposing if we match either to avoid stalls.
+                let n = hs.validator_pks.len();
+                let expected_view = crate::p2p::simple_leader_election(hs.state.current_view, n);
+                let expected_alias = self.expected_leader_for_next_block();
+                let am_view_leader = hs.validator_id == expected_view;
+                let am_alias_leader = expected_alias.map_or(false, |id| id == hs.validator_id);
+                if !am_view_leader && !am_alias_leader {
+                    // Prefer reporting alias leader if available, else the view leader
+                    let report = expected_alias.or(Some(expected_view));
+                    return Err(ProduceError::NotProposer {
+                        slot: self.chain.height + 1,
+                        leader: report,
+                        mine: Some(hs.validator_id),
+                    });
                 }
                 if self.last_proposed_view == Some(hs.state.current_view) {
                     return Err(ProduceError::HeaderBuild("already proposed in this view".into()));
@@ -1182,14 +1211,10 @@ impl Node {
         // In consensus (networked) mode, do NOT locally commit.
         // Let HotStuff decide commits via QCs so all replicas advance together.
         let res = if self.consensus_network.is_none() {
-            let res = self.chain
+            self.chain
                 .commit_simulated_block(
                     &built.block,
-                    apply.clone(),
-                    balances.clone(),
-                    nonces.clone(),
-                    commitments.clone(),
-                    available.clone(),
+                    &apply,
                 )
                 .map_err(|e| ProduceError::HeaderBuild(format!("commit failed: {e:?}")))?;
 
@@ -1212,10 +1237,10 @@ impl Node {
             self.mempool.revalidate_affordability(&view, &self.chain.fee_state);
             self.mempool.evict_stale(self.chain.height);
 
-            res
+            apply
         } else {
-            // Networked mode: skip local commit and return a dummy ApplyResult copy for callers that log it.
-            apply.clone()
+            // Networked mode: skip local commit and return the simulated ApplyResult.
+            apply
         };
 
         // HotStuff: broadcast proposal and handle consensus
@@ -1224,17 +1249,18 @@ impl Node {
             let now_ms = (Self::now_ts() as u128) * 1000;
             if let Some(hs) = self.hotstuff.as_mut() {
                 hs.observe_block_header(&built.block.header);
-                let _ = hs.on_block_proposal(built.block.clone(), now_ms);
+                let _ = hs.on_block_proposal(&built.block, now_ms);
             }
 
             // Store our own proposed block so we can commit it on QC later
             let bid = crate::codec::header_id(&built.block.header);
-            self.block_store.insert(bid, built.block.clone());
+            let stored_block = built.block.clone();
+            self.block_store.insert(bid, stored_block.clone());
 
             // Broadcast the proposal to all validators (include parent block if available)
             if let Some(network) = self.consensus_network.as_ref() {
                 let parent_opt = self.block_store.get(&built.block.header.parent_hash).cloned();
-                if let Err(e) = network.broadcast_proposal(built.block.clone(), parent_opt) {
+                if let Err(e) = network.broadcast_proposal(stored_block.clone(), parent_opt) {
                     eprintln!("Failed to broadcast proposal: {}", e);
                 }
 
@@ -1244,7 +1270,7 @@ impl Node {
                 if let Some(hs) = self.hotstuff.as_ref() {
                     let my_id = hs.validator_id;
                     // Ignore errors here to avoid blocking liveness on local validation quirks; peers will vet too.
-                    let _ = self.handle_proposal(built.block.clone(), my_id);
+                    let _ = self.handle_proposal(&stored_block, my_id);
                 }
             } else if let Some(hs) = self.hotstuff.as_mut() {
                 // Single-process fallback: vote and drive QC locally
@@ -1561,7 +1587,7 @@ mod tests {
         bitmap.set(0, true);
         let qc0 = QC { view: 0, block_id: genesis_id, agg_sig, bitmap };
 
-        let mut pm = Pacemaker::new(1000, 10000, 2, 1);
+        let mut pm = Pacemaker::new(1000, 10000, 2, 1, 1, 1);
         pm.on_enter_view(node.chain.now_ts());
         let hs_state = HotStuffState { current_view: 1, locked_block: (genesis_id, 0), high_qc: qc0, pacemaker: pm };
         node.hotstuff = Some(HotStuff::new(hs_state, vec![bls_pk], 0, Some(bls_signer)));

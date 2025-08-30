@@ -117,7 +117,7 @@ impl HotStuff {
         }
     }
 
-    pub fn on_block_proposal(&mut self, block: Block, _now_ms: u128) -> Result<(), Error> {
+    pub fn on_block_proposal(&mut self, block: &Block, _now_ms: u128) -> Result<(), Error> {
         // Any validator can validate proposals from any other validator
 
         let committed = qc_commitment(

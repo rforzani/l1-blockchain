@@ -67,7 +67,7 @@ fn proposal_triggers_qc_creation() {
     let qc1 = build_qc(block1_id, 1, &signers);
 
     // pacemaker state
-    let mut base_pm = Pacemaker::new(1000, 10000, 2, 1);
+    let mut base_pm = Pacemaker::new(1000, 10000, 2, 1, 1, 1);
     base_pm.on_enter_view(0);
 
     // create validators

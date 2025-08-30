@@ -75,10 +75,12 @@ fn create_test_node_with_shared_validators(
     
     // Set up HotStuff consensus
     let pacemaker_config = PacemakerConfig {
-        base_timeout_ms: 1000,
+        base_timeout_ms: 500,
         max_timeout_ms: 10000,
         backoff_num: 3,
         backoff_den: 2,
+        safety_num: 1,
+        safety_den: 1,
     };
     
     let consensus_config = ConsensusConfig {
@@ -90,7 +92,7 @@ fn create_test_node_with_shared_validators(
     
     // Override the HotStuff state with proper configuration  
     let now_ms = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()) as u128;
-    let mut pacemaker = Pacemaker::new(1000, 10000, 3, 2);
+    let mut pacemaker = Pacemaker::new(500, 10000, 3, 2, 1, 1);
     pacemaker.on_enter_view(now_ms);
     
     let hs_state = HotStuffState {
