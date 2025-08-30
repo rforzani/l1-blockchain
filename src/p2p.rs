@@ -103,6 +103,8 @@ impl From<kad::Event> for P2PEvent {
 pub struct P2PConfig {
     pub listen_addr: Multiaddr,
     pub bootstrap_peers: Vec<Multiaddr>,
+    pub min_peers: usize,
+    pub target_peers: usize,
     pub max_peers: usize,
 }
 
@@ -111,7 +113,9 @@ impl Default for P2PConfig {
         Self {
             listen_addr: "/ip4/0.0.0.0/tcp/0".parse().unwrap(),
             bootstrap_peers: Vec::new(),
-            max_peers: 50,
+            min_peers: 2,
+            target_peers: 10,
+            max_peers: 20,
         }
     }
 }
@@ -129,8 +133,14 @@ pub struct ConsensusNetwork {
     command_tx: mpsc::UnboundedSender<NetworkCommand>,
     /// Connected peers mapped to validator IDs
     peers: Arc<Mutex<HashMap<PeerId, ValidatorId>>>,
+    /// Reverse mapping validator -> peer (best known)
+    validator_to_peer: Arc<Mutex<HashMap<ValidatorId, PeerId>>>,
     /// Our local PeerId
     local_peer_id: PeerId,
+    /// Discovery thresholds
+    min_peers: usize,
+    target_peers: usize,
+    max_peers: usize,
 }
 
 /// Commands for the P2P network task
@@ -140,6 +150,7 @@ enum NetworkCommand {
     SendToValidator(ValidatorId, ConsensusMessage),
     ConnectPeer(Multiaddr),
     GetConnectedPeers,
+    TriggerDiscovery,
 }
 
 impl ConsensusNetwork {
@@ -234,13 +245,18 @@ impl ConsensusNetwork {
         swarm.listen_on(config.listen_addr.clone())?;
         
         let peers = Arc::new(Mutex::new(HashMap::new()));
+        let v2p = Arc::new(Mutex::new(HashMap::new()));
         let network = Self {
             validator_id,
             message_rx: Arc::new(Mutex::new(message_rx)),
             message_tx,
             command_tx,
             peers: peers.clone(),
+            validator_to_peer: v2p.clone(),
             local_peer_id,
+            min_peers: config.min_peers,
+            target_peers: config.target_peers,
+            max_peers: config.max_peers,
         };
         
         // Spawn the network event loop
@@ -250,6 +266,12 @@ impl ConsensusNetwork {
             message_tx: network.message_tx.clone(),
             peers,
             validator_id,
+            validator_to_peer: v2p,
+            bootstrap_peers: config.bootstrap_peers.clone(),
+            min_peers: network.min_peers,
+            target_peers: network.target_peers,
+            max_peers: network.max_peers,
+            discovery_tick: tokio::time::interval(Duration::from_secs(3)),
         };
         
         tokio::spawn(network_task.run());
@@ -357,6 +379,11 @@ impl ConsensusNetwork {
     pub fn connected_peers(&self) -> usize {
         self.peers.lock().unwrap().len()
     }
+
+    /// Snapshot PeerIds
+    pub fn peer_ids(&self) -> Vec<PeerId> {
+        self.peers.lock().unwrap().keys().cloned().collect()
+    }
 }
 
 /// Network task handling P2P events
@@ -366,6 +393,12 @@ struct NetworkTask {
     message_tx: broadcast::Sender<ConsensusMessage>,
     peers: Arc<Mutex<HashMap<PeerId, ValidatorId>>>,
     validator_id: ValidatorId,
+    validator_to_peer: Arc<Mutex<HashMap<ValidatorId, PeerId>>>,
+    bootstrap_peers: Vec<Multiaddr>,
+    min_peers: usize,
+    target_peers: usize,
+    max_peers: usize,
+    discovery_tick: tokio::time::Interval,
 }
 
 impl NetworkTask {
@@ -374,6 +407,9 @@ impl NetworkTask {
         
         loop {
             tokio::select! {
+                _ = self.discovery_tick.tick() => {
+                    self.check_and_discover().await;
+                }
                 command = self.command_rx.recv() => {
                     if let Some(cmd) = command {
                         self.handle_command(cmd).await;
@@ -416,17 +452,20 @@ impl NetworkTask {
                 let peers = self.peers.lock().unwrap();
                 info!("Connected peers: {:?}", peers.keys().collect::<Vec<_>>());
             }
+            NetworkCommand::TriggerDiscovery => {
+                self.run_discovery_round().await;
+            }
         }
     }
     
     async fn handle_swarm_event(&mut self, event: SwarmEvent<P2PEvent>) {
         match event {
             SwarmEvent::Behaviour(P2PEvent::Gossipsub(gossipsub::Event::Message {
-                propagation_source: _,
+                propagation_source,
                 message_id: _,
                 message,
             })) => {
-                self.handle_gossipsub_message(message).await;
+                self.handle_gossipsub_message(propagation_source, message).await;
             }
             
             SwarmEvent::Behaviour(P2PEvent::Mdns(mdns::Event::Discovered(list))) => {
@@ -474,9 +513,18 @@ impl NetworkTask {
         }
     }
     
-    async fn handle_gossipsub_message(&mut self, message: gossipsub::Message) {
+    async fn handle_gossipsub_message(&mut self, source: PeerId, message: gossipsub::Message) {
         if let Ok(consensus_msg) = serde_json::from_slice::<ConsensusMessage>(&message.data) {
             debug!("Received consensus message: {:?}", consensus_msg);
+            // Learn validator_id -> peer mapping
+            match &consensus_msg {
+                ConsensusMessage::Proposal { sender_id, .. } |
+                ConsensusMessage::Vote { sender_id, .. } |
+                ConsensusMessage::QC { sender_id, .. } |
+                ConsensusMessage::ViewChange { sender_id, .. } => {
+                    self.validator_to_peer.lock().unwrap().insert(*sender_id, source);
+                }
+            }
             if let Err(e) = self.message_tx.send(consensus_msg) {
                 error!("Failed to forward consensus message: {}", e);
             }
@@ -503,9 +551,28 @@ impl NetworkTask {
     }
     
     async fn send_to_validator(&mut self, _validator_id: ValidatorId, msg: ConsensusMessage) -> Result<()> {
-        // For now, we broadcast to all peers since we don't have validator<->peer mapping
-        // In production, this would require a registry or handshake to map validators to peer IDs
+        // For now, we still broadcast (gossipsub). Mapping is kept for future direct channels.
         self.broadcast_consensus_message(msg).await
+    }
+
+    async fn check_and_discover(&mut self) {
+        let current = self.peers.lock().unwrap().len();
+        if current < self.min_peers {
+            info!("Peers below min ({} < {}), triggering discovery", current, self.min_peers);
+            self.run_discovery_round().await;
+        }
+        // Optional pruning when above max: left as future work
+    }
+
+    async fn run_discovery_round(&mut self) {
+        // Dial bootstraps
+        for addr in self.bootstrap_peers.clone() {
+            let _ = self.swarm.dial(addr);
+        }
+        // Try a Kademlia bootstrap and a closest-peers lookup
+        let _ = self.swarm.behaviour_mut().kademlia.bootstrap();
+        let local_id = self.swarm.local_peer_id().clone();
+        self.swarm.behaviour_mut().kademlia.get_closest_peers(local_id);
     }
 }
 
@@ -543,7 +610,9 @@ pub async fn create_test_network(validator_ids: Vec<ValidatorId>) -> Result<Vec<
             let config = P2PConfig {
                 listen_addr: format!("/ip4/127.0.0.1/tcp/{}", candidate).parse()?,
                 bootstrap_peers: Vec::new(),
-                max_peers: 50,
+                min_peers: 2,
+                target_peers: 10,
+                max_peers: 20,
             };
 
             match ConsensusNetwork::new(id, config.clone()).await {
