@@ -531,6 +531,45 @@ impl Node {
         Ok(committed_blocks)
     }
 
+    /// Process a single consensus message (new async-driven path)
+    pub fn process_consensus_message(&mut self, msg: crate::p2p::ConsensusMessage) -> Result<Vec<Hash>, String> {
+        let mut committed_blocks = Vec::new();
+        match msg {
+            crate::p2p::ConsensusMessage::Proposal { block, parent, sender_id } => {
+                if let Some(pb) = parent {
+                    if let Err(e) = self.handle_proposal(pb, sender_id) {
+                        eprintln!("Error handling parent proposal from {}: {}", sender_id, e);
+                    }
+                }
+                if let Err(e) = self.handle_proposal(block, sender_id) {
+                    eprintln!("Error handling proposal from {}: {}", sender_id, e);
+                }
+            }
+            crate::p2p::ConsensusMessage::Vote { vote, leader_id: _, sender_id } => {
+                if let Some(committed) = self.handle_vote(vote, sender_id)? {
+                    if let Err(e) = self.apply_committed_block(committed) {
+                        eprintln!("Failed to apply committed block: {}", e);
+                    }
+                    self.try_apply_pending_commits();
+                    committed_blocks.push(committed);
+                }
+            }
+            crate::p2p::ConsensusMessage::QC { qc, sender_id } => {
+                if let Some(committed) = self.handle_qc(qc, sender_id)? {
+                    if let Err(e) = self.apply_committed_block(committed) {
+                        eprintln!("Failed to apply committed block from QC: {}", e);
+                    }
+                    self.try_apply_pending_commits();
+                    committed_blocks.push(committed);
+                }
+            }
+            crate::p2p::ConsensusMessage::ViewChange { view, sender_id, timeout_qc } => {
+                self.handle_view_change(view, sender_id, timeout_qc)?;
+            }
+        }
+        Ok(committed_blocks)
+    }
+
     /// Handle an incoming block proposal
     fn handle_proposal(&mut self, block: Block, sender_id: ValidatorId) -> Result<(), String> {
         // 1) HotStuff header observation and validation
@@ -624,6 +663,10 @@ impl Node {
     fn handle_qc(&mut self, qc: QC, sender_id: ValidatorId) -> Result<Option<Hash>, String> {
         if let Some(hs) = self.hotstuff.as_mut() {
             let now_ms = (Self::now_ts() as u128) * 1000;
+            // Measure elapsed time in the view we are leaving (before pacemaker resets)
+            let prev_view_start = hs.state.pacemaker.view_start_ms;
+            let measured = now_ms.saturating_sub(prev_view_start) as u64;
+
             let res = hs
                 .on_qc_self(qc, now_ms)
                 .map_err(|e| format!("Failed to process QC: {:?}", e))?;
@@ -632,6 +675,8 @@ impl Node {
             let next_view = hs.state.current_view;
             let my_id = hs.validator_id;
             let n = hs.validator_pks.len();
+            // Feed observed latency into pacemaker (will affect subsequent views)
+            hs.state.pacemaker.observe_qc_latency(measured);
             drop(hs);
 
             // If I'm the leader for the current view and haven't proposed yet, propose immediately

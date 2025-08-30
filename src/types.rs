@@ -81,6 +81,14 @@ pub struct Pacemaker {
     /// backoff multiplier numerator/denominator (e.g., 3/2 = 1.5x)
     pub backoff_num: u64,
     pub backoff_den: u64,
+    /// EWMA of observed QC latencies (ms)
+    pub latency_ewma_ms: u64,
+    /// EWMA alpha fraction (alpha = num/den), e.g., 1/4
+    pub ewma_alpha_num: u64,
+    pub ewma_alpha_den: u64,
+    /// Safety factor applied to latency when deriving timeout (num/den)
+    pub safety_num: u64,
+    pub safety_den: u64,
 }
 
 impl Pacemaker {
@@ -92,13 +100,22 @@ impl Pacemaker {
             max_timeout_ms,
             backoff_num: backoff_num.max(1),
             backoff_den: backoff_den.max(1),
+            latency_ewma_ms: base_timeout_ms,
+            ewma_alpha_num: 1,
+            ewma_alpha_den: 4,
+            safety_num: 3,
+            safety_den: 2,
         }
     }
 
     /// Call when you switch to a new view.
     pub fn on_enter_view(&mut self, now_ms: u128) {
         self.view_start_ms = now_ms;
-        self.current_timeout_ms = self.base_timeout_ms;
+        // Derive timeout from observed latency EWMA with safety factor, clamped to [base, max].
+        let mut suggested = (self.latency_ewma_ms.saturating_mul(self.safety_num)) / self.safety_den;
+        if suggested < self.base_timeout_ms { suggested = self.base_timeout_ms; }
+        if suggested > self.max_timeout_ms { suggested = self.max_timeout_ms; }
+        self.current_timeout_ms = suggested;
     }
 
     /// Returns true if the current view's timer expired at `now_ms`.
@@ -108,14 +125,30 @@ impl Pacemaker {
 
     /// Bump the timeout using configured backoff, capped at `max_timeout_ms`.
     pub fn bump_backoff(&mut self) {
-        let mut next = (self.current_timeout_ms.saturating_mul(self.backoff_num)) / self.backoff_den;
-        if next < self.base_timeout_ms {
-            next = self.base_timeout_ms;
-        }
-        if next > self.max_timeout_ms {
-            next = self.max_timeout_ms;
-        }
+        // Backoff path
+        let mut backoff_next = (self.current_timeout_ms.saturating_mul(self.backoff_num)) / self.backoff_den;
+        if backoff_next < self.base_timeout_ms { backoff_next = self.base_timeout_ms; }
+        if backoff_next > self.max_timeout_ms { backoff_next = self.max_timeout_ms; }
+
+        // Suggested from EWMA
+        let mut suggested = (self.latency_ewma_ms.saturating_mul(self.safety_num)) / self.safety_den;
+        if suggested < self.base_timeout_ms { suggested = self.base_timeout_ms; }
+        if suggested > self.max_timeout_ms { suggested = self.max_timeout_ms; }
+
+        let mut next = backoff_next.max(suggested);
+        if next > self.max_timeout_ms { next = self.max_timeout_ms; }
         self.current_timeout_ms = next;
+    }
+
+    /// Observe a QC latency sample (ms) and update EWMA.
+    pub fn observe_qc_latency(&mut self, sample_ms: u64) {
+        let a_num = self.ewma_alpha_num.max(1);
+        let a_den = self.ewma_alpha_den.max(1);
+        // ewma = (1-alpha)*ewma + alpha*sample
+        let ewma = self.latency_ewma_ms;
+        let one_minus_num = a_den.saturating_sub(a_num);
+        let updated = (ewma.saturating_mul(one_minus_num) + sample_ms.saturating_mul(a_num)) / a_den;
+        self.latency_ewma_ms = updated.max(1);
     }
 }
 

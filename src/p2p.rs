@@ -104,6 +104,8 @@ impl From<kad::Event> for P2PEvent {
 pub struct P2PConfig {
     pub listen_addr: Multiaddr,
     pub bootstrap_peers: Vec<Multiaddr>,
+    /// Whether to also publish consensus messages via gossipsub (fallback)
+    pub use_gossip_fallback: bool,
     pub min_peers: usize,
     pub target_peers: usize,
     pub max_peers: usize,
@@ -114,6 +116,7 @@ impl Default for P2PConfig {
         Self {
             listen_addr: "/ip4/0.0.0.0/tcp/0".parse().unwrap(),
             bootstrap_peers: Vec::new(),
+            use_gossip_fallback: false,
             min_peers: 2,
             target_peers: 10,
             max_peers: 20,
@@ -136,12 +139,14 @@ pub struct ConsensusNetwork {
     peers: Arc<Mutex<HashMap<PeerId, ValidatorId>>>,
     /// Reverse mapping validator -> peer (best known)
     validator_to_peer: Arc<Mutex<HashMap<ValidatorId, PeerId>>>,
+    direct_peers: Arc<Mutex<HashMap<ValidatorId, broadcast::Sender<ConsensusMessage>>>>,
     /// Our local PeerId
     local_peer_id: PeerId,
     /// Discovery thresholds
     min_peers: usize,
     target_peers: usize,
     max_peers: usize,
+    use_gossip_fallback: bool,
 }
 
 /// Commands for the P2P network task
@@ -259,10 +264,12 @@ impl ConsensusNetwork {
             command_tx,
             peers: peers.clone(),
             validator_to_peer: v2p.clone(),
+            direct_peers: Arc::new(Mutex::new(HashMap::new())),
             local_peer_id,
             min_peers: config.min_peers,
             target_peers: config.target_peers,
             max_peers: config.max_peers,
+            use_gossip_fallback: config.use_gossip_fallback,
         };
         
         // Spawn the network event loop
@@ -305,8 +312,17 @@ impl ConsensusNetwork {
             parent,
             sender_id: self.validator_id,
         };
-        
-        self.broadcast_message(msg)
+        // Direct to all peers
+        if !self.direct_peers.lock().unwrap().is_empty() {
+            for (vid, tx) in self.direct_peers.lock().unwrap().iter() {
+                if *vid == self.validator_id { continue; }
+                let _ = tx.send(msg.clone());
+            }
+        }
+        if self.use_gossip_fallback {
+            self.broadcast_message(msg)?;
+        }
+        Ok(())
     }
 
     /// Send a vote to the leader of the next view
@@ -316,7 +332,13 @@ impl ConsensusNetwork {
             leader_id,
             sender_id: self.validator_id,
         };
-        self.send_to_validator(leader_id, msg)
+        if let Some(tx) = self.direct_peers.lock().unwrap().get(&leader_id) {
+            let _ = tx.send(msg.clone());
+        }
+        if self.use_gossip_fallback {
+            self.send_to_validator(leader_id, msg)?;
+        }
+        Ok(())
     }
 
     /// Broadcast a QC to all connected peers
@@ -325,8 +347,16 @@ impl ConsensusNetwork {
             qc,
             sender_id: self.validator_id,
         };
-        
-        self.broadcast_message(msg)
+        if !self.direct_peers.lock().unwrap().is_empty() {
+            for (vid, tx) in self.direct_peers.lock().unwrap().iter() {
+                if *vid == self.validator_id { continue; }
+                let _ = tx.send(msg.clone());
+            }
+        }
+        if self.use_gossip_fallback {
+            self.broadcast_message(msg)?;
+        }
+        Ok(())
     }
 
     /// Broadcast a view change message
@@ -336,8 +366,16 @@ impl ConsensusNetwork {
             sender_id: self.validator_id,
             timeout_qc,
         };
-        
-        self.broadcast_message(msg)
+        if !self.direct_peers.lock().unwrap().is_empty() {
+            for (vid, tx) in self.direct_peers.lock().unwrap().iter() {
+                if *vid == self.validator_id { continue; }
+                let _ = tx.send(msg.clone());
+            }
+        }
+        if self.use_gossip_fallback {
+            self.broadcast_message(msg)?;
+        }
+        Ok(())
     }
 
     /// Try to receive a consensus message (non-blocking)
@@ -355,6 +393,12 @@ impl ConsensusNetwork {
                 None
             }
         }
+    }
+
+    /// Subscribe to the consensus message stream to await messages asynchronously.
+    /// Each subscriber gets its own cursor over the broadcast channel.
+    pub fn subscribe(&self) -> broadcast::Receiver<ConsensusMessage> {
+        self.message_tx.subscribe()
     }
 
     /// Send a message to a specific validator
@@ -389,6 +433,11 @@ impl ConsensusNetwork {
     /// Snapshot PeerIds
     pub fn peer_ids(&self) -> Vec<PeerId> {
         self.peers.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// Install direct peer map (validator_id -> sender) for in-process routing.
+    pub fn install_direct_peers(&self, map: HashMap<ValidatorId, broadcast::Sender<ConsensusMessage>>) {
+        *self.direct_peers.lock().unwrap() = map;
     }
 }
 
@@ -616,6 +665,7 @@ pub async fn create_test_network(validator_ids: Vec<ValidatorId>) -> Result<Vec<
             let config = P2PConfig {
                 listen_addr: format!("/ip4/127.0.0.1/tcp/{}", candidate).parse()?,
                 bootstrap_peers: Vec::new(),
+                use_gossip_fallback: false,
                 min_peers: 2,
                 target_peers: 10,
                 max_peers: 20,
@@ -646,6 +696,13 @@ pub async fn create_test_network(validator_ids: Vec<ValidatorId>) -> Result<Vec<
 
     // Connect each network to all others using the determined listen ports
     for (i, network) in networks.iter().enumerate() {
+        // Install direct peer map for in-process routing
+        let mut map: HashMap<ValidatorId, broadcast::Sender<ConsensusMessage>> = HashMap::new();
+        for (j, net_j) in networks.iter().enumerate() {
+            if i == j { continue; }
+            map.insert(validator_ids[j], net_j.message_tx.clone());
+        }
+        network.install_direct_peers(map);
         for (j, &port) in listen_ports.iter().enumerate() {
             if i != j {
                 let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", port).parse()?;

@@ -161,15 +161,30 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
-        // Fast consensus message processing + pacemaker timeout checks
+        // Fast consensus message processing: await messages and handle immediately
         let node2 = nodes[i].clone();
         tokio::spawn(async move {
-            let mut tick = interval(Duration::from_millis(10));
+            // Obtain a dedicated subscription to the consensus network
+            let mut rx_opt = { node2.lock().unwrap().consensus_network().map(|net| net.subscribe()) };
             loop {
-                tick.tick().await;
-                let mut n = node2.lock().unwrap();
-                let _ = n.process_consensus_messages();
-                let _ = n.check_pacemaker_timeout();
+                if let Some(rx) = rx_opt.as_mut() {
+                    match rx.recv().await {
+                        Ok(msg) => {
+                            let mut n = node2.lock().unwrap();
+                            let _ = n.process_consensus_message(msg);
+                            let _ = n.check_pacemaker_timeout();
+                        }
+                        Err(_) => {
+                            // Re-subscribe on channel closed
+                            rx_opt = { node2.lock().unwrap().consensus_network().map(|net| net.subscribe()) };
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    }
+                } else {
+                    // No network yet; backoff a bit and retry
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    rx_opt = { node2.lock().unwrap().consensus_network().map(|net| net.subscribe()) };
+                }
             }
         });
     }
