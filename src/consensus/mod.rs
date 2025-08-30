@@ -91,6 +91,24 @@ impl HotStuff {
         self.parent_index.insert(id, header.parent_hash);
     }
 
+    // --- Debug helpers ---
+    /// Snapshot the current vote aggregators as (view, block_id, votes_collected)
+    pub fn debug_aggregators(&self) -> Vec<(u64, Hash, usize)> {
+        let mut out = Vec::with_capacity(self.aggregators.len());
+        for ((_view, _bid), agg) in self.aggregators.iter() {
+            out.push((agg.view, agg.block_id, agg.bitmap.count_ones()));
+        }
+        out
+    }
+
+    /// Parent index size
+    pub fn debug_parent_index_len(&self) -> usize { self.parent_index.len() }
+
+    /// Sample parent links (up to `limit`)
+    pub fn debug_parent_index_sample(&self, limit: usize) -> Vec<(Hash, Hash)> {
+        self.parent_index.iter().take(limit).map(|(k,v)| (*k, *v)).collect()
+    }
+
     pub fn on_new_slot(&mut self, now_ms: u128) {
         if self.state.pacemaker.expired(now_ms) {
             self.state.current_view += 1;

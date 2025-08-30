@@ -26,6 +26,7 @@ pub enum ConsensusMessage {
     /// Block proposal from a leader to all validators
     Proposal {
         block: Block,
+        parent: Option<Block>,
         sender_id: ValidatorId,
     },
     /// Vote from a validator to the leader of next view
@@ -270,9 +271,10 @@ impl ConsensusNetwork {
     }
 
     /// Broadcast a proposal to all connected peers
-    pub fn broadcast_proposal(&self, block: Block) -> Result<()> {
+    pub fn broadcast_proposal(&self, block: Block, parent: Option<Block>) -> Result<()> {
         let msg = ConsensusMessage::Proposal {
             block,
+            parent,
             sender_id: self.validator_id,
         };
         

@@ -160,6 +160,13 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/consensus", get(consensus_status))
+        // Debug endpoints
+        .route("/debug/mempool", get(debug_mempool))
+        .route("/debug/hotstuff", get(debug_hotstuff))
+        .route("/debug/block_store", get(debug_block_store))
+        .route("/debug/pending_commits", get(debug_pending_commits))
+        .route("/debug/leader", get(debug_leader))
+        .route("/debug/last_apply_error", get(debug_last_apply_error))
         .route("/balance/:addr", get(balance))
         .route("/mempool/commit", post(submit_commit))
         .route("/mempool/avail",  post(submit_avail))
@@ -227,6 +234,127 @@ async fn consensus_status(State(state): State<AppState>) -> Json<ConsensusStatus
 async fn balance(State(state): State<AppState>, Path(addr): Path<String>) -> Json<BalanceResp> {
     let node = state.node.lock().unwrap();
     Json(BalanceResp { address: addr.clone(), balance: node.balance_of(&addr) })
+}
+
+// --------------- Debug endpoints ---------------
+
+#[derive(Serialize)]
+struct MempoolDebugResp {
+    commits: usize,
+    avails: usize,
+    reveals: usize,
+}
+
+async fn debug_mempool(State(state): State<AppState>) -> Json<MempoolDebugResp> {
+    let node = state.node.lock().unwrap();
+    let (commits, avails, reveals) = node.debug_mempool_counts();
+    Json(MempoolDebugResp { commits, avails, reveals })
+}
+
+#[derive(Serialize)]
+struct AggregatorEntryResp {
+    view: u64,
+    block_id: String,
+    votes: usize,
+    quorum: usize,
+}
+
+#[derive(Serialize)]
+struct HotStuffDebugResp {
+    current_view: Option<u64>,
+    high_qc_view: Option<u64>,
+    locked_view: Option<u64>,
+    validator_id: Option<u64>,
+    aggregators: Vec<AggregatorEntryResp>,
+    parent_index_len: Option<usize>,
+}
+
+async fn debug_hotstuff(State(state): State<AppState>) -> Json<HotStuffDebugResp> {
+    let node = state.node.lock().unwrap();
+    let mut resp = HotStuffDebugResp {
+        current_view: None,
+        high_qc_view: None,
+        locked_view: None,
+        validator_id: None,
+        aggregators: Vec::new(),
+        parent_index_len: None,
+    };
+    if let Some(hs) = node.hotstuff() {
+        resp.current_view = Some(hs.state.current_view);
+        resp.high_qc_view = Some(hs.state.high_qc.view);
+        resp.locked_view = Some(hs.state.locked_block.1);
+        resp.validator_id = Some(hs.validator_id as u64);
+        resp.parent_index_len = node.debug_parent_index_len();
+    }
+    if let Some(entries) = node.debug_hotstuff_aggregators() {
+        for (view, bid, votes, quorum) in entries {
+            resp.aggregators.push(AggregatorEntryResp { view, block_id: hex::encode(bid), votes, quorum });
+        }
+    }
+    Json(resp)
+}
+
+#[derive(Serialize)]
+struct BlockStoreEntryResp {
+    id: String,
+    height: u64,
+    view: u64,
+    parent: String,
+    justify_view: u64,
+}
+
+#[derive(Serialize)]
+struct BlockStoreDebugResp {
+    total: usize,
+    sample: Vec<BlockStoreEntryResp>,
+}
+
+async fn debug_block_store(State(state): State<AppState>) -> Json<BlockStoreDebugResp> {
+    let node = state.node.lock().unwrap();
+    let sample = node.debug_block_store_sample(20);
+    let mut out = Vec::new();
+    for (id, h, v, parent, jv) in sample {
+        out.push(BlockStoreEntryResp { id: hex::encode(id), height: h, view: v, parent: hex::encode(parent), justify_view: jv });
+    }
+    Json(BlockStoreDebugResp { total: out.len(), sample: out })
+}
+
+#[derive(Serialize)]
+struct PendingCommitsResp { commits: Vec<String> }
+
+async fn debug_pending_commits(State(state): State<AppState>) -> Json<PendingCommitsResp> {
+    let node = state.node.lock().unwrap();
+    let commits = node.debug_pending_commits().into_iter().map(|h| hex::encode(h)).collect();
+    Json(PendingCommitsResp { commits })
+}
+
+#[derive(Serialize)]
+struct LeaderDebugResp {
+    current_view: Option<u64>,
+    leader_id: Option<u64>,
+    mine: Option<u64>,
+    last_proposed_view: Option<u64>,
+}
+
+async fn debug_leader(State(state): State<AppState>) -> Json<LeaderDebugResp> {
+    let node = state.node.lock().unwrap();
+    let mut resp = LeaderDebugResp { current_view: None, leader_id: None, mine: None, last_proposed_view: node.debug_last_proposed_view() };
+    if let Some(hs) = node.hotstuff() {
+        let n = hs.validator_pks.len();
+        let leader = crate::p2p::simple_leader_election(hs.state.current_view, n);
+        resp.current_view = Some(hs.state.current_view);
+        resp.leader_id = Some(leader as u64);
+        resp.mine = Some(hs.validator_id as u64);
+    }
+    Json(resp)
+}
+
+#[derive(Serialize)]
+struct LastApplyErrorResp { error: Option<String> }
+
+async fn debug_last_apply_error(State(state): State<AppState>) -> Json<LastApplyErrorResp> {
+    let node = state.node.lock().unwrap();
+    Json(LastApplyErrorResp { error: node.debug_last_apply_error() })
 }
 
 async fn submit_commit(State(state): State<AppState>, Json(req): Json<CommitReq>) -> Result<Json<SubmitResp>, (StatusCode, String)> {

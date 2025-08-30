@@ -93,6 +93,8 @@ pub struct Node {
     last_proposed_view: Option<u64>,
     /// Pending commit targets (header ids) awaiting prerequisites (block/parent)
     pending_commits: HashSet<Hash>,
+    /// Last error when trying to apply a committed block (for debug)
+    last_apply_error: Option<String>,
 }
 
 struct NodeStateView<'a> {
@@ -156,6 +158,7 @@ impl Node {
             block_store: HashMap::new(),
             last_proposed_view: None,
             pending_commits: HashSet::new(),
+            last_apply_error: None,
         }
     }
 
@@ -371,10 +374,19 @@ impl Node {
         }
 
         // Apply and verify. This mutates chain.tip_hash, height, fees, and writes to balances/nonces/etc.
-        let _res = self
+        match self
             .chain
             .apply_block(&block, &mut self.balances, &mut self.nonces, &mut self.commitments, &mut self.available)
-            .map_err(|e| format!("apply_block failed: {:?}", e))?;
+        {
+            Ok(_res) => {
+                self.last_apply_error = None;
+            }
+            Err(e) => {
+                let msg = format!("apply_block failed: {:?}", e);
+                self.last_apply_error = Some(msg.clone());
+                return Err(msg);
+            }
+        }
 
         // Best-effort mempool maintenance: mark included txs and revalidate
         let mut included: Vec<TxId> = Vec::new();
@@ -440,7 +452,13 @@ impl Node {
         // Now process all collected messages
         for msg in messages {
             match msg {
-                ConsensusMessage::Proposal { block, sender_id } => {
+                ConsensusMessage::Proposal { block, parent, sender_id } => {
+                    // If sender included the parent block, store/validate it first
+                    if let Some(pb) = parent {
+                        if let Err(e) = self.handle_proposal(pb, sender_id) {
+                            eprintln!("Error handling parent proposal from {}: {}", sender_id, e);
+                        }
+                    }
                     if let Err(e) = self.handle_proposal(block, sender_id) {
                         eprintln!("Error handling proposal from {}: {}", sender_id, e);
                     }
@@ -474,58 +492,60 @@ impl Node {
 
     /// Handle an incoming block proposal
     fn handle_proposal(&mut self, block: Block, sender_id: ValidatorId) -> Result<(), String> {
-        if let Some(hotstuff) = self.hotstuff.as_mut() {
+        // 1) HotStuff header observation and validation
+        if let Some(hs) = self.hotstuff.as_mut() {
             let now_ms = (Self::now_ts() as u128) * 1000;
-            
-            // Validate the proposal
-            hotstuff.observe_block_header(&block.header);
-            hotstuff.on_block_proposal(block.clone(), now_ms)
+            hs.observe_block_header(&block.header);
+            hs.on_block_proposal(block.clone(), now_ms)
                 .map_err(|e| format!("Block proposal validation failed: {:?}", e))?;
+        }
 
-            // Store block for potential future commit
-            let bid = crate::codec::header_id(&block.header);
-            self.block_store.insert(bid, block.clone());
-
-            // Ensure we have the batch payload referenced by this block in our store
-            if !block.batch_digests.is_empty() {
-                let parent_count = block.batch_digests.len().saturating_sub(1);
-                let parents = if parent_count > 0 {
-                    block.batch_digests[..parent_count].to_vec()
-                } else { Vec::new() };
-                if let Some(&expected_id) = block.batch_digests.last() {
-                    let batch = Batch::new(block.transactions.clone(), parents, block.header.proposer_id, [0u8; 64]);
-                    if batch.id == expected_id {
-                        if self.chain.batch_store.get(&batch.id).is_none() {
-                            self.chain.batch_store.insert(batch);
-                        }
-                    } else {
-                        eprintln!(
-                            "Warning: batch id mismatch for proposed block: expected {}, computed {}",
-                            hex::encode(expected_id),
-                            hex::encode(batch.id)
-                        );
+        // 2) Store the block and ensure batch payloads exist locally
+        let bid = crate::codec::header_id(&block.header);
+        self.block_store.insert(bid, block.clone());
+        if !block.batch_digests.is_empty() {
+            let parent_count = block.batch_digests.len().saturating_sub(1);
+            let parents = if parent_count > 0 { block.batch_digests[..parent_count].to_vec() } else { Vec::new() };
+            if let Some(&expected_id) = block.batch_digests.last() {
+                let batch = Batch::new(block.transactions.clone(), parents, block.header.proposer_id, [0u8; 64]);
+                if batch.id == expected_id {
+                    if self.chain.batch_store.get(&batch.id).is_none() {
+                        self.chain.batch_store.insert(batch);
                     }
+                } else {
+                    eprintln!(
+                        "Warning: batch id mismatch for proposed block: expected {}, computed {}",
+                        hex::encode(expected_id),
+                        hex::encode(batch.id)
+                    );
                 }
             }
+        }
 
-            // New information might unblock pending commits; perform after releasing hotstuff borrow
-        
-            // Generate and send vote if we should vote on this proposal
-            if let Some(vote) = hotstuff.maybe_vote_self(&block) {
-                // First, count our own vote locally so our aggregator can reach quorum
-                if let Some(qc) = hotstuff.on_vote(vote.clone()) {
-                    // If our self-vote completes a QC, broadcast it immediately
+        // 3) Now that we've indexed the header, try to commit using the best QC
+        if let Some(hs) = self.hotstuff.as_mut() {
+            let now_ms = (Self::now_ts() as u128) * 1000;
+            if let Ok(Some(committed)) = hs.on_qc_self(hs.state.high_qc.clone(), now_ms) {
+                if let Err(e) = self.apply_committed_block(committed) {
+                    eprintln!("Failed to apply committed block via high_qc refresh: {}", e);
+                }
+                self.try_apply_pending_commits();
+            }
+        }
+
+        // 4) Generate and send vote if we should vote on this proposal
+        if let Some(hs) = self.hotstuff.as_mut() {
+            if let Some(vote) = hs.maybe_vote_self(&block) {
+                if let Some(qc) = hs.on_vote(vote.clone()) {
                     if let Some(network) = self.consensus_network.as_ref() {
                         if let Err(e) = network.broadcast_qc(qc.clone()) {
                             eprintln!("Failed to broadcast QC: {}", e);
                         }
                     }
                     let now_ms = (Self::now_ts() as u128) * 1000;
-                    let _ = hotstuff.on_qc_self(qc, now_ms);
+                    let _ = hs.on_qc_self(qc, now_ms);
                 }
-
-                // Then, broadcast the vote to all peers
-                let num_validators = hotstuff.validator_pks.len();
+                let num_validators = hs.validator_pks.len();
                 let next_leader = simple_leader_election(vote.view + 1, num_validators);
                 if let Some(network) = self.consensus_network.as_ref() {
                     if let Err(e) = network.send_vote(vote, next_leader) {
@@ -784,10 +804,28 @@ impl Node {
     ) -> Result<(BuiltBlock, ApplyResult, Balances, Nonces, Commitments, Available, u64), ProduceError> {
         // ---- VORTEX: PoS gating & deterministic metadata ----
         let now_ms = self.chain.now_ts();
-        let slot_now   = self.chain.clock.current_slot(now_ms);
-        let next_height = self.chain.height + 1;
+        let _slot_now   = self.chain.clock.current_slot(now_ms);
+
+        // Choose parent based on consensus state if enabled; otherwise use local tip.
+        // Compute height relative to the parent's known height to avoid drift in
+        // networked mode where local chain.height lags committed state.
+        let (parent_hash, parent_height) = if let Some(hs) = self.hotstuff.as_ref() {
+            let ph = hs.state.high_qc.block_id;
+            let ph_height = if ph == self.chain.tip_hash {
+                self.chain.height
+            } else if let Some(b) = self.block_store.get(&ph) {
+                b.header.height
+            } else {
+                // Fallback to local height if we don't have the parent block yet
+                self.chain.height
+            };
+            (ph, ph_height)
+        } else {
+            (self.chain.tip_hash, self.chain.height)
+        };
+
+        let next_height = parent_height.saturating_add(1);
         // Production policy: block at height h must be labeled with slot h.
-        // We target the next height's slot regardless of current wall-clock slot.
         let slot   = next_height;
         let epoch  = self.chain.clock.current_epoch(slot);
     
@@ -884,12 +922,7 @@ impl Node {
             (qc, hash)
         };
 
-        // Choose parent based on consensus state if enabled; otherwise use local tip
-        let parent_hash = if let Some(h) = self.hotstuff.as_ref() {
-            h.state.high_qc.block_id
-        } else {
-            self.chain.tip_hash
-        };
+        // Parent chosen earlier (parent_hash)
 
         // 3) Build a block with an unsigned header; STF computes roots/gas then we sign
         let mut header = crate::types::BlockHeader {
@@ -1009,12 +1042,25 @@ impl Node {
         &mut self,
         limits: BlockSelectionLimits,
     ) -> Result<(BuiltBlock, ApplyResult), ProduceError> {
-        // In networked mode, propose at most once per view.
+        // In networked mode, propose at most once per view, and only if leader.
         if self.consensus_network.is_some() {
             if let Some(hs) = self.hotstuff.as_ref() {
+                // Only the elected leader for this view should propose, to avoid
+                // competing proposals that dilute votes and stall QCs.
+                let n = hs.validator_pks.len();
+                let leader_id = crate::p2p::simple_leader_election(hs.state.current_view, n);
+                if hs.validator_id != leader_id {
+                    return Err(ProduceError::NotProposer {
+                        slot: self.chain.height + 1,
+                        leader: Some(leader_id),
+                        mine: Some(hs.validator_id),
+                    });
+                }
                 if self.last_proposed_view == Some(hs.state.current_view) {
                     return Err(ProduceError::HeaderBuild("already proposed in this view".into()));
                 }
+                // Note: Do not require a QC for the previous view before proposing.
+                // HotStuff leaders can always propose using their highest QC.
             }
         }
         let (
@@ -1066,35 +1112,35 @@ impl Node {
         };
 
         // HotStuff: broadcast proposal and handle consensus
-        if let Some(hs) = self.hotstuff.as_mut() {
-            // Track parent lineage for safety checks
-            hs.observe_block_header(&built.block.header);
-
+        if self.hotstuff.is_some() {
+            // Validate and index header lineage before broadcast
             let now_ms = (Self::now_ts() as u128) * 1000;
-            // As leader, validate the proposal we're about to broadcast
-            let _ = hs.on_block_proposal(built.block.clone(), now_ms);
+            if let Some(hs) = self.hotstuff.as_mut() {
+                hs.observe_block_header(&built.block.header);
+                let _ = hs.on_block_proposal(built.block.clone(), now_ms);
+            }
 
             // Store our own proposed block so we can commit it on QC later
             let bid = crate::codec::header_id(&built.block.header);
             self.block_store.insert(bid, built.block.clone());
 
-            // Broadcast the proposal to all validators
+            // Broadcast the proposal to all validators (include parent block if available)
             if let Some(network) = self.consensus_network.as_ref() {
-                if let Err(e) = network.broadcast_proposal(built.block.clone()) {
+                let parent_opt = self.block_store.get(&built.block.header.parent_hash).cloned();
+                if let Err(e) = network.broadcast_proposal(built.block.clone(), parent_opt) {
                     eprintln!("Failed to broadcast proposal: {}", e);
                 }
 
-                // Also cast and send our own vote for the proposal so quorum can be reached (3/3 in n=3).
-                if let Some(vote) = hs.maybe_vote_self(&built.block) {
-                    // We route via send_vote, which currently broadcasts in the P2P layer.
-                    // The next leader id is not strictly required since the network broadcasts.
-                    let next_leader = 0 as ValidatorId; // placeholder; send_vote broadcasts anyway
-                    if let Err(e) = network.send_vote(vote, next_leader) {
-                        eprintln!("Failed to send self vote: {}", e);
-                    }
+                // Additionally, run the standard proposal handler locally so we:
+                //  - generate and count our self-vote in the local aggregator,
+                //  - broadcast that vote using the same path as non-leaders.
+                if let Some(hs) = self.hotstuff.as_ref() {
+                    let my_id = hs.validator_id;
+                    // Ignore errors here to avoid blocking liveness on local validation quirks; peers will vet too.
+                    let _ = self.handle_proposal(built.block.clone(), my_id);
                 }
-            } else {
-                // Fallback to single-process mode for backward compatibility
+            } else if let Some(hs) = self.hotstuff.as_mut() {
+                // Single-process fallback: vote and drive QC locally
                 if let Some(vote) = hs.maybe_vote_self(&built.block) {
                     if let Some(qc) = hs.on_vote(vote) {
                         let _ = hs.on_qc_self(qc, now_ms);
@@ -1111,6 +1157,50 @@ impl Node {
         }
         Ok((built, res))
     }
+
+    // ---------- Debug helpers (for RPC) ----------
+    /// Snapshot HotStuff aggregators: (view, block_id, votes, quorum)
+    pub fn debug_hotstuff_aggregators(&self) -> Option<Vec<(u64, Hash, usize, usize)>> {
+        let hs = self.hotstuff.as_ref()?;
+        let n = hs.validator_pks.len();
+        let quorum = (2 * n) / 3 + 1;
+        Some(hs.debug_aggregators().into_iter().map(|(v, bid, votes)| (v, bid, votes, quorum)).collect())
+    }
+
+    /// Snapshot HotStuff parent index size.
+    pub fn debug_parent_index_len(&self) -> Option<usize> {
+        self.hotstuff.as_ref().map(|hs| hs.debug_parent_index_len())
+    }
+
+    /// Snapshot a sample of parent links (up to `limit`).
+    pub fn debug_parent_index_sample(&self, limit: usize) -> Option<Vec<(Hash, Hash)>> {
+        self.hotstuff.as_ref().map(|hs| hs.debug_parent_index_sample(limit))
+    }
+
+    /// Snapshot of stored blocks (up to `limit`). Returns (id, height, view, parent, justify_view).
+    pub fn debug_block_store_sample(&self, limit: usize) -> Vec<(Hash, u64, u64, Hash, u64)> {
+        let mut out = Vec::new();
+        for (id, b) in self.block_store.iter().take(limit) {
+            out.push((*id, b.header.height, b.header.view, b.header.parent_hash, b.justify_qc.view));
+        }
+        out
+    }
+
+    /// Snapshot of pending commit targets.
+    pub fn debug_pending_commits(&self) -> Vec<Hash> {
+        self.pending_commits.iter().cloned().collect()
+    }
+
+    /// Last view we proposed in (if any).
+    pub fn debug_last_proposed_view(&self) -> Option<u64> { self.last_proposed_view }
+
+    /// Mempool counts snapshot (commits, avails, reveals)
+    pub fn debug_mempool_counts(&self) -> (usize, usize, usize) {
+        let (c, a, r) = self.mempool.debug_read();
+        (c.by_id.len(), a.by_id.len(), r.by_id.len())
+    }
+
+    pub fn debug_last_apply_error(&self) -> Option<String> { self.last_apply_error.clone() }
 
 }
 

@@ -473,7 +473,8 @@ impl Chain {
         );
 
         // 3) update self state
-        self.tip_hash = hash_bytes_sha256(&header_bytes(&block.header));
+        // Use canonical header-id (signing preimage) as the block identifier
+        self.tip_hash = crate::codec::header_id(&block.header);
         self.height = block.header.height;
         self.fee_state.exec_base = next_exec;
         self.fee_state.commit_base = update_commit_base(
@@ -592,7 +593,8 @@ impl Chain {
             FEE_PARAMS.exec_damping_bps,
         );
 
-        self.tip_hash = hash_bytes_sha256(&header_bytes(&block.header));
+        // Use canonical header-id (signing preimage) as the block identifier
+        self.tip_hash = crate::codec::header_id(&block.header);
         self.height = block.header.height;
         self.fee_state.exec_base = next_exec;
         self.fee_state.commit_base = update_commit_base(
