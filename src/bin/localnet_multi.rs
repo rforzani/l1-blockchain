@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis();
-        let mut pacemaker = l1_blockchain::types::Pacemaker::new(1000, 10000, 3, 2);
+        let mut pacemaker = l1_blockchain::types::Pacemaker::new(500, 8000, 3, 2);
         pacemaker.on_enter_view(now_ms);
 
         let hs_state = HotStuffState {
@@ -124,10 +124,18 @@ async fn main() -> anyhow::Result<()> {
         let hotstuff = HotStuff::new(hs_state, active_bls_pks, i as ValidatorId, Some(bls_signers[i].clone()));
         node.set_hotstuff(hotstuff);
 
-        // Align slot clock for deterministic dev behavior
+        // Shorter slot period for faster dev loops: set 500ms and align clock
+        node.set_slot_ms(400);
         node.align_clock_for_test();
 
-        nodes.push(Arc::new(Mutex::new(node)));
+        let arc = Arc::new(Mutex::new(node));
+        {
+            let mut guard = arc.lock().unwrap();
+            // Already set above; ensure state reflects these settings
+            guard.set_slot_ms(400);
+            guard.align_clock_for_test();
+        }
+        nodes.push(arc);
     }
 
     // Wire up P2P consensus networking across validators
@@ -156,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
         // Fast consensus message processing + pacemaker timeout checks
         let node2 = nodes[i].clone();
         tokio::spawn(async move {
-            let mut tick = interval(Duration::from_millis(100));
+            let mut tick = interval(Duration::from_millis(10));
             loop {
                 tick.tick().await;
                 let mut n = node2.lock().unwrap();

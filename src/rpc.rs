@@ -306,6 +306,7 @@ struct BlockStoreEntryResp {
 #[derive(Serialize)]
 struct BlockStoreDebugResp {
     total: usize,
+    sample_size: usize,
     sample: Vec<BlockStoreEntryResp>,
 }
 
@@ -316,7 +317,8 @@ async fn debug_block_store(State(state): State<AppState>) -> Json<BlockStoreDebu
     for (id, h, v, parent, jv) in sample {
         out.push(BlockStoreEntryResp { id: hex::encode(id), height: h, view: v, parent: hex::encode(parent), justify_view: jv });
     }
-    Json(BlockStoreDebugResp { total: out.len(), sample: out })
+    let total = node.debug_block_store_len();
+    Json(BlockStoreDebugResp { total, sample_size: out.len(), sample: out })
 }
 
 #[derive(Serialize)]

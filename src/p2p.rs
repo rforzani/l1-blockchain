@@ -32,6 +32,7 @@ pub enum ConsensusMessage {
     /// Vote from a validator to the leader of next view
     Vote {
         vote: Vote,
+        leader_id: ValidatorId,
         sender_id: ValidatorId,
     },
     /// QC broadcast from leader to all validators
@@ -174,9 +175,9 @@ impl ConsensusNetwork {
                 yamux::Config::default,
             )?
             .with_behaviour(|key| {
-                // Gossipsub configuration
+                // Gossipsub configuration (faster heartbeat for tighter meshes in dev)
                 let gossipsub_config = gossipsub::ConfigBuilder::default()
-                    .heartbeat_interval(Duration::from_secs(1))
+                    .heartbeat_interval(Duration::from_millis(250))
                     // Permissive validation to avoid requiring explicit app-level accepts in devnet
                     .validation_mode(ValidationMode::Permissive)
                     .message_id_fn(|message| {
@@ -240,6 +241,11 @@ impl ConsensusNetwork {
             swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
             info!("Subscribed to topic: {}", topic_str);
         }
+
+        // Also subscribe to our leader-specific vote topic to receive votes directly
+        let my_vote_topic = IdentTopic::new(format!("hotstuff-votes-{}", validator_id));
+        swarm.behaviour_mut().gossipsub.subscribe(&my_vote_topic)?;
+        info!("Subscribed to topic: {}", my_vote_topic.hash());
         
         // Start listening
         swarm.listen_on(config.listen_addr.clone())?;
@@ -307,9 +313,9 @@ impl ConsensusNetwork {
     pub fn send_vote(&self, vote: Vote, leader_id: ValidatorId) -> Result<()> {
         let msg = ConsensusMessage::Vote {
             vote,
+            leader_id,
             sender_id: self.validator_id,
         };
-        
         self.send_to_validator(leader_id, msg)
     }
 
@@ -536,7 +542,7 @@ impl NetworkTask {
     async fn broadcast_consensus_message(&mut self, msg: ConsensusMessage) -> Result<()> {
         let topic = match &msg {
             ConsensusMessage::Proposal { .. } => IdentTopic::new("hotstuff-proposals"),
-            ConsensusMessage::Vote { .. } => IdentTopic::new("hotstuff-votes"),
+            ConsensusMessage::Vote { leader_id, .. } => IdentTopic::new(format!("hotstuff-votes-{}", leader_id)),
             ConsensusMessage::QC { .. } => IdentTopic::new("hotstuff-qcs"),
             ConsensusMessage::ViewChange { .. } => IdentTopic::new("hotstuff-view-changes"),
         };

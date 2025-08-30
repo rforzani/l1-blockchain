@@ -23,6 +23,14 @@ use crate::pos::schedule::ProposerSchedule;
 use crate::crypto::vrf::{build_vrf_msg, vrf_eligible, SchnorrkelVrfSigner, VrfSigner};
 use anyhow::{Result, anyhow, bail};
 
+#[derive(Clone)]
+struct PendingVoteRetry {
+    vote: Vote,
+    leader_id: ValidatorId,
+    due_ms: u128,
+    retries: u8,
+}
+
 pub struct StateBalanceView<'a> {
     balances: &'a Balances,
 }
@@ -95,6 +103,8 @@ pub struct Node {
     pending_commits: HashSet<Hash>,
     /// Last error when trying to apply a committed block (for debug)
     last_apply_error: Option<String>,
+    /// Pending vote retries (single fast retry)
+    pending_vote_retries: Vec<PendingVoteRetry>,
 }
 
 struct NodeStateView<'a> {
@@ -140,6 +150,33 @@ impl<'a> StateView for NodeStateView<'a> {
 }
 
 impl Node {
+    #[inline]
+    fn now_ms() -> u128 { (Self::now_ts() as u128) * 1000 }
+
+    fn schedule_vote_retry(&mut self, vote: Vote, leader_id: ValidatorId, delay_ms: u64) {
+        let due = Self::now_ms().saturating_add(delay_ms as u128);
+        self.pending_vote_retries.push(PendingVoteRetry { vote, leader_id, due_ms: due, retries: 0 });
+    }
+
+    fn process_pending_vote_retries(&mut self) {
+        if self.pending_vote_retries.is_empty() { return; }
+        let now = Self::now_ms();
+        let mut next: Vec<PendingVoteRetry> = Vec::with_capacity(self.pending_vote_retries.len());
+        let high_view = self.hotstuff.as_ref().map(|h| h.state.high_qc.view).unwrap_or(0);
+        for mut pv in self.pending_vote_retries.drain(..) {
+            // Drop if QC for this view has been observed
+            if high_view >= pv.vote.view { continue; }
+            if pv.retries == 0 && now >= pv.due_ms {
+                if let Some(net) = self.consensus_network.as_ref() {
+                    let _ = net.send_vote(pv.vote.clone(), pv.leader_id);
+                }
+                pv.retries = 1;
+                // No more retries; keep until QC advances (to avoid endless resends)
+            }
+            next.push(pv);
+        }
+        self.pending_vote_retries = next;
+    }
     pub fn new(mempool: Arc<MempoolImpl>, signer: SigningKey) -> Self {
         let proposer_pubkey = signer.verifying_key().to_bytes();
         Self {
@@ -159,6 +196,7 @@ impl Node {
             last_proposed_view: None,
             pending_commits: HashSet::new(),
             last_apply_error: None,
+            pending_vote_retries: Vec::new(),
         }
     }
 
@@ -449,6 +487,9 @@ impl Node {
             }
         }
         
+        // Process any due vote retries first to reduce tails
+        self.process_pending_vote_retries();
+
         // Now process all collected messages
         for msg in messages {
             match msg {
@@ -463,7 +504,7 @@ impl Node {
                         eprintln!("Error handling proposal from {}: {}", sender_id, e);
                     }
                 }
-                ConsensusMessage::Vote { vote, sender_id } => {
+                ConsensusMessage::Vote { vote, leader_id: _ , sender_id } => {
                     if let Some(committed) = self.handle_vote(vote, sender_id)? {
                         if let Err(e) = self.apply_committed_block(committed) {
                             eprintln!("Failed to apply committed block: {}", e);
@@ -548,9 +589,11 @@ impl Node {
                 let num_validators = hs.validator_pks.len();
                 let next_leader = simple_leader_election(vote.view + 1, num_validators);
                 if let Some(network) = self.consensus_network.as_ref() {
-                    if let Err(e) = network.send_vote(vote, next_leader) {
+                    if let Err(e) = network.send_vote(vote.clone(), next_leader) {
                         eprintln!("Failed to send vote: {}", e);
                     }
+                    // Schedule one fast retry (~100ms) if no QC yet
+                    self.schedule_vote_retry(vote, next_leader, 100);
                 }
             }
         }
@@ -579,10 +622,26 @@ impl Node {
 
     /// Handle an incoming QC
     fn handle_qc(&mut self, qc: QC, sender_id: ValidatorId) -> Result<Option<Hash>, String> {
-        if let Some(hotstuff) = self.hotstuff.as_mut() {
+        if let Some(hs) = self.hotstuff.as_mut() {
             let now_ms = (Self::now_ts() as u128) * 1000;
-            return Ok(hotstuff.on_qc_self(qc, now_ms)
-                .map_err(|e| format!("Failed to process QC: {:?}", e))?);
+            let res = hs
+                .on_qc_self(qc, now_ms)
+                .map_err(|e| format!("Failed to process QC: {:?}", e))?;
+
+            // Snapshot leader info for the new view and drop the borrow
+            let next_view = hs.state.current_view;
+            let my_id = hs.validator_id;
+            let n = hs.validator_pks.len();
+            drop(hs);
+
+            // If I'm the leader for the current view and haven't proposed yet, propose immediately
+            let leader = crate::p2p::simple_leader_election(next_view, n);
+            if my_id == leader && self.last_proposed_view != Some(next_view) {
+                // Ignore errors here; even if selection fails, regular producer will try soon.
+                let _ = self.produce_block(crate::consensus::dev_loop::DEFAULT_LIMITS);
+            }
+
+            return Ok(res);
         }
         Ok(None)
     }
@@ -721,6 +780,9 @@ impl Node {
 
     /// Expose the configured slot duration in milliseconds.
     pub fn slot_ms(&self) -> u64 { self.chain.clock.slot_ms }
+
+    /// Set the slot duration (milliseconds) for local/dev networks.
+    pub fn set_slot_ms(&mut self, ms: u64) { self.chain.clock.slot_ms = ms; }
 
     /// Determine the deterministic fallback leader for the next block's bundle start.
     /// This reflects production alias scheduling and does not consider VRF winners.
@@ -1201,6 +1263,9 @@ impl Node {
     }
 
     pub fn debug_last_apply_error(&self) -> Option<String> { self.last_apply_error.clone() }
+
+    /// Total number of blocks currently stored in the ephemeral block_store
+    pub fn debug_block_store_len(&self) -> usize { self.block_store.len() }
 
 }
 
