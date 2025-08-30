@@ -1102,7 +1102,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(chain.height, 1);
-        let expected_tip = hash_bytes_sha256(&header_bytes(&block.header));
+        let expected_tip = crate::codec::header_id(&block.header);
         assert_eq!(chain.tip_hash, expected_tip);
     }
 
@@ -1232,11 +1232,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(chain.height, 2);
-        let expected_tip = hash_bytes_sha256(&header_bytes(&block2.header));
+        let expected_tip = crate::codec::header_id(&block2.header);
         assert_eq!(chain.tip_hash, expected_tip);
         assert_ne!(
             chain.tip_hash,
-            hash_bytes_sha256(&header_bytes(&block1.header))
+            crate::codec::header_id(&block1.header)
         );
     }
 

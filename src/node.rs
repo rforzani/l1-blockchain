@@ -1107,16 +1107,16 @@ impl Node {
         // In networked mode, propose at most once per view, and only if leader.
         if self.consensus_network.is_some() {
             if let Some(hs) = self.hotstuff.as_ref() {
-                // Only the elected leader for this view should propose, to avoid
-                // competing proposals that dilute votes and stall QCs.
-                let n = hs.validator_pks.len();
-                let leader_id = crate::p2p::simple_leader_election(hs.state.current_view, n);
-                if hs.validator_id != leader_id {
-                    return Err(ProduceError::NotProposer {
-                        slot: self.chain.height + 1,
-                        leader: Some(leader_id),
-                        mine: Some(hs.validator_id),
-                    });
+                // Only the expected leader for the upcoming block should propose.
+                // Use the chain's proposer schedule (fallback or VRF-aware) when available.
+                if let Some(exp) = self.expected_leader_for_next_block() {
+                    if hs.validator_id != exp {
+                        return Err(ProduceError::NotProposer {
+                            slot: self.chain.height + 1,
+                            leader: Some(exp),
+                            mine: Some(hs.validator_id),
+                        });
+                    }
                 }
                 if self.last_proposed_view == Some(hs.state.current_view) {
                     return Err(ProduceError::HeaderBuild("already proposed in this view".into()));
