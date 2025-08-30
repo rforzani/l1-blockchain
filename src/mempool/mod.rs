@@ -537,11 +537,6 @@ impl Mempool for MempoolImpl {
 
                 // Fetch payload; skip if any index inconsistency.
                 if let Some(commit_tx) = commits.payload_by_id.get(txid) {
-                    // STATEVIEW CHECK BEFORE PUSHING A COMMIT TX
-                    if state.pending_commit_room(&commit_tx.sender) == 0 {
-                        continue; // sender at pending-capacity, skip
-                    }
-
                     txs.push(Tx::Commit(commit_tx.clone()));
                     commit_ids.push(*txid);
                     commits_added += 1;

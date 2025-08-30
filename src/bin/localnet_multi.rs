@@ -166,18 +166,31 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             // Obtain a dedicated subscription to the consensus network
             let mut rx_opt = { node2.lock().unwrap().consensus_network().map(|net| net.subscribe()) };
+            let mut poll = interval(Duration::from_millis(50));
             loop {
                 if let Some(rx) = rx_opt.as_mut() {
-                    match rx.recv().await {
-                        Ok(msg) => {
-                            let mut n = node2.lock().unwrap();
-                            let _ = n.process_consensus_message(msg);
-                            let _ = n.check_pacemaker_timeout();
+                    tokio::select! {
+                        biased;
+                        // Process incoming consensus messages immediately
+                        msg = rx.recv() => {
+                            match msg {
+                                Ok(msg) => {
+                                    let mut n = node2.lock().unwrap();
+                                    let _ = n.process_consensus_message(msg);
+                                    let _ = n.check_pacemaker_timeout();
+                                }
+                                Err(_) => {
+                                    // Re-subscribe on channel closed
+                                    rx_opt = { node2.lock().unwrap().consensus_network().map(|net| net.subscribe()) };
+                                    tokio::time::sleep(Duration::from_millis(5)).await;
+                                }
+                            }
                         }
-                        Err(_) => {
-                            // Re-subscribe on channel closed
-                            rx_opt = { node2.lock().unwrap().consensus_network().map(|net| net.subscribe()) };
-                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        // Periodic poll to drive timeouts and pending work even if no messages
+                        _ = poll.tick() => {
+                            let mut n = node2.lock().unwrap();
+                            let _ = n.process_consensus_messages();
+                            let _ = n.check_pacemaker_timeout();
                         }
                     }
                 } else {
