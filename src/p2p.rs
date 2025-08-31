@@ -169,8 +169,8 @@ impl ConsensusNetwork {
         
         info!("Starting P2P network for validator {} with peer ID {}", validator_id, local_peer_id);
         
-        // Create message channels
-        let (message_tx, message_rx) = broadcast::channel(1024);
+        // Create message channels (larger buffer to reduce drops under load)
+        let (message_tx, message_rx) = broadcast::channel(8192);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         
         // Initialize the network behaviour

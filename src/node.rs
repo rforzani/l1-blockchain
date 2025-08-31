@@ -158,20 +158,12 @@ impl<'a> StateView for NodeStateView<'a> {
 }
 
 impl Node {
-    /// Stake-weighted leader for a HotStuff view, derived from the epoch proposer schedule.
-    /// Falls back to round-robin if schedule is empty.
-    pub(crate) fn leader_for_view(&self, _view: u64) -> ValidatorId {
-        // Align consensus leader with the slot-based alias schedule to avoid
-        // view/slot drift causing NotScheduledLeader rejections.
-        let next_slot = self.chain.height + 1;
-        let bundle_start = self.chain.clock.bundle_start(next_slot, DEFAULT_BUNDLE_LEN);
-        self.chain
-            .schedule
-            .fallback_leader_for_bundle(bundle_start)
-            .unwrap_or_else(|| {
-                let n = self.chain.validator_set.validators.len();
-                if n == 0 { 0 } else { (next_slot as usize % n) as ValidatorId }
-            })
+    /// Stake-weighted leader for a HotStuff view. Uses the epoch proposer schedule
+    /// indexed by `view`; falls back to simple round-robin over validator ids by `view`.
+    pub(crate) fn leader_for_view(&self, view: u64) -> ValidatorId {
+        if let Some(vid) = self.chain.schedule.leader_for_view(view) { return vid; }
+        let n = self.chain.validator_set.validators.len();
+        if n == 0 { 0 } else { (view as usize % n) as ValidatorId }
     }
     #[inline]
     fn now_ms() -> u128 { (Self::now_ts() as u128) * 1000 }
@@ -1721,6 +1713,43 @@ mod tests {
         node.produce_block(limits).unwrap();
     
         PROCESS_BLOCK_CALLS.with(|c| assert_eq!(c.get(), 1));
+    }
+
+    #[test]
+    fn leader_changes_with_view_even_if_height_constant() {
+        use crate::pos::registry::{Validator, ValidatorStatus};
+        use crate::crypto::bls::BlsSigner;
+
+        // Build a node and install a 2-validator set
+        let cfg = MempoolConfig {
+            max_avails_per_block: 10,
+            max_reveals_per_block: 10,
+            max_commits_per_block: 10,
+            max_pending_commits_per_account: 10,
+            commit_ttl_blocks: 2,
+            reveal_window_blocks: 2,
+        };
+        let mp = MempoolImpl::new(cfg);
+        let mut node = Node::new(mp.clone(), SigningKey::from_bytes(&[9u8; 32]));
+
+        // Two deterministic validators (ids 0 and 1)
+        let ed0 = SigningKey::from_bytes(&[1u8; 32]).verifying_key().to_bytes();
+        let ed1 = SigningKey::from_bytes(&[2u8; 32]).verifying_key().to_bytes();
+        let bls0 = BlsSigner::from_sk_bytes(&[10u8; 32]).unwrap();
+        let bls1 = BlsSigner::from_sk_bytes(&[11u8; 32]).unwrap();
+        let v0 = Validator { id: 0, ed25519_pubkey: ed0, bls_pubkey: Some(bls0.public_key_bytes()), vrf_pubkey: [3u8; 32], stake: 1_000, status: ValidatorStatus::Active };
+        let v1 = Validator { id: 1, ed25519_pubkey: ed1, bls_pubkey: Some(bls1.public_key_bytes()), vrf_pubkey: [4u8; 32], stake: 1_000, status: ValidatorStatus::Active };
+        node.init_with_shared_validator_set(vec![v0, v1], bls0);
+
+        // Disable schedule leaders to force fallback to round-robin by view
+        node.chain.schedule.epoch_slots = 0;
+        node.chain.schedule.leaders.clear();
+
+        // Keep height constant and verify leader depends on view
+        node.chain.height = 0;
+        let l1 = node.leader_for_view(1);
+        let l2 = node.leader_for_view(2);
+        assert_ne!(l1, l2, "leader should change with view when schedule is empty");
     }
 
     #[test]
