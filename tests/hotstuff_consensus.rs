@@ -11,7 +11,7 @@ use l1_blockchain::{
     types::{HotStuffState, Pacemaker, QC, Hash},
     node::{Node, ConsensusConfig, PacemakerConfig},
     mempool::{MempoolImpl, MempoolConfig, BlockSelectionLimits},
-    p2p::{create_test_network, simple_leader_election},
+    p2p::create_test_network,
     pos::registry::ValidatorId,
     codec::qc_commitment,
     crypto::hash_bytes_sha256,
@@ -308,18 +308,20 @@ async fn test_multi_round_consensus_with_commits() {
             hs.state.current_view = round;
         }
         
-        // Leader produces a block
+        // Leader produces a block (may already have self-proposed on QC)
         let result = match leader_id {
             0 => node_0.produce_block(limits.clone()),
             1 => node_1.produce_block(limits.clone()),
             2 => node_2.produce_block(limits.clone()),
             _ => panic!("Invalid leader"),
         };
-        
-        if let Err(e) = &result {
-            eprintln!("round {} produce error: {:?}", round, e);
+
+        let ok = result.is_ok();
+        let already = matches!(result.as_ref(), Err(e) if format!("{:?}", e).contains("already proposed in this view"));
+        if !ok && !already {
+            eprintln!("round {} produce error: {:?}", round, result.as_ref().err());
         }
-        assert!(result.is_ok(), "Block production should succeed in round {}", round);
+        assert!(ok || already, "Block production should succeed or be already proposed in round {}", round);
         
         // Process messages multiple times to handle the full flow (longer delays for real P2P)
         for _msg_round in 0..3 {

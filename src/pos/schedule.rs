@@ -21,6 +21,10 @@ pub trait ProposerSchedule {
 
     fn epoch(&self) -> u64;
     fn epoch_slots(&self) -> u64;
+
+    /// Deterministic leader for a HotStuff view, derived from the epoch schedule.
+    /// Maps arbitrary `view` to an index in the precomputed leader array.
+    fn leader_for_view(&self, view: u64) -> Option<ValidatorId>;
 }
 
 /// Deterministic, stake-weighted leader schedule built with a fixed-point alias table.
@@ -210,5 +214,12 @@ impl ProposerSchedule for AliasSchedule {
     #[inline]
     fn epoch_slots(&self) -> u64 {
         self.epoch_slots
+    }
+
+    #[inline]
+    fn leader_for_view(&self, view: u64) -> Option<ValidatorId> {
+        if self.leaders.is_empty() || self.epoch_slots == 0 { return None; }
+        let idx = (view % self.epoch_slots) as usize;
+        Some(self.leaders[idx])
     }
 }

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     codec::{header_id, qc_commitment}, crypto::bls::{
-        has_quorum, verify_qc, verify_sig, vote_msg, BlsAggregate, BlsSignatureBytes, BlsSigner, SignerBitmap
+        fast_aggregate_verify, has_quorum, verify_qc, verify_sig, vote_msg, BlsAggregate, BlsSignatureBytes, BlsSigner, SignerBitmap
     }, pos::registry::ValidatorId, types::{Block, BlockHeader, Hash, HotStuffState, Vote, QC} 
 };
 
@@ -15,6 +15,10 @@ struct VoteAggregator {
     seen: Vec<bool>,
     block_id: Hash,
     view: u64,
+    // Pending, not-yet-verified partials for this (view, block)
+    pending_sigs: Vec<[u8; 96]>,
+    pending_indices: Vec<usize>,
+    pending_bitmap: SignerBitmap,
 }
 
 impl VoteAggregator {
@@ -25,6 +29,9 @@ impl VoteAggregator {
             seen: vec![false; n],
             block_id,
             view,
+            pending_sigs: Vec::new(),
+            pending_indices: Vec::new(),
+            pending_bitmap: SignerBitmap::repeat(false, n),
         }
     }
     fn add(&mut self, voter_idx: usize, sig: &BlsSignatureBytes) {
@@ -33,6 +40,62 @@ impl VoteAggregator {
             self.bitmap.set(voter_idx, true);
             self.seen[voter_idx] = true;
         }
+    }
+    fn add_pending(&mut self, voter_idx: usize, sig: &BlsSignatureBytes) {
+        if self.seen[voter_idx] { return; }
+        if self.pending_bitmap.get(voter_idx).as_deref().copied().unwrap_or(false) { return; }
+        self.pending_indices.push(voter_idx);
+        self.pending_sigs.push(sig.0);
+        self.pending_bitmap.set(voter_idx, true);
+    }
+    fn pending_len(&self) -> usize { self.pending_indices.len() }
+    fn drain_pending_with_agg_verify(&mut self, validator_pks: &[[u8; 48]]) {
+        let m = self.pending_indices.len();
+        if m == 0 { return; }
+
+        // Move pending vectors out to avoid self-borrow conflicts
+        let indices: Vec<usize> = core::mem::take(&mut self.pending_indices);
+        let sigs: Vec<[u8; 96]> = core::mem::take(&mut self.pending_sigs);
+
+        // Build message once for this (block, view)
+        let msg = vote_msg(&self.block_id, self.view);
+
+        // Collect signer PKs for pending
+        let mut pks: Vec<[u8; 48]> = Vec::with_capacity(m);
+        for &idx in &indices {
+            // idx bounds guaranteed by construction
+            pks.push(validator_pks[idx]);
+        }
+
+        // Aggregate the pending signatures and try fast-aggregate verify
+        let mut tmp_agg = BlsAggregate::new();
+        for s in &sigs {
+            tmp_agg.push(s);
+        }
+
+        if let Some(agg_sig) = tmp_agg.finalize() {
+            if fast_aggregate_verify(&agg_sig, &msg, &pks) {
+                // All pending verified as a batch — add all to main aggregator
+                for (i, &idx) in indices.iter().enumerate() {
+                    let sig_bytes = BlsSignatureBytes(sigs[i]);
+                    self.add(idx, &sig_bytes);
+                }
+                // Clear pending
+                for &idx in &indices { self.pending_bitmap.set(idx, false); }
+                return;
+            }
+        }
+
+        // Fallback: verify each pending individually; add only valid ones
+        for (i, &idx) in indices.iter().enumerate() {
+            let sig_bytes = BlsSignatureBytes(sigs[i]);
+            let pk = &validator_pks[idx];
+            if verify_sig(pk, &msg, &sig_bytes) {
+                self.add(idx, &sig_bytes);
+            }
+        }
+        // Clear pending (bitmap and vectors)
+        for &idx in &indices { self.pending_bitmap.set(idx, false); }
     }
 }
 
@@ -270,24 +333,28 @@ impl HotStuff {
         // Only meaningful if I'm the leader for this (policy: we can still aggregate even if not)
         let n = self.validator_pks.len();
         if (vote.voter_id as usize) >= n { return None; }
-    
-        // 1) Verify the *individual* vote quickly (single BLS verify).
-        let pk = &self.validator_pks[vote.voter_id as usize];
-        let msg = vote_msg(&vote.block_id, vote.view);
-        if !verify_sig(pk, &msg, &vote.bls_sig) {
-            return None; // bad partial
-        }
-    
-        // 2) Get/create the aggregator for (view, block_id).
+
+        // Get/create the aggregator for (view, block_id).
         let key = (vote.view, vote.block_id);
         let entry = self.aggregators.entry(key).or_insert_with(|| {
             VoteAggregator::new(n, vote.block_id, vote.view)
         });
-    
-        // 3) Add vote if not a duplicate from this validator.
-        entry.add(vote.voter_id as usize, &vote.bls_sig);
-    
-        // 4) If quorum reached, finalize to QC and return it.
+
+        // Buffer this vote for batch verification (dedup pending + seen)
+        entry.add_pending(vote.voter_id as usize, &vote.bls_sig);
+
+        // Decide when to verify pending batch:
+        // - if pending batch is large enough, or
+        // - if adding all pendings could reach quorum.
+        let pending = entry.pending_len();
+        let have = entry.bitmap.count_ones();
+        let need = (2 * n) / 3 + 1;
+        const BATCH_VERIFY_MIN: usize = 4; // small batches amortize better
+        if pending >= BATCH_VERIFY_MIN || have + pending >= need {
+            entry.drain_pending_with_agg_verify(&self.validator_pks);
+        }
+
+        // If quorum reached after verification, finalize to QC and return it.
         if has_quorum(n, &entry.bitmap) {
             if let Some(agg_sig) = entry.agg.finalize() {
                 let qc = QC {
@@ -296,8 +363,6 @@ impl HotStuff {
                     agg_sig,
                     bitmap: entry.bitmap.clone(),
                 };
-                // Optional: keep the aggregator or remove it to free memory.
-                // self.aggregators.remove(&key);
                 return Some(qc);
             }
         }

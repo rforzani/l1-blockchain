@@ -631,14 +631,8 @@ impl NetworkTask {
     }
 }
 
-/// Simple leader election for testing - round-robin based on view
-/// In production, this would use VRF or stake-weighted selection
-pub fn simple_leader_election(view: u64, num_validators: usize) -> ValidatorId {
-    if num_validators == 0 {
-        return 0;
-    }
-    (view as usize % num_validators) as ValidatorId
-}
+// Round-robin leader election removed. Use the stake-weighted proposer schedule
+// (see `pos::schedule`) or VRF-based eligibility in higher layers.
 
 /// Create a P2P network for testing with multiple validators
 pub async fn create_test_network(validator_ids: Vec<ValidatorId>) -> Result<Vec<ConsensusNetwork>, anyhow::Error> {
@@ -783,13 +777,5 @@ mod tests {
         println!("P2P proposal broadcast test skipped - use integration tests");
     }
 
-    #[test]
-    fn test_leader_election() {
-        // Test round-robin leader election
-        assert_eq!(simple_leader_election(0, 3), 0);
-        assert_eq!(simple_leader_election(1, 3), 1);
-        assert_eq!(simple_leader_election(2, 3), 2);
-        assert_eq!(simple_leader_election(3, 3), 0);
-        assert_eq!(simple_leader_election(4, 3), 1);
-    }
+    // Leader election is validated via chain/schedule and integration tests.
 }

@@ -2,7 +2,7 @@ use crate::consensus::dev_loop::DevNode;
 use crate::consensus::HotStuff;
 use crate::crypto::bls::{verify_qc, BlsSigner, BlsSignatureBytes, BlsAggregate, vote_msg};
 use crate::fees::FeeState;
-use crate::p2p::{ConsensusNetwork, ConsensusMessage, simple_leader_election};
+use crate::p2p::{ConsensusNetwork, ConsensusMessage};
 use crate::types::Vote;
 // src/node.rs
 use crate::mempool::{BalanceView, BlockSelectionLimits, CommitmentId, Mempool, MempoolImpl, SelectError, StateView, TxId, Batch, AdmissionError};
@@ -152,6 +152,14 @@ impl<'a> StateView for NodeStateView<'a> {
 }
 
 impl Node {
+    /// Stake-weighted leader for a HotStuff view, derived from the epoch proposer schedule.
+    /// Falls back to round-robin if schedule is empty.
+    pub(crate) fn leader_for_view(&self, view: u64) -> ValidatorId {
+        if let Some(id) = self.chain.schedule.leader_for_view(view) { return id; }
+        let n = self.chain.validator_set.validators.len();
+        if n == 0 { return 0; }
+        (view as usize % n) as ValidatorId
+    }
     #[inline]
     fn now_ms() -> u128 { (Self::now_ts() as u128) * 1000 }
 
@@ -634,8 +642,7 @@ impl Node {
                     let now_ms = (Self::now_ts() as u128) * 1000;
                     let _ = hs.on_qc_self(qc, now_ms);
                 }
-                let num_validators = hs.validator_pks.len();
-                let next_leader = simple_leader_election(vote.view + 1, num_validators);
+                let next_leader = self.leader_for_view(vote.view + 1);
                 if let Some(network) = self.consensus_network.as_ref() {
                     if let Err(e) = network.send_vote(vote.clone(), next_leader) {
                         eprintln!("Failed to send vote: {}", e);
@@ -689,7 +696,7 @@ impl Node {
             drop(hs);
 
             // If I'm the leader for the current view and haven't proposed yet, propose immediately
-            let leader = crate::p2p::simple_leader_election(next_view, n);
+            let leader = self.leader_for_view(next_view);
             if my_id == leader && self.last_proposed_view != Some(next_view) {
                 // Ignore errors here; even if selection fails, regular producer will try soon.
                 let _ = self.produce_block(crate::consensus::dev_loop::DEFAULT_LIMITS);
@@ -739,7 +746,7 @@ impl Node {
             // Drop the borrow before calling into self.produce_block
             drop(hotstuff);
             if advanced {
-                let leader = crate::p2p::simple_leader_election(next_view, n);
+            let leader = self.leader_for_view(next_view);
                 if my_id == leader && self.last_proposed_view != Some(next_view) {
                     // Ignore errors here; the periodic producer will also try.
                     let _ = self.produce_block(crate::consensus::dev_loop::DEFAULT_LIMITS);
@@ -1178,8 +1185,7 @@ impl Node {
                 // In HotStuff mode, leaders are view-based; however, our production
                 // alias schedule may also specify an expected proposer for the next
                 // slot. Allow proposing if we match either to avoid stalls.
-                let n = hs.validator_pks.len();
-                let expected_view = crate::p2p::simple_leader_election(hs.state.current_view, n);
+                let expected_view = self.leader_for_view(hs.state.current_view);
                 let expected_alias = self.expected_leader_for_next_block();
                 let am_view_leader = hs.validator_id == expected_view;
                 let am_alias_leader = expected_alias.map_or(false, |id| id == hs.validator_id);

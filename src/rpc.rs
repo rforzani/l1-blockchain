@@ -342,8 +342,7 @@ async fn debug_leader(State(state): State<AppState>) -> Json<LeaderDebugResp> {
     let node = state.node.lock().unwrap();
     let mut resp = LeaderDebugResp { current_view: None, leader_id: None, mine: None, last_proposed_view: node.debug_last_proposed_view() };
     if let Some(hs) = node.hotstuff() {
-        let n = hs.validator_pks.len();
-        let leader = crate::p2p::simple_leader_election(hs.state.current_view, n);
+        let leader = node.leader_for_view(hs.state.current_view);
         resp.current_view = Some(hs.state.current_view);
         resp.leader_id = Some(leader as u64);
         resp.mine = Some(hs.validator_id as u64);
