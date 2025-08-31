@@ -180,10 +180,13 @@ impl ConsensusNetwork {
                 yamux::Config::default,
             )?
             .with_behaviour(|key| {
-                // Gossipsub configuration (faster heartbeat for tighter meshes in dev)
-                let gossipsub_config = gossipsub::ConfigBuilder::default()
+                // Gossipsub configuration tuned for consensus message reliability.
+                // - Tight heartbeat for quick mesh healing.
+                // - Mesh degree targets sized for validator counts up to low hundreds.
+                // - Content-address message id to dedupe retries.
+                let mut cfg_builder = gossipsub::ConfigBuilder::default();
+                cfg_builder
                     .heartbeat_interval(Duration::from_millis(250))
-                    // Permissive validation to avoid requiring explicit app-level accepts in devnet
                     .validation_mode(ValidationMode::Permissive)
                     .message_id_fn(|message| {
                         use std::collections::hash_map::DefaultHasher;
@@ -191,13 +194,20 @@ impl ConsensusNetwork {
                         let mut hasher = DefaultHasher::new();
                         message.data.hash(&mut hasher);
                         gossipsub::MessageId::from(hasher.finish().to_string())
-                    })
+                    });
+                // Mesh parameters for durable propagation
+                cfg_builder.mesh_n(8);
+                cfg_builder.mesh_n_low(6);
+                cfg_builder.mesh_n_high(12);
+                cfg_builder.gossip_lazy(12);
+                cfg_builder.flood_publish(true);
+                let cfg = cfg_builder
                     .build()
                     .expect("Valid gossipsub config");
                 
                 let gossipsub = gossipsub::Behaviour::new(
                     MessageAuthenticity::Signed(key.clone()),
-                    gossipsub_config,
+                    cfg,
                 )?;
                 
                 let mdns = mdns::tokio::Behaviour::new(
@@ -312,14 +322,13 @@ impl ConsensusNetwork {
             parent,
             sender_id: self.validator_id,
         };
-        // Direct to all peers
+        // Prefer direct in-process delivery for tests when available; otherwise gossipsub.
         if !self.direct_peers.lock().unwrap().is_empty() {
             for (vid, tx) in self.direct_peers.lock().unwrap().iter() {
                 if *vid == self.validator_id { continue; }
                 let _ = tx.send(msg.clone());
             }
-        }
-        if self.use_gossip_fallback {
+        } else {
             self.broadcast_message(msg)?;
         }
         Ok(())
@@ -332,10 +341,16 @@ impl ConsensusNetwork {
             leader_id,
             sender_id: self.validator_id,
         };
+        // Prefer direct intra-process delivery if the leader lives in this process.
+        let mut fallback_to_gossip = true;
         if let Some(tx) = self.direct_peers.lock().unwrap().get(&leader_id) {
-            let _ = tx.send(msg.clone());
+            match tx.send(msg.clone()) {
+                Ok(_) => fallback_to_gossip = false,
+                Err(_) => fallback_to_gossip = true,
+            }
         }
-        if self.use_gossip_fallback {
+        if fallback_to_gossip {
+            // Publish via gossipsub (shared votes topic) so any node can aggregate.
             self.send_to_validator(leader_id, msg)?;
         }
         Ok(())
@@ -352,8 +367,7 @@ impl ConsensusNetwork {
                 if *vid == self.validator_id { continue; }
                 let _ = tx.send(msg.clone());
             }
-        }
-        if self.use_gossip_fallback {
+        } else {
             self.broadcast_message(msg)?;
         }
         Ok(())
@@ -371,8 +385,7 @@ impl ConsensusNetwork {
                 if *vid == self.validator_id { continue; }
                 let _ = tx.send(msg.clone());
             }
-        }
-        if self.use_gossip_fallback {
+        } else {
             self.broadcast_message(msg)?;
         }
         Ok(())
@@ -591,7 +604,9 @@ impl NetworkTask {
     async fn broadcast_consensus_message(&mut self, msg: ConsensusMessage) -> Result<()> {
         let topic = match &msg {
             ConsensusMessage::Proposal { .. } => IdentTopic::new("hotstuff-proposals"),
-            ConsensusMessage::Vote { leader_id, .. } => IdentTopic::new(format!("hotstuff-votes-{}", leader_id)),
+            // Publish votes to the shared votes topic to ensure delivery even if
+            // leader selection is misaligned across nodes. Any node may aggregate.
+            ConsensusMessage::Vote { .. } => IdentTopic::new("hotstuff-votes"),
             ConsensusMessage::QC { .. } => IdentTopic::new("hotstuff-qcs"),
             ConsensusMessage::ViewChange { .. } => IdentTopic::new("hotstuff-view-changes"),
         };

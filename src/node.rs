@@ -107,6 +107,12 @@ pub struct Node {
     last_apply_error: Option<String>,
     /// Pending vote retries (single fast retry)
     pending_vote_retries: Vec<PendingVoteRetry>,
+    /// Last observed proposal view (from any proposer)
+    last_observed_proposal_view: Option<u64>,
+    /// Per-leader miss counters within a sliding window (ms since epoch)
+    leader_miss: HashMap<ValidatorId, (u32, u128)>,
+    /// Avoid repeating early-skip within the same view
+    last_early_skip_view: Option<u64>,
 }
 
 struct NodeStateView<'a> {
@@ -154,11 +160,18 @@ impl<'a> StateView for NodeStateView<'a> {
 impl Node {
     /// Stake-weighted leader for a HotStuff view, derived from the epoch proposer schedule.
     /// Falls back to round-robin if schedule is empty.
-    pub(crate) fn leader_for_view(&self, view: u64) -> ValidatorId {
-        if let Some(id) = self.chain.schedule.leader_for_view(view) { return id; }
-        let n = self.chain.validator_set.validators.len();
-        if n == 0 { return 0; }
-        (view as usize % n) as ValidatorId
+    pub(crate) fn leader_for_view(&self, _view: u64) -> ValidatorId {
+        // Align consensus leader with the slot-based alias schedule to avoid
+        // view/slot drift causing NotScheduledLeader rejections.
+        let next_slot = self.chain.height + 1;
+        let bundle_start = self.chain.clock.bundle_start(next_slot, DEFAULT_BUNDLE_LEN);
+        self.chain
+            .schedule
+            .fallback_leader_for_bundle(bundle_start)
+            .unwrap_or_else(|| {
+                let n = self.chain.validator_set.validators.len();
+                if n == 0 { 0 } else { (next_slot as usize % n) as ValidatorId }
+            })
     }
     #[inline]
     fn now_ms() -> u128 { (Self::now_ts() as u128) * 1000 }
@@ -173,15 +186,25 @@ impl Node {
         let now = Self::now_ms();
         let mut next: Vec<PendingVoteRetry> = Vec::with_capacity(self.pending_vote_retries.len());
         let high_view = self.hotstuff.as_ref().map(|h| h.state.high_qc.view).unwrap_or(0);
-        for mut pv in self.pending_vote_retries.drain(..) {
+        // Move out the current retry queue to avoid borrowing self during iteration
+        let current = std::mem::take(&mut self.pending_vote_retries);
+        for mut pv in current.into_iter() {
             // Drop if QC for this view has been observed
             if high_view >= pv.vote.view { continue; }
-            if pv.retries == 0 && now >= pv.due_ms {
+            // Retry schedule: ~100ms, 250ms, 500ms (cap total retries to 3)
+            const DELAYS: [u64; 3] = [100, 250, 500];
+            if now >= pv.due_ms && (pv.retries as usize) < DELAYS.len() {
+                // Refresh leader in case schedule changed for this view+1
+                let target_leader = self.leader_for_view(pv.vote.view + 1);
                 if let Some(net) = self.consensus_network.as_ref() {
-                    let _ = net.send_vote(pv.vote.clone(), pv.leader_id);
+                    let _ = net.send_vote(pv.vote.clone(), target_leader);
                 }
-                pv.retries = 1;
-                // No more retries; keep until QC advances (to avoid endless resends)
+                pv.leader_id = target_leader;
+                // Schedule next retry if any remain
+                pv.retries += 1;
+                if (pv.retries as usize) < DELAYS.len() {
+                    pv.due_ms = now.saturating_add(DELAYS[pv.retries as usize] as u128);
+                }
             }
             next.push(pv);
         }
@@ -207,6 +230,9 @@ impl Node {
             pending_commits: HashSet::new(),
             last_apply_error: None,
             pending_vote_retries: Vec::new(),
+            last_observed_proposal_view: None,
+            leader_miss: HashMap::new(),
+            last_early_skip_view: None,
         }
     }
 
@@ -596,6 +622,8 @@ impl Node {
             hs.on_block_proposal(block, now_ms)
                 .map_err(|e| format!("Block proposal validation failed: {:?}", e))?;
         }
+        // Track observed proposals to suppress early-skip
+        self.last_observed_proposal_view = Some(block.header.view);
 
         // 2) Store the block and ensure batch payloads exist locally
         let bid = crate::codec::header_id(&block.header);
@@ -715,42 +743,103 @@ impl Node {
                 let now_ms = (Self::now_ts() as u128) * 1000;
                 let _ = hotstuff.on_qc_self(qc, now_ms);
             }
-            
-            // Could implement view synchronization logic here
-            // For now, we rely on timeouts to drive view changes
+            // View synchronization: adopt next view if peers timed out at >= our current view
+            let now_ms = (Self::now_ts() as u128) * 1000;
+            let cur = hotstuff.state.current_view;
+            if view >= cur {
+                // Advance to view+1 and reset pacemaker
+                hotstuff.state.current_view = view + 1;
+                hotstuff.state.pacemaker.on_enter_view(now_ms);
+                // If we're the leader for the new view and haven't proposed, do it now
+                let next_view = hotstuff.state.current_view;
+                let my_id = hotstuff.validator_id;
+                // Drop borrow before computing leader/proposing
+                drop(hotstuff);
+                let leader = self.leader_for_view(next_view);
+                if my_id == leader && self.last_proposed_view != Some(next_view) {
+                    let _ = self.produce_block(crate::consensus::dev_loop::DEFAULT_LIMITS);
+                }
+            }
         }
         Ok(())
     }
 
     /// Check for pacemaker timeouts and advance view if necessary
     pub fn check_pacemaker_timeout(&mut self) -> Result<(), String> {
-        if let Some(hotstuff) = self.hotstuff.as_mut() {
-            let now_ms = (Self::now_ts() as u128) * 1000;
-            // Check expiry before advancing view so we can notify peers first
-            let expired = hotstuff.state.pacemaker.expired(now_ms);
-            if expired {
-                if let Some(network) = self.consensus_network.as_ref() {
-                    let view = hotstuff.state.current_view;
-                    let _ = network.broadcast_view_change(view, Some(hotstuff.state.high_qc.clone()));
+        if self.hotstuff.is_none() { return Ok(()); }
+        let now_ms = (Self::now_ts() as u128) * 1000;
+        // Snapshot readonly fields for early-skip evaluation
+        let (view_start, cur_timeout, base_timeout, cur_view, my_id_snapshot, high_qc_snapshot) = {
+            let hs = self.hotstuff.as_ref().unwrap();
+            (
+                hs.state.pacemaker.view_start_ms,
+                hs.state.pacemaker.current_timeout_ms,
+                hs.state.pacemaker.base_timeout_ms,
+                hs.state.current_view,
+                hs.validator_id,
+                hs.state.high_qc.clone(),
+            )
+        };
+
+        // Early leader-skip hint: if no proposal observed halfway through the timeout,
+        // record a miss and, on repeated misses within a short window, advance view early.
+        let elapsed = now_ms.saturating_sub(view_start);
+        let half = (cur_timeout / 2) as u128;
+        if elapsed >= half {
+            if self.last_observed_proposal_view != Some(cur_view) && self.last_early_skip_view != Some(cur_view) {
+                let leader = self.leader_for_view(cur_view);
+                // Sliding window: base_timeout * 4
+                let window_ms = (base_timeout.saturating_mul(4)) as u128;
+                let entry = self.leader_miss.entry(leader).or_insert((0, now_ms));
+                if now_ms.saturating_sub(entry.1) > window_ms { *entry = (0, now_ms); }
+                entry.0 = entry.0.saturating_add(1);
+                if entry.0 >= 2 {
+                    if let Some(network) = self.consensus_network.as_ref() {
+                        let _ = network.broadcast_view_change(cur_view, Some(high_qc_snapshot.clone()));
+                    }
+                    // Advance view immediately without backoff
+                    if let Some(hs2) = self.hotstuff.as_mut() {
+                        let next_view = cur_view + 1;
+                        hs2.state.current_view = next_view;
+                        hs2.state.pacemaker.on_enter_view(now_ms);
+                        self.last_early_skip_view = Some(cur_view);
+                        hs2.state.pacemaker.observe_qc_latency(base_timeout);
+                        let my_id = my_id_snapshot;
+                        drop(hs2);
+                        self.chain.record_leader_miss(leader);
+                        // If we are the new leader, propose immediately
+                        let leader2 = self.leader_for_view(next_view);
+                        if my_id == leader2 && self.last_proposed_view != Some(next_view) {
+                            let _ = self.produce_block(crate::consensus::dev_loop::DEFAULT_LIMITS);
+                        }
+                        return Ok(());
+                    }
                 }
             }
-            // Capture current view, then advance the view (bumps backoff and resets timer)
-            let prev_view = hotstuff.state.current_view;
-            hotstuff.on_new_slot(now_ms);
+        }
 
-            // If we advanced to a higher view, and we're the leader for that view, propose immediately
-            let next_view = hotstuff.state.current_view;
-            let my_id = hotstuff.validator_id;
-            let n = hotstuff.validator_pks.len();
-            let advanced = next_view > prev_view;
-            // Drop the borrow before calling into self.produce_block
-            drop(hotstuff);
-            if advanced {
+        // Expiry handling and regular view advance
+        let expired = {
+            let hs = self.hotstuff.as_ref().unwrap();
+            hs.state.pacemaker.expired(now_ms)
+        };
+        if expired {
+            if let Some(network) = self.consensus_network.as_ref() {
+                let (view, qc) = {
+                    let hs = self.hotstuff.as_ref().unwrap();
+                    (hs.state.current_view, hs.state.high_qc.clone())
+                };
+                let _ = network.broadcast_view_change(view, Some(qc));
+            }
+        }
+        let prev_view = { self.hotstuff.as_ref().unwrap().state.current_view };
+        { self.hotstuff.as_mut().unwrap().on_new_slot(now_ms); }
+        let next_view = { self.hotstuff.as_ref().unwrap().state.current_view };
+        if next_view > prev_view {
+            let my_id = { self.hotstuff.as_ref().unwrap().validator_id };
             let leader = self.leader_for_view(next_view);
-                if my_id == leader && self.last_proposed_view != Some(next_view) {
-                    // Ignore errors here; the periodic producer will also try.
-                    let _ = self.produce_block(crate::consensus::dev_loop::DEFAULT_LIMITS);
-                }
+            if my_id == leader && self.last_proposed_view != Some(next_view) {
+                let _ = self.produce_block(crate::consensus::dev_loop::DEFAULT_LIMITS);
             }
         }
         Ok(())
@@ -977,7 +1066,16 @@ impl Node {
         let Some(_vrf) = &self.vrf_signer else {
             return Err(ProduceError::NotProposer { slot, leader: None, mine: Some(proposer_id) });
         };
-    
+        // Check if we are the consensus (HotStuff) leader for the current view; if so,
+        // we allow proposing regardless of VRF threshold eligibility (we will include
+        // a valid VRF proof so Chain verification passes). This avoids empty views.
+        let am_consensus_leader: bool = if let Some(hs) = self.hotstuff.as_ref() {
+            let v = hs.state.current_view;
+            let my = hs.validator_id;
+            let leader = self.leader_for_view(v);
+            my == leader
+        } else { false };
+
         // Build VRF message and check stake-weighted threshold
         let msg = build_vrf_msg(&self.chain.epoch_seed, bundle_start, proposer_id);
         let (mut vrf_out, mut vrf_pre, mut vrf_proof) = self
@@ -997,14 +1095,25 @@ impl Node {
             .schedule
             .fallback_leader_for_bundle(bundle_start);
         if !vrf_eligible(me.stake, total, &vrf_out, self.chain.tau) {
-            // Not elected via VRF. Only continue if we're the deterministic fallback leader.
-            if fallback != Some(proposer_id) {
-                return Err(ProduceError::NotProposer { slot, leader: fallback, mine: Some(proposer_id) });
+            if am_consensus_leader {
+                // If alias fallback for this bundle selects us, prefer fallback path
+                // by clearing VRF fields so chain accepts via schedule.
+                if fallback == Some(proposer_id) {
+                    vrf_out = [0u8; 32];
+                    vrf_pre = [0u8; 32];
+                    vrf_proof.clear();
+                }
+                // Else keep the proof (might still pass tie-breaker/threshold if near boundary).
+            } else {
+                // Not elected via VRF. Only continue if we're the deterministic fallback leader.
+                if fallback != Some(proposer_id) {
+                    return Err(ProduceError::NotProposer { slot, leader: fallback, mine: Some(proposer_id) });
+                }
+                // Use empty VRF fields to signal alias fallback.
+                vrf_out = [0u8; 32];
+                vrf_pre = [0u8; 32];
+                vrf_proof.clear();
             }
-            // Use empty VRF fields to signal alias fallback.
-            vrf_out = [0u8; 32];
-            vrf_pre = [0u8; 32];
-            vrf_proof.clear();
         }
     
         // 0) Prune stale items before building any view or selecting.

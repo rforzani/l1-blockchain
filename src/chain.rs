@@ -45,6 +45,9 @@ pub struct Chain {
     pub threshold_engine: ThresholdEngine,
     /// Pending threshold shares by commitment hash
     pending_shares: HashMap<Hash, Vec<crate::mempool::encrypted::ThresholdShare>>,
+    /// Optional: penalize consistently unreachable validators when building schedules.
+    pub use_liveness_penalty: bool,
+    liveness_penalty: HashMap<ValidatorId, u64>,
 }
 
 #[derive(Clone)]
@@ -109,6 +112,8 @@ impl Chain {
             tau: DEFAULT_TAU,
             threshold_engine: ThresholdEngine::new(),
             pending_shares: HashMap::new(),
+            use_liveness_penalty: false,
+            liveness_penalty: HashMap::new(),
         }
     }
 
@@ -269,7 +274,12 @@ impl Chain {
         );
 
         // Install the new validator set and seed.
-        self.validator_set = new_set;
+        // Optionally apply liveness penalties to dampen unreachable proposers.
+        self.validator_set = if self.use_liveness_penalty {
+            self.adjust_validator_set_with_penalties(&new_set)
+        } else {
+            new_set
+        };
         self.epoch_seed = new_seed;
 
         // Rebuild the proposer schedule for the new epoch.
@@ -284,6 +294,30 @@ impl Chain {
         buf.extend_from_slice(b"l1-blockchain/epoch-accum/start:v1");
         buf.extend_from_slice(&self.epoch_seed);
         self.epoch_accumulator = hash_bytes_sha256(&buf);
+    }
+
+    /// Increment the liveness penalty counter for a validator (called when leader misses).
+    pub fn record_leader_miss(&mut self, vid: ValidatorId) {
+        let c = self.liveness_penalty.entry(vid).or_insert(0);
+        *c = c.saturating_add(1);
+    }
+
+    /// Build an adjusted validator set where stake is down-weighted by recent misses.
+    /// Determinism note: This should be driven by consensus-evidenced data; by default
+    /// `use_liveness_penalty` is false. When enabled, all nodes must apply identical inputs.
+    fn adjust_validator_set_with_penalties(&self, set: &ValidatorSet) -> ValidatorSet {
+        let mut adjusted = set.clone();
+        for v in adjusted.validators.iter_mut() {
+            if let Some(misses) = self.liveness_penalty.get(&v.id) {
+                // Simple penalty: divide stake by (1 + min(misses, cap)).
+                let cap = 5u64;
+                let denom = 1 + core::cmp::min(*misses, cap);
+                let denom_u128: u128 = (denom.max(1)) as u128;
+                v.stake = v.stake.saturating_div(denom_u128);
+                if v.stake == 0 { v.stake = 1; }
+            }
+        }
+        adjusted
     }
 
     /// Derive the next epoch's seed from the current epoch's seed and its final accumulator.

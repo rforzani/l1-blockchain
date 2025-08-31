@@ -133,7 +133,11 @@ fn safe_to_vote<S: BlockStore>(
     if justify_qc.view < state.locked_block.1 {
         return false;
     }
-    // proposal must extend the locked block
+    // Fast-path: proposal builds directly on the certified block.
+    if proposal_parent == &justify_qc.block_id {
+        return true;
+    }
+    // Otherwise, require the proposal to extend the locked block via known lineage.
     store.is_descendant(proposal_parent, &state.locked_block.0)
 }
 
@@ -343,16 +347,8 @@ impl HotStuff {
         // Buffer this vote for batch verification (dedup pending + seen)
         entry.add_pending(vote.voter_id as usize, &vote.bls_sig);
 
-        // Decide when to verify pending batch:
-        // - if pending batch is large enough, or
-        // - if adding all pendings could reach quorum.
-        let pending = entry.pending_len();
-        let have = entry.bitmap.count_ones();
-        let need = (2 * n) / 3 + 1;
-        const BATCH_VERIFY_MIN: usize = 4; // small batches amortize better
-        if pending >= BATCH_VERIFY_MIN || have + pending >= need {
-            entry.drain_pending_with_agg_verify(&self.validator_pks);
-        }
+        // Verify pending immediately to ensure progress even under sparse arrivals.
+        entry.drain_pending_with_agg_verify(&self.validator_pks);
 
         // If quorum reached after verification, finalize to QC and return it.
         if has_quorum(n, &entry.bitmap) {
