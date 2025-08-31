@@ -18,7 +18,7 @@ use anyhow::{Result, anyhow};
 use tracing::{info, warn, error, debug};
 
 use crate::pos::registry::ValidatorId;
-use crate::types::{Block, Vote, QC, Hash};
+use crate::types::{Block, Vote, QC, Hash, SlashingEvidence};
 
 /// Network messages for HotStuff consensus protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +46,8 @@ pub enum ConsensusMessage {
         sender_id: ValidatorId,
         timeout_qc: Option<QC>, // If we have a QC that justifies the timeout
     },
+    /// Gossip slashing evidence for misbehavior
+    SlashEvidence(SlashingEvidence),
 }
 
 /// P2P Network Behaviour combining all protocols
@@ -248,7 +250,8 @@ impl ConsensusNetwork {
             "hotstuff-proposals",
             "hotstuff-votes", 
             "hotstuff-qcs",
-            "hotstuff-view-changes"
+            "hotstuff-view-changes",
+            "hotstuff-slash-evidence",
         ];
         
         for topic_str in &topics {
@@ -452,6 +455,20 @@ impl ConsensusNetwork {
     pub fn install_direct_peers(&self, map: HashMap<ValidatorId, broadcast::Sender<ConsensusMessage>>) {
         *self.direct_peers.lock().unwrap() = map;
     }
+
+    /// Broadcast slashing evidence to all validators
+    pub fn broadcast_slash_evidence(&self, evidence: SlashingEvidence) -> Result<()> {
+        let msg = ConsensusMessage::SlashEvidence(evidence);
+        if !self.direct_peers.lock().unwrap().is_empty() {
+            for (vid, tx) in self.direct_peers.lock().unwrap().iter() {
+                if *vid == self.validator_id { continue; }
+                let _ = tx.send(msg.clone());
+            }
+        } else {
+            self.broadcast_message(msg)?;
+        }
+        Ok(())
+    }
 }
 
 /// Network task handling P2P events
@@ -592,6 +609,7 @@ impl NetworkTask {
                 ConsensusMessage::ViewChange { sender_id, .. } => {
                     self.validator_to_peer.lock().unwrap().insert(*sender_id, source);
                 }
+                ConsensusMessage::SlashEvidence(_) => {}
             }
             if let Err(e) = self.message_tx.send(consensus_msg) {
                 error!("Failed to forward consensus message: {}", e);
@@ -609,6 +627,7 @@ impl NetworkTask {
             ConsensusMessage::Vote { .. } => IdentTopic::new("hotstuff-votes"),
             ConsensusMessage::QC { .. } => IdentTopic::new("hotstuff-qcs"),
             ConsensusMessage::ViewChange { .. } => IdentTopic::new("hotstuff-view-changes"),
+            ConsensusMessage::SlashEvidence(_) => IdentTopic::new("hotstuff-slash-evidence"),
         };
         
         let data = serde_json::to_vec(&msg)

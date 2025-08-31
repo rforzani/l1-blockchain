@@ -181,6 +181,23 @@ pub struct QC {
     pub bitmap: BitVec,          // which validators signed (for auditing/slashing)
 }
 
+/// Canonical slashing evidence propagated over the network.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum SlashingEvidence {
+    /// A proposer produced an invalid block proposal.
+    /// The offending block is included for verification by receivers.
+    InvalidProposal {
+        proposer: ValidatorId,
+        block: Block,
+    },
+    /// A validator signed two conflicting votes for the same view/height.
+    DoubleVote {
+        voter: ValidatorId,
+        vote_a: Vote,
+        vote_b: Vote,
+    },
+}
+
 pub struct HotStuffState {
     pub current_view: u64,
     pub locked_block: (Hash, u64),    // id and view of the block we’re locked on

@@ -568,6 +568,9 @@ impl Node {
                 ConsensusMessage::ViewChange { view, sender_id, timeout_qc } => {
                     self.handle_view_change(view, sender_id, timeout_qc)?;
                 }
+                ConsensusMessage::SlashEvidence(_e) => {
+                    // TODO: Integrate slashing pipeline; for now, accept and ignore.
+                }
             }
         }
         
@@ -608,6 +611,9 @@ impl Node {
             }
             crate::p2p::ConsensusMessage::ViewChange { view, sender_id, timeout_qc } => {
                 self.handle_view_change(view, sender_id, timeout_qc)?;
+            }
+            crate::p2p::ConsensusMessage::SlashEvidence(_e) => {
+                // TODO: Integrate slashing pipeline; for now, accept and ignore.
             }
         }
         Ok(committed_blocks)
@@ -1033,19 +1039,20 @@ impl Node {
         let _slot_now   = self.chain.clock.current_slot(now_ms);
 
         // Choose parent based on consensus state if enabled; otherwise use local tip.
-        // Compute height relative to the parent's known height to avoid drift in
-        // networked mode where local chain.height lags committed state.
+        // In consensus mode, we must know the parent header locally to derive a
+        // deterministic child height. If we don't, skip proposing this slot and
+        // wait for the parent proposal to arrive via the network.
         let (parent_hash, parent_height) = if let Some(hs) = self.hotstuff.as_ref() {
             let ph = hs.state.high_qc.block_id;
-            let ph_height = if ph == self.chain.tip_hash {
-                self.chain.height
+            if ph == self.chain.tip_hash {
+                (ph, self.chain.height)
             } else if let Some(b) = self.block_store.get(&ph) {
-                b.header.height
+                (ph, b.header.height)
             } else {
-                // Fallback to local height if we don't have the parent block yet
-                self.chain.height
-            };
-            (ph, ph_height)
+                return Err(ProduceError::HeaderBuild(
+                    "missing high_qc parent header; waiting for proposal".into()
+                ));
+            }
         } else {
             (self.chain.tip_hash, self.chain.height)
         };
