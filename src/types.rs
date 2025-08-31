@@ -397,4 +397,10 @@ pub enum Event {
     AvailabilityRecorded { commitment: Hash },
     ThresholdShareReceived { commitment: Hash, validator_id: ValidatorId },
     ThresholdDecryptionComplete { commitment: Hash },
+    // --- Staking / Registry events (on-chain ops) ---
+    StakeRegister { address: Address, ed25519: [u8; 32], bls: [u8; 48], vrf: [u8; 32] },
+    StakeBond { address: Address, amount: u64 },
+    StakeUnbond { address: Address, amount: u64 },
+    StakeActivate { address: Address },
+    StakeDeactivate { address: Address },
 }

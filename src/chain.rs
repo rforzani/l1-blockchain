@@ -7,13 +7,13 @@ use crate::crypto::vrf::{build_vrf_msg, vrf_eligible, SchnorrkelVrf, VrfPubkey, 
 use crate::crypto::{addr_from_pubkey, addr_hex, hash_bytes_sha256, verify_ed25519};
 use crate::crypto::bls::{verify_qc, verify_sig, vote_msg};
 use crate::fees::{update_commit_base, update_exec_base, FeeState, FEE_PARAMS};
-use crate::pos::registry::{StakingConfig, ValidatorSet, ValidatorStatus, ValidatorId};
+use crate::pos::registry::{StakingConfig, ValidatorSet, ValidatorStatus, ValidatorId, Validator};
 use crate::pos::schedule::{AliasSchedule, ProposerSchedule};
 use crate::pos::slots::SlotClock;
 use crate::stf::{process_block, BlockError};
 use crate::mempool::{BatchStore, ThresholdEngine};
 use crate::state::{Available, Balances, Commitments, Nonces, DECRYPTION_DELAY, REVEAL_WINDOW};
-use crate::types::{Block, BlockHeader, Event, Hash, Receipt, SlashingEvidence};
+use crate::types::{Block, BlockHeader, Event, Hash, Receipt, SlashingEvidence, Address};
 use crate::verify::verify_block_roots;
 use std::collections::{HashMap, HashSet, BTreeMap};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -50,6 +50,19 @@ pub struct Chain {
     liveness_penalty: HashMap<ValidatorId, u64>,
     /// Historical slash counts per validator (lightweight accounting)
     pub slash_history: HashMap<ValidatorId, u64>,
+    /// On-chain staking registry
+    pub registry: HashMap<Address, RegistryEntry>,
+    /// Staking configuration
+    pub staking_cfg: StakingConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct RegistryEntry {
+    pub ed25519_pubkey: [u8; 32],
+    pub bls_pubkey: [u8; 48],
+    pub vrf_pubkey: [u8; 32],
+    pub stake: u128,
+    pub status: ValidatorStatus,
 }
 
 #[derive(Clone)]
@@ -117,6 +130,8 @@ impl Chain {
             use_liveness_penalty: false,
             liveness_penalty: HashMap::new(),
             slash_history: HashMap::new(),
+            registry: HashMap::new(),
+            staking_cfg,
         }
     }
 
@@ -497,6 +512,47 @@ impl Chain {
                     // Handle completed threshold decryption
                     // This could trigger reveal processing or other consensus actions
                 }
+                // --- Staking events ---
+                Event::StakeRegister { address, ed25519, bls, vrf } => {
+                    self.registry.entry(address.clone()).and_modify(|e| {
+                        e.ed25519_pubkey = *ed25519;
+                        e.bls_pubkey = *bls;
+                        e.vrf_pubkey = *vrf;
+                    }).or_insert(RegistryEntry {
+                        ed25519_pubkey: *ed25519,
+                        bls_pubkey: *bls,
+                        vrf_pubkey: *vrf,
+                        stake: 0,
+                        status: ValidatorStatus::Inactive,
+                    });
+                }
+                Event::StakeBond { address, amount } => {
+                    let entry = self.registry.entry(address.clone()).or_insert(RegistryEntry {
+                        ed25519_pubkey: [0u8;32], bls_pubkey: [0u8;48], vrf_pubkey: [0u8;32], stake: 0, status: ValidatorStatus::Inactive
+                    });
+                    entry.stake = entry.stake.saturating_add(*amount as u128);
+                }
+                Event::StakeUnbond { address, amount } => {
+                    if let Some(entry) = self.registry.get_mut(address) {
+                        let amt = *amount as u128;
+                        if entry.stake >= amt {
+                            entry.stake -= amt;
+                            if entry.status == ValidatorStatus::Active && entry.stake < self.staking_cfg.min_stake {
+                                entry.status = ValidatorStatus::Inactive;
+                            }
+                        }
+                    }
+                }
+                Event::StakeActivate { address } => {
+                    if let Some(entry) = self.registry.get_mut(address) {
+                        if entry.stake >= self.staking_cfg.min_stake { entry.status = ValidatorStatus::Active; }
+                    }
+                }
+                Event::StakeDeactivate { address } => {
+                    if let Some(entry) = self.registry.get_mut(address) {
+                        entry.status = ValidatorStatus::Inactive;
+                    }
+                }
             }
         }
 
@@ -518,7 +574,41 @@ impl Chain {
             self.fee_state.commit_base,
             res.commits_used,
         );
+        // Epoch boundary: rebuild validator set from on-chain registry
+        if self.clock.epoch_slots > 0 {
+            let idx = self.clock.slot_in_epoch(block.header.slot);
+            if idx + 1 == self.clock.epoch_slots {
+                // Next epoch index
+                let next_epoch = block.header.epoch.saturating_add(1);
+                let new_set = self.build_set_from_registry(next_epoch);
+                let new_seed = self.next_epoch_seed(self.epoch_accumulator);
+                self.on_epoch_transition(new_set, new_seed);
+            }
+        }
+
         Ok(ApplyResult { receipts: res.receipts, gas_total: res.gas_total, events: res.events, exec_reveals_used: res.exec_reveals_used, commits_used: res.commits_used, burned_total: self.burned_total })
+    }
+
+    fn build_set_from_registry(&self, epoch: u64) -> ValidatorSet {
+        let mut entries: Vec<(&Address, &RegistryEntry)> = self
+            .registry
+            .iter()
+            .filter(|(_, e)| e.status == ValidatorStatus::Active && e.stake >= self.staking_cfg.min_stake)
+            .collect();
+        entries.sort_by(|a, b| a.1.ed25519_pubkey.cmp(&b.1.ed25519_pubkey));
+        let mut vals: Vec<Validator> = Vec::new();
+        for (i, (_addr, e)) in entries.into_iter().enumerate() {
+            if i as u32 >= self.staking_cfg.max_validators { break; }
+            vals.push(Validator {
+                id: i as u64,
+                ed25519_pubkey: e.ed25519_pubkey,
+                bls_pubkey: Some(e.bls_pubkey),
+                vrf_pubkey: e.vrf_pubkey,
+                stake: e.stake,
+                status: ValidatorStatus::Active,
+            });
+        }
+        ValidatorSet::from_genesis(epoch, &self.staking_cfg, vals)
     }
 
     pub fn commit_simulated_block(
@@ -613,6 +703,45 @@ impl Chain {
                 Event::ThresholdDecryptionComplete { commitment: _ } => {
                     // Handle completed threshold decryption
                     // This could trigger reveal processing or other consensus actions
+                }
+                // --- Staking events ---
+                Event::StakeRegister { address, ed25519, bls, vrf } => {
+                    self.registry.entry(address.clone()).and_modify(|e| {
+                        e.ed25519_pubkey = *ed25519;
+                        e.bls_pubkey = *bls;
+                        e.vrf_pubkey = *vrf;
+                    }).or_insert(RegistryEntry {
+                        ed25519_pubkey: *ed25519,
+                        bls_pubkey: *bls,
+                        vrf_pubkey: *vrf,
+                        stake: 0,
+                        status: ValidatorStatus::Inactive,
+                    });
+                }
+                Event::StakeBond { address, amount } => {
+                    let entry = self.registry.entry(address.clone()).or_insert(RegistryEntry {
+                        ed25519_pubkey: [0u8;32], bls_pubkey: [0u8;48], vrf_pubkey: [0u8;32], stake: 0, status: ValidatorStatus::Inactive
+                    });
+                    entry.stake = entry.stake.saturating_add(*amount as u128);
+                }
+                Event::StakeUnbond { address, amount } => {
+                    if let Some(entry) = self.registry.get_mut(address) {
+                        let amt = *amount as u128;
+                        if entry.stake >= amt {
+                            entry.stake -= amt;
+                            if entry.status == ValidatorStatus::Active && entry.stake < self.staking_cfg.min_stake {
+                                entry.status = ValidatorStatus::Inactive;
+                            }
+                        }
+                    }
+                }
+                Event::StakeActivate { address } => {
+                    if let Some(entry) = self.registry.get_mut(address) {
+                        if entry.stake >= self.staking_cfg.min_stake { entry.status = ValidatorStatus::Active; }
+                    }
+                }
+                Event::StakeDeactivate { address } => {
+                    if let Some(entry) = self.registry.get_mut(address) { entry.status = ValidatorStatus::Inactive; }
                 }
             }
         }

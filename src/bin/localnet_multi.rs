@@ -1,12 +1,12 @@
 //! Local devnet: spin up multiple validators with RPC + P2P HotStuff
 //!
-//! - Starts N validators (default 3) in a single process
+//! - Starts N validators (default 3) and M observers (default 0) in a single process
 //! - Each validator has its own RPC port (base 8545 + idx)
 //! - Nodes discover each other via libp2p (using the in-crate P2P helper)
 //! - Runs HotStuff consensus end-to-end (proposal, votes, QC broadcast)
 //!
 //! Usage:
-//!   cargo run --bin localnet_multi -- [N] [RPC_BASE]
+//!   cargo run --bin localnet_multi -- [N_VALIDATORS] [N_OBSERVERS] [RPC_BASE]
 //! Example:
 //!   cargo run --bin localnet_multi -- 4 9000
 
@@ -83,28 +83,44 @@ fn make_genesis_qc(signers: &[BlsSigner]) -> QC {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Parse CLI args: N validators and base RPC port
+    // Parse CLI args: N validators, M observers, and base RPC port
     let args: Vec<String> = env::args().collect();
-    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3);
-    let rpc_base: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8545);
+    let n_validators: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3);
+    let n_observers: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let rpc_base: u16 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8545);
 
     // Build shared validator set and keys
-    let (validators, bls_signers, ed_seeds) = make_validators(n);
+    let (validators, bls_signers, ed_seeds) = make_validators(n_validators);
     let genesis_qc = make_genesis_qc(&bls_signers);
 
     // Build nodes
-    let mut nodes: Vec<Arc<Mutex<Node>>> = Vec::with_capacity(n);
-    for i in 0..n {
+    let total = n_validators + n_observers;
+    let mut nodes: Vec<Arc<Mutex<Node>>> = Vec::with_capacity(total);
+    // Precompute ed25519 seeds for observers as well
+    let mut ed_all: Vec<[u8; 32]> = Vec::with_capacity(total);
+    ed_all.extend_from_slice(&ed_seeds);
+    for j in 0..n_observers {
+        ed_all.push([((n_validators + j) as u8).wrapping_add(1); 32]);
+    }
+
+    for i in 0..total {
         let mp = MempoolImpl::new(build_mempool_config());
-        let ed = SigningKey::from_bytes(&ed_seeds[i]);
+        let ed = SigningKey::from_bytes(&ed_all[i]);
         let mut node = Node::new(mp.clone(), ed);
 
         // VRF signer
         let vrf = SchnorrkelVrfSigner::from_deterministic_seed([(i as u8).wrapping_add(7); 32]);
         node.set_vrf_signer(vrf);
 
-        // Shared validator set and my BLS signer
-        node.init_with_shared_validator_set(validators.clone(), bls_signers[i].clone());
+        // Shared validator set installed on all nodes. Observers are not included in this set.
+        // For nodes beyond n_validators, provide a throwaway BLS signer for genesis install only.
+        let my_bls_install = if i < n_validators {
+            bls_signers[i].clone()
+        } else {
+            let sk = [((i as u8).wrapping_add(10)); 32];
+            BlsSigner::from_sk_bytes(&sk).expect("valid bls sk")
+        };
+        node.init_with_shared_validator_set(validators.clone(), my_bls_install.clone());
 
         // Configure HotStuff
         let active_bls_pks: Vec<[u8; 48]> = validators.iter().map(|v| v.bls_pubkey.expect("bls")).collect();
@@ -121,7 +137,13 @@ async fn main() -> anyhow::Result<()> {
             high_qc: genesis_qc.clone(),
             pacemaker,
         };
-        let hotstuff = HotStuff::new(hs_state, active_bls_pks, i as ValidatorId, Some(bls_signers[i].clone()));
+        // Observers (i >= n_validators) do not have a BLS signer in HotStuff to suppress voting traffic.
+        let hotstuff = HotStuff::new(
+            hs_state,
+            active_bls_pks,
+            i as ValidatorId,
+            if i < n_validators { Some(my_bls_install) } else { None }
+        );
         node.set_hotstuff(hotstuff);
 
         // Shorter slot period for faster dev loops: set 500ms and align clock
@@ -138,9 +160,9 @@ async fn main() -> anyhow::Result<()> {
         nodes.push(arc);
     }
 
-    // Wire up P2P consensus networking across validators
+    // Wire up P2P consensus networking across all nodes (validators + observers)
     {
-        let ids: Vec<ValidatorId> = (0..n as u64).collect();
+        let ids: Vec<ValidatorId> = (0..total as u64).collect();
         let networks = create_test_network(ids).await?;
         for (i, net) in networks.into_iter().enumerate() {
             nodes[i].lock().unwrap().set_consensus_network(net);
@@ -202,9 +224,9 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Spawn RPC servers for each validator
-    let mut rpc_handles = Vec::with_capacity(n);
-    for i in 0..n {
+    // Spawn RPC servers for each node
+    let mut rpc_handles = Vec::with_capacity(total);
+    for i in 0..total {
         let node = nodes[i].clone();
         let port = rpc_base + (i as u16);
         let app_state = AppState { node, faucet: Arc::new(Mutex::new(FaucetLimiter::new(1_000_000))) };

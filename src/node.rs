@@ -833,8 +833,10 @@ impl Node {
                 if now_ms.saturating_sub(entry.1) > window_ms { *entry = (0, now_ms); }
                 entry.0 = entry.0.saturating_add(1);
                 if entry.0 >= 2 {
-                    if let Some(network) = self.consensus_network.as_ref() {
-                        let _ = network.broadcast_view_change(cur_view, Some(high_qc_snapshot.clone()));
+                    if self.my_validator_id().is_some() {
+                        if let Some(network) = self.consensus_network.as_ref() {
+                            let _ = network.broadcast_view_change(cur_view, Some(high_qc_snapshot.clone()));
+                        }
                     }
                     // Advance view immediately without backoff
                     if let Some(hs2) = self.hotstuff.as_mut() {
@@ -863,12 +865,14 @@ impl Node {
             hs.state.pacemaker.expired(now_ms)
         };
         if expired {
-            if let Some(network) = self.consensus_network.as_ref() {
-                let (view, qc) = {
-                    let hs = self.hotstuff.as_ref().unwrap();
-                    (hs.state.current_view, hs.state.high_qc.clone())
-                };
-                let _ = network.broadcast_view_change(view, Some(qc));
+            if self.my_validator_id().is_some() {
+                if let Some(network) = self.consensus_network.as_ref() {
+                    let (view, qc) = {
+                        let hs = self.hotstuff.as_ref().unwrap();
+                        (hs.state.current_view, hs.state.high_qc.clone())
+                    };
+                    let _ = network.broadcast_view_change(view, Some(qc));
+                }
             }
         }
         let prev_view = { self.hotstuff.as_ref().unwrap().state.current_view };
