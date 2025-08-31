@@ -19,9 +19,11 @@ pub fn compute_roots_for(block: &Block, batches: &BatchStore, receipts: &[Receip
         let h = hash_bytes_sha256(&tx_enum_bytes(tx));
         seen_in_block.insert(h);
     }
-    // Append batch transactions only if not already present in block.transactions
-    for d in &block.batch_digests {
-        if let Some(batch) = batches.get(d) {
+    // Append transactions only from the latest batch digest (if any), skipping
+    // those already present in block.transactions. Parent digests are DAG hints
+    // and not required for root computation.
+    if let Some(last) = block.batch_digests.last() {
+        if let Some(batch) = batches.get(last) {
             for tx in batch.txs {
                 let h = hash_bytes_sha256(&tx_enum_bytes(&tx));
                 if !seen_in_block.contains(&h) {

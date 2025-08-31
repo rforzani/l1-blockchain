@@ -361,10 +361,7 @@ impl ConsensusNetwork {
 
     /// Broadcast a QC to all connected peers
     pub fn broadcast_qc(&self, qc: QC) -> Result<()> {
-        let msg = ConsensusMessage::QC {
-            qc,
-            sender_id: self.validator_id,
-        };
+        let msg = ConsensusMessage::QC { qc, sender_id: self.validator_id };
         if !self.direct_peers.lock().unwrap().is_empty() {
             for (vid, tx) in self.direct_peers.lock().unwrap().iter() {
                 if *vid == self.validator_id { continue; }

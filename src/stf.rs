@@ -563,11 +563,13 @@ pub fn process_block(
         let h = hash_bytes_sha256(&tx_enum_bytes(tx));
         seen_in_block.insert(h);
     }
-    // Append batch transactions, skipping only those already present in block.transactions.
-    for d in &block.batch_digests {
+    // Append batch transactions only from the latest batch digest (if any),
+    // skipping those already present in block.transactions. Parent digests are
+    // included in the header as DAG hints and are not required for execution.
+    if let Some(last) = block.batch_digests.last() {
         let batch = batch_store
-            .get(d)
-            .ok_or(BlockError::MissingBatch(*d))?;
+            .get(last)
+            .ok_or(BlockError::MissingBatch(*last))?;
         for tx in batch.txs {
             let h = hash_bytes_sha256(&tx_enum_bytes(&tx));
             if !seen_in_block.contains(&h) {

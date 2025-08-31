@@ -5,7 +5,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use crate::codec::{header_bytes, header_signing_bytes, qc_commitment};
 use crate::crypto::vrf::{build_vrf_msg, vrf_eligible, SchnorrkelVrf, VrfPubkey, VrfVerifier};
 use crate::crypto::{addr_from_pubkey, addr_hex, hash_bytes_sha256, verify_ed25519};
-use crate::crypto::bls::verify_qc;
+use crate::crypto::bls::{verify_qc, verify_sig, vote_msg};
 use crate::fees::{update_commit_base, update_exec_base, FeeState, FEE_PARAMS};
 use crate::pos::registry::{StakingConfig, ValidatorSet, ValidatorStatus, ValidatorId};
 use crate::pos::schedule::{AliasSchedule, ProposerSchedule};
@@ -13,7 +13,7 @@ use crate::pos::slots::SlotClock;
 use crate::stf::{process_block, BlockError};
 use crate::mempool::{BatchStore, ThresholdEngine};
 use crate::state::{Available, Balances, Commitments, Nonces, DECRYPTION_DELAY, REVEAL_WINDOW};
-use crate::types::{Block, BlockHeader, Event, Hash, Receipt};
+use crate::types::{Block, BlockHeader, Event, Hash, Receipt, SlashingEvidence};
 use crate::verify::verify_block_roots;
 use std::collections::{HashMap, HashSet, BTreeMap};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -48,6 +48,8 @@ pub struct Chain {
     /// Optional: penalize consistently unreachable validators when building schedules.
     pub use_liveness_penalty: bool,
     liveness_penalty: HashMap<ValidatorId, u64>,
+    /// Historical slash counts per validator (lightweight accounting)
+    pub slash_history: HashMap<ValidatorId, u64>,
 }
 
 #[derive(Clone)]
@@ -114,6 +116,7 @@ impl Chain {
             pending_shares: HashMap::new(),
             use_liveness_penalty: false,
             liveness_penalty: HashMap::new(),
+            slash_history: HashMap::new(),
         }
     }
 
@@ -406,7 +409,7 @@ impl Chain {
         }
 
         // QC verification: all active validators must have BLS keys
-        let active_bls_pks = self.collect_active_bls_pubkeys()?;
+        let active_bls_pks = self.collect_bls_pubkeys_snapshot()?;
         let computed_qc_hash = qc_commitment(
             block.justify_qc.view,
             &block.justify_qc.block_id,
@@ -552,7 +555,7 @@ impl Chain {
         }
 
         // QC verification: all active validators must have BLS keys
-        let active_bls_pks = self.collect_active_bls_pubkeys()?;
+        let active_bls_pks = self.collect_bls_pubkeys_snapshot()?;
         let computed_qc_hash = qc_commitment(
             block.justify_qc.view,
             &block.justify_qc.block_id,
@@ -722,23 +725,156 @@ impl Chain {
         });
     }
 
-    /// Collect BLS public keys from active validators in stable order.
-    /// Returns an error if any active validator is missing a BLS key.
-    fn collect_active_bls_pubkeys(&self) -> Result<Vec<[u8; 48]>, BlockError> {
+    /// Collect BLS public keys from the current validator set in stable id order.
+    /// Do not filter by status so QC verification remains stable across mid-epoch
+    /// stake/status changes (e.g., slashing/jailing). Missing keys result in an error.
+    fn collect_bls_pubkeys_snapshot(&self) -> Result<Vec<[u8; 48]>, BlockError> {
         let mut out = Vec::new();
         for v in &self.validator_set.validators {
-            if v.status == ValidatorStatus::Active {
-                match v.bls_pubkey {
-                    Some(pk) => out.push(pk),
-                    None => {
-                        return Err(BlockError::IntrinsicInvalid(
-                            "active validator missing BLS key".into(),
-                        ))
-                    }
+            match v.bls_pubkey {
+                Some(pk) => out.push(pk),
+                None => {
+                    return Err(BlockError::IntrinsicInvalid(
+                        "validator missing BLS key".into(),
+                    ))
                 }
             }
         }
         Ok(out)
+    }
+
+    /// Apply a slashing action based on validated evidence.
+    /// - For DoubleVote: verify both BLS signatures over (block_id, view), slash stake and jail.
+    /// - For InvalidProposal: if QC invalid or header/QC mismatch, apply a smaller stake slash.
+    /// Returns Ok(()) if applied, or Err(reason) if evidence is invalid or unverifiable.
+    pub fn apply_slash(&mut self, evidence: &SlashingEvidence, cfg: &StakingConfig) -> Result<(), String> {
+        const SLASH_BPS_DOUBLE_VOTE: u64 = 500; // 5%
+        const SLASH_BPS_INVALID_PROPOSAL: u64 = 50; // 0.5%
+
+        match evidence {
+            SlashingEvidence::DoubleVote { voter, vote_a, vote_b } => {
+                // Basic shape checks
+                if vote_a.voter_id != *voter || vote_b.voter_id != *voter {
+                    return Err("voter id mismatch".into());
+                }
+                if vote_a.view != vote_b.view { return Err("views differ".into()); }
+                if vote_a.block_id == vote_b.block_id { return Err("identical blocks".into()); }
+
+                // Fetch BLS pk from validator set
+                let v = self
+                    .validator_set
+                    .get(*voter)
+                    .ok_or_else(|| "unknown validator".to_string())?;
+                let pk = v
+                    .bls_pubkey
+                    .ok_or_else(|| "validator missing BLS key".to_string())?;
+
+                // Verify both signatures
+                let msg_a = vote_msg(&vote_a.block_id, vote_a.view);
+                let msg_b = vote_msg(&vote_b.block_id, vote_b.view);
+                if !verify_sig(&pk, &msg_a, &vote_a.bls_sig) || !verify_sig(&pk, &msg_b, &vote_b.bls_sig) {
+                    return Err("invalid vote signature(s)".into());
+                }
+
+                // Apply penalty
+                if let Some(vm) = self.validator_set.validators.iter_mut().find(|vv| vv.id == *voter) {
+                    let stake = vm.stake;
+                    let penalty = (stake.saturating_mul(SLASH_BPS_DOUBLE_VOTE as u128)) / 10_000u128;
+                    let penalty = if penalty == 0 { 1 } else { penalty };
+                    vm.stake = stake.saturating_sub(penalty);
+                    // Jail for equivocation
+                    vm.status = ValidatorStatus::Jailed;
+                }
+                // Recompute total active stake
+                self.validator_set.total_stake = self
+                    .validator_set
+                    .validators
+                    .iter()
+                    .filter(|v| v.status == ValidatorStatus::Active)
+                    .map(|v| v.stake)
+                    .fold(0u128, |acc, x| acc.saturating_add(x));
+
+                // Record
+                *self.slash_history.entry(*voter).or_insert(0) = self
+                    .slash_history
+                    .get(voter)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                // Reset liveness misses for offender if enabled to avoid double-penalizing
+                if self.use_liveness_penalty {
+                    self.liveness_penalty.remove(voter);
+                }
+                // Rebuild proposer schedule immediately to reflect stake/status change
+                let epoch_slots = self.clock.epoch_slots;
+                self.schedule
+                    .rebuild(self.validator_set.epoch, epoch_slots, &self.validator_set, self.epoch_seed);
+                Ok(())
+            }
+            SlashingEvidence::InvalidProposal { proposer, block } => {
+                // Validate that the proposal is indeed invalid relative to the attached QC
+                let committed = qc_commitment(
+                    block.justify_qc.view,
+                    &block.justify_qc.block_id,
+                    &block.justify_qc.agg_sig,
+                    &block.justify_qc.bitmap,
+                );
+                let header_mismatch = block.header.justify_qc_hash != committed;
+
+                // Check QC signature against the current snapshot order (status-agnostic)
+                let bls_vec = self.collect_bls_pubkeys_snapshot()
+                    .map_err(|e| format!("cannot collect bls keys: {:?}", e))?;
+                let qc_bad = verify_qc(
+                    &block.justify_qc.block_id,
+                    block.justify_qc.view,
+                    &block.justify_qc.agg_sig,
+                    &block.justify_qc.bitmap,
+                    &bls_vec,
+                )
+                .is_err();
+
+                if !(header_mismatch || qc_bad) {
+                    return Err("evidence does not prove invalid proposal".into());
+                }
+
+                // Apply a smaller stake slash; do not jail by default
+                if let Some(vm) = self.validator_set.validators.iter_mut().find(|vv| vv.id == *proposer) {
+                    let stake = vm.stake;
+                    let penalty = (stake.saturating_mul(SLASH_BPS_INVALID_PROPOSAL as u128)) / 10_000u128;
+                    let penalty = if penalty == 0 { 1 } else { penalty };
+                    vm.stake = stake.saturating_sub(penalty);
+                    // If below min_stake and active, downgrade to Inactive
+                    if vm.status == ValidatorStatus::Active && vm.stake < cfg.min_stake {
+                        vm.status = ValidatorStatus::Inactive;
+                    }
+                }
+                // Recompute total active stake
+                self.validator_set.total_stake = self
+                    .validator_set
+                    .validators
+                    .iter()
+                    .filter(|v| v.status == ValidatorStatus::Active)
+                    .map(|v| v.stake)
+                    .fold(0u128, |acc, x| acc.saturating_add(x));
+
+                // Record
+                *self.slash_history.entry(*proposer).or_insert(0) = self
+                    .slash_history
+                    .get(proposer)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                // Reset liveness misses for offender if enabled to avoid double-penalizing
+                if self.use_liveness_penalty {
+                    self.liveness_penalty.remove(proposer);
+                }
+                // Rebuild proposer schedule immediately to reflect stake/status change
+                let epoch_slots = self.clock.epoch_slots;
+                self.schedule
+                    .rebuild(self.validator_set.epoch, epoch_slots, &self.validator_set, self.epoch_seed);
+                Ok(())
+            }
+        }
     }
 }
 

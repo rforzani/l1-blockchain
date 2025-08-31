@@ -568,8 +568,12 @@ impl Node {
                 ConsensusMessage::ViewChange { view, sender_id, timeout_qc } => {
                     self.handle_view_change(view, sender_id, timeout_qc)?;
                 }
-                ConsensusMessage::SlashEvidence(_e) => {
-                    // TODO: Integrate slashing pipeline; for now, accept and ignore.
+                ConsensusMessage::SlashEvidence(e) => {
+                    // Validate and apply slashing
+                    let cfg = StakingConfig { min_stake: 1, unbonding_epochs: 1, max_validators: u32::MAX };
+                    if let Err(err) = self.chain.apply_slash(&e, &cfg) {
+                        eprintln!("Ignoring invalid slashing evidence: {}", err);
+                    }
                 }
             }
         }
@@ -612,8 +616,11 @@ impl Node {
             crate::p2p::ConsensusMessage::ViewChange { view, sender_id, timeout_qc } => {
                 self.handle_view_change(view, sender_id, timeout_qc)?;
             }
-            crate::p2p::ConsensusMessage::SlashEvidence(_e) => {
-                // TODO: Integrate slashing pipeline; for now, accept and ignore.
+            crate::p2p::ConsensusMessage::SlashEvidence(e) => {
+                let cfg = StakingConfig { min_stake: 1, unbonding_epochs: 1, max_validators: u32::MAX };
+                if let Err(err) = self.chain.apply_slash(&e, &cfg) {
+                    eprintln!("Ignoring invalid slashing evidence: {}", err);
+                }
             }
         }
         Ok(committed_blocks)
@@ -743,6 +750,13 @@ impl Node {
             // Measure elapsed time in the view we are leaving (before pacemaker resets)
             let prev_view_start = hs.state.pacemaker.view_start_ms;
             let measured = now_ms.saturating_sub(prev_view_start) as u64;
+
+            // Ensure HotStuff knows the parent link for the certified block if we have it locally.
+            // This allows the 2-chain commit rule to produce a commit target even if the QC arrives
+            // before we processed the corresponding proposal message.
+            if let Some(b) = self.block_store.get(&qc.block_id) {
+                hs.observe_block_header(&b.header);
+            }
 
             let res = hs
                 .on_qc_self(qc, now_ms)
