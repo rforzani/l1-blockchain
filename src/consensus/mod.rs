@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::{
     codec::{header_id, qc_commitment}, crypto::bls::{
         fast_aggregate_verify, has_quorum, verify_qc, verify_sig, vote_msg, BlsAggregate, BlsSignatureBytes, BlsSigner, SignerBitmap
-    }, pos::registry::ValidatorId, types::{Block, BlockHeader, Hash, HotStuffState, Vote, QC} 
+    }, pos::registry::ValidatorId, types::{Block, BlockHeader, Hash, HotStuffState, Vote, QC, SlashingEvidence} 
 };
 
 pub mod dev_loop;
@@ -106,12 +106,17 @@ pub struct HotStuff {
     pub bls_signer: Option<BlsSigner>,    
     parent_index: HashMap<Hash, Hash>,
     aggregators: HashMap<(u64, Hash), VoteAggregator>,  
+    /// For duplicate-vote detection: map (voter_id, view) -> first seen vote
+    vote_log: HashMap<(ValidatorId, u64), Vote>,
+    /// Evidence outbox to be drained by the node for broadcasting
+    evidence_outbox: Vec<SlashingEvidence>,
 }
 
 #[derive(Debug)]
 pub enum Error {
     QcCommitmentMismatch,
     QcInvalid,
+    ProposalUnsafe,
     Unimplemented,
 }
 
@@ -150,6 +155,8 @@ impl HotStuff {
             bls_signer,
             parent_index: HashMap::new(),
             aggregators: HashMap::new(),
+            vote_log: HashMap::new(),
+            evidence_outbox: Vec::new(),
         }
     }
 
@@ -194,17 +201,33 @@ impl HotStuff {
             &block.justify_qc.bitmap,
         );
         if block.header.justify_qc_hash != committed {
+            // Invalid: header does not match QC commitment
+            self.evidence_outbox.push(SlashingEvidence::InvalidProposal {
+                proposer: block.header.proposer_id,
+                block: block.clone(),
+            });
             return Err(Error::QcCommitmentMismatch);
         }
 
-        verify_qc(
+        if verify_qc(
             &block.justify_qc.block_id,
             block.justify_qc.view,
             &block.justify_qc.agg_sig,
             &block.justify_qc.bitmap,
             &self.validator_pks,
         )
-        .map_err(|_| Error::QcInvalid)?;
+        .is_err() {
+            // Invalid QC attached to proposal
+            self.evidence_outbox.push(SlashingEvidence::InvalidProposal {
+                proposer: block.header.proposer_id,
+                block: block.clone(),
+            });
+            return Err(Error::QcInvalid);
+        }
+
+        // Note: Whether this proposal is safe to vote on is evaluated per-recipient in maybe_vote.
+        // A proposal that some replicas cannot vote for (due to differing locks) is not slashable.
+        // We therefore do not treat this as an error at proposal-validation time.
 
         if block.justify_qc.view > self.state.high_qc.view {
             self.state.high_qc = block.justify_qc.clone();
@@ -338,6 +361,23 @@ impl HotStuff {
         let n = self.validator_pks.len();
         if (vote.voter_id as usize) >= n { return None; }
 
+        // Duplicate vote detection: same voter, same view, different block
+        let key = (vote.voter_id, vote.view);
+        if let Some(prev) = self.vote_log.get(&key) {
+            if prev.block_id != vote.block_id {
+                // Emit evidence; keep both votes as-is for transparency
+                self.evidence_outbox.push(SlashingEvidence::DoubleVote {
+                    voter: vote.voter_id,
+                    vote_a: prev.clone(),
+                    vote_b: vote.clone(),
+                });
+                // Do not aggregate the conflicting vote to avoid counting equivocation
+                return None;
+            }
+        } else {
+            self.vote_log.insert(key, vote.clone());
+        }
+
         // Get/create the aggregator for (view, block_id).
         let key = (vote.view, vote.block_id);
         let entry = self.aggregators.entry(key).or_insert_with(|| {
@@ -363,6 +403,13 @@ impl HotStuff {
             }
         }
         None
+    }
+
+    /// Drain any accumulated slashing evidence for broadcasting
+    pub fn drain_evidence(&mut self) -> Vec<SlashingEvidence> {
+        let mut out = Vec::new();
+        core::mem::swap(&mut out, &mut self.evidence_outbox);
+        out
     }
 
     /// Convenience wrapper for [`maybe_vote`] that snapshots the current
