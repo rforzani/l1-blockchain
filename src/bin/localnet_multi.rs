@@ -52,7 +52,9 @@ fn make_validators(n: usize) -> (Vec<Validator>, Vec<BlsSigner>, Vec<[u8;32]>) {
 
         let bls_sk = [(i as u8).wrapping_add(10); 32];
         let bls = BlsSigner::from_sk_bytes(&bls_sk).expect("valid bls sk");
-        let vrf_pub = hash_bytes_sha256(&[(i as u8).wrapping_add(100); 32]);
+        // Use the exact same deterministic seed scheme as nodes for VRF so proofs verify
+        let vrf_signer = SchnorrkelVrfSigner::from_deterministic_seed([(i as u8).wrapping_add(7); 32]);
+        let vrf_pub = vrf_signer.public_bytes();
 
         vals.push(Validator {
             id: i as ValidatorId,

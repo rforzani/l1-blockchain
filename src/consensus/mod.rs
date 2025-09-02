@@ -454,6 +454,8 @@ impl HotStuff {
         let store = TmpStore(self.parent_index.clone());
         self.on_qc(&store, qc, now_ms)
     }
+
+    // Note: dynamic validator reconfiguration is not supported in this module.
 }
 
 impl BlockStore for HotStuff {

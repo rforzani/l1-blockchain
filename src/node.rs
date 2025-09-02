@@ -20,7 +20,7 @@ use crate::codec::{header_signing_bytes, qc_commitment};
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::pos::registry::{StakingConfig, Validator, ValidatorId, ValidatorSet, ValidatorStatus};
 use crate::pos::schedule::ProposerSchedule;
-use crate::crypto::vrf::{build_vrf_msg, vrf_eligible, SchnorrkelVrfSigner, VrfSigner};
+use crate::crypto::vrf::{build_vrf_msg, vrf_eligible, SchnorrkelVrfSigner, VrfSigner, SchnorrkelVrf, VrfPubkey, VrfVerifier};
 use anyhow::{Result, anyhow, bail};
 
 #[derive(Clone)]
@@ -113,6 +113,13 @@ pub struct Node {
     leader_miss: HashMap<ValidatorId, (u32, u128)>,
     /// Avoid repeating early-skip within the same view
     last_early_skip_view: Option<u64>,
+    /// Debug: last reason we skipped voting on a proposal, and at which view
+    last_vote_skip_reason: Option<String>,
+    last_vote_skip_view: Option<u64>,
+    /// Buffered QCs waiting for their certified block header
+    pending_qcs: HashMap<Hash, Vec<QC>>,
+    /// Tracks which block_ids we've already requested from peers
+    requested_blocks: HashSet<Hash>,
 }
 
 struct NodeStateView<'a> {
@@ -225,6 +232,10 @@ impl Node {
             last_observed_proposal_view: None,
             leader_miss: HashMap::new(),
             last_early_skip_view: None,
+            last_vote_skip_reason: None,
+            last_vote_skip_view: None,
+            pending_qcs: HashMap::new(),
+            requested_blocks: HashSet::new(),
         }
     }
 
@@ -416,6 +427,12 @@ impl Node {
             }
         };
 
+        // If this block's height is already applied (or older), discard any pending entry.
+        if block.header.height <= self.chain.height {
+            self.pending_commits.remove(&commit_id);
+            return Ok(());
+        }
+
         // Apply only in-order and on the current tip.
         if block.header.parent_hash != self.chain.tip_hash {
             self.pending_commits.insert(commit_id);
@@ -493,8 +510,66 @@ impl Node {
         Ok(())
     }
 
+    /// Ask peers for a missing block (best-effort). Deduplicated per block id.
+    fn request_block(&mut self, block_id: Hash) {
+        if self.requested_blocks.contains(&block_id) { return; }
+        if let Some(net) = self.consensus_network.as_ref() {
+            let _ = net.broadcast_block_request(block_id);
+            self.requested_blocks.insert(block_id);
+        }
+    }
+
+    /// Lightweight proposer eligibility check that returns a debug reason.
+    fn header_eligibility_check(&self, header: &crate::types::BlockHeader) -> Result<(), String> {
+        // Epoch must match the clock for the given slot
+        let expected_epoch = self.chain.clock.current_epoch(header.slot);
+        if header.epoch != expected_epoch { return Err("wrong_epoch".into()); }
+
+        // Bundle length sanity (bound to our configured default)
+        if header.bundle_len == 0 || header.bundle_len != crate::chain::DEFAULT_BUNDLE_LEN { return Err("bad_bundle_len".into()); }
+
+        let bundle_start = self.chain.clock.bundle_start(header.slot, header.bundle_len);
+
+        // Lookup proposer in current validator set
+        let v = match self.chain.validator_set.get(header.proposer_id) {
+            Some(v) => v,
+            None => return Err("unknown_proposer".into()),
+        };
+
+        if header.vrf_proof.is_empty() {
+            // Alias fallback path: proposer must match schedule
+            match self.chain.schedule.fallback_leader_for_bundle(bundle_start) {
+                Some(expected) if expected == header.proposer_id => Ok(()),
+                _ => Err("fallback_mismatch".into()),
+            }
+        } else {
+            // VRF path: verify proof and threshold eligibility
+            let msg = build_vrf_msg(&self.chain.epoch_seed, bundle_start, header.proposer_id);
+            if !SchnorrkelVrf::vrf_verify(&VrfPubkey(v.vrf_pubkey), &msg, &header.vrf_output, &header.vrf_preout, &header.vrf_proof) {
+                return Err("bad_vrf".into());
+            }
+            let total = self.chain.validator_set.total_stake();
+            if vrf_eligible(v.stake, total, &header.vrf_output, self.chain.tau) { Ok(()) } else { Err("vrf_not_eligible".into()) }
+        }
+    }
+
+    /// Convenience wrapper used by tests: returns true if the header passes eligibility checks.
+    pub fn header_is_eligible(&self, header: &crate::types::BlockHeader) -> bool {
+        self.header_eligibility_check(header).is_ok()
+    }
+
     /// Attempt to apply any pending commits that have become applicable.
     fn try_apply_pending_commits(&mut self) {
+        // First: drop any stale commit ids whose blocks we now know are at/below current height.
+        let cur_h = self.chain.height;
+        let stale: Vec<Hash> = self
+            .pending_commits
+            .iter()
+            .copied()
+            .filter(|h| self.block_store.get(h).map_or(false, |b| b.header.height <= cur_h))
+            .collect();
+        for h in stale { self.pending_commits.remove(&h); }
+
         loop {
             let pend: Vec<Hash> = self.pending_commits.iter().copied().collect();
             let mut progressed = false;
@@ -557,6 +632,34 @@ impl Node {
                         committed_blocks.push(committed);
                     }
                 }
+                ConsensusMessage::BlockRequest { block_id, sender_id: _ } => {
+                    if let Some(b) = self.block_store.get(&block_id).cloned() {
+                        if let Some(net) = self.consensus_network.as_ref() {
+                            let _ = net.broadcast_block_response(b);
+                        }
+                    }
+                }
+                ConsensusMessage::BlockResponse { block, sender_id: _ } => {
+                    let bid = crate::codec::header_id(&block.header);
+                    self.block_store.entry(bid).or_insert_with(|| block.clone());
+                    if let Some(hs) = self.hotstuff.as_mut() { hs.observe_block_header(&block.header); }
+                    if let Some(mut qcs) = self.pending_qcs.remove(&bid) {
+                        let mut commits: Vec<Hash> = Vec::new();
+                        if let Some(hs) = self.hotstuff.as_mut() {
+                            let now_ms = (Self::now_ts() as u128) * 1000;
+                            for qc in qcs.drain(..) {
+                                if let Ok(Some(committed)) = hs.on_qc_self(qc, now_ms) { commits.push(committed); }
+                            }
+                        }
+                        for committed in commits {
+                            if let Err(e) = self.apply_committed_block(committed) {
+                                eprintln!("Failed to apply committed block from buffered QC: {}", e);
+                            }
+                            self.try_apply_pending_commits();
+                            committed_blocks.push(committed);
+                        }
+                    }
+                }
                 ConsensusMessage::ViewChange { view, sender_id, timeout_qc } => {
                     self.handle_view_change(view, sender_id, timeout_qc)?;
                 }
@@ -603,6 +706,34 @@ impl Node {
                     }
                     self.try_apply_pending_commits();
                     committed_blocks.push(committed);
+                }
+            }
+            crate::p2p::ConsensusMessage::BlockRequest { block_id, sender_id: _ } => {
+                if let Some(b) = self.block_store.get(&block_id).cloned() {
+                    if let Some(net) = self.consensus_network.as_ref() {
+                        let _ = net.broadcast_block_response(b);
+                    }
+                }
+            }
+            crate::p2p::ConsensusMessage::BlockResponse { block, sender_id: _ } => {
+                let bid = crate::codec::header_id(&block.header);
+                self.block_store.entry(bid).or_insert_with(|| block.clone());
+                if let Some(hs) = self.hotstuff.as_mut() { hs.observe_block_header(&block.header); }
+                if let Some(mut qcs) = self.pending_qcs.remove(&bid) {
+                    let mut commits: Vec<Hash> = Vec::new();
+                    if let Some(hs) = self.hotstuff.as_mut() {
+                        let now_ms = (Self::now_ts() as u128) * 1000;
+                        for qc in qcs.drain(..) {
+                            if let Ok(Some(committed)) = hs.on_qc_self(qc, now_ms) { commits.push(committed); }
+                        }
+                    }
+                    for committed in commits {
+                        if let Err(e) = self.apply_committed_block(committed) {
+                            eprintln!("Failed to apply committed block from buffered QC: {}", e);
+                        }
+                        self.try_apply_pending_commits();
+                        committed_blocks.push(committed);
+                    }
                 }
             }
             crate::p2p::ConsensusMessage::ViewChange { view, sender_id, timeout_qc } => {
@@ -670,7 +801,26 @@ impl Node {
             }
         }
 
-        // 3) Now that we've indexed the header, try to commit using the best QC
+        // 3) If any QCs were buffered for this block, replay them now that we have the header
+        if let Some(mut qcs) = self.pending_qcs.remove(&bid) {
+            let mut commits: Vec<Hash> = Vec::new();
+            if let Some(hs) = self.hotstuff.as_mut() {
+                let now_ms = (Self::now_ts() as u128) * 1000;
+                for qc in qcs.drain(..) {
+                    if let Ok(Some(committed)) = hs.on_qc_self(qc, now_ms) {
+                        commits.push(committed);
+                    }
+                }
+            }
+            for committed in commits {
+                if let Err(e) = self.apply_committed_block(committed) {
+                    eprintln!("Failed to apply committed block via buffered QC: {}", e);
+                }
+                self.try_apply_pending_commits();
+            }
+        }
+
+        // Additionally, now that we've indexed the header, try to commit using the best QC
         if let Some(hs) = self.hotstuff.as_mut() {
             let now_ms = (Self::now_ts() as u128) * 1000;
             if let Ok(Some(committed)) = hs.on_qc_self(hs.state.high_qc.clone(), now_ms) {
@@ -682,6 +832,15 @@ impl Node {
         }
 
         // 4) Generate and send vote if we should vote on this proposal
+        // Before voting, ensure the header is proposer-eligible under VRF/schedule rules.
+        // Perform this check BEFORE mutably borrowing HotStuff to avoid borrow conflicts.
+        if let Err(reason) = self.header_eligibility_check(&block.header) {
+            // Do not vote for ineligible proposals; they would create QCs that
+            // cannot be applied, stalling height under load.
+            self.last_vote_skip_reason = Some(reason.clone());
+            self.last_vote_skip_view = Some(block.header.view);
+            return Ok(());
+        }
         if let Some(hs) = self.hotstuff.as_mut() {
             if let Some(vote) = hs.maybe_vote_self(&block) {
                 if let Some(qc) = hs.on_vote(vote.clone()) {
@@ -748,6 +907,11 @@ impl Node {
             // before we processed the corresponding proposal message.
             if let Some(b) = self.block_store.get(&qc.block_id) {
                 hs.observe_block_header(&b.header);
+            } else {
+                // Missing certified block: request from peers and buffer the QC for retry
+                self.request_block(qc.block_id);
+                self.pending_qcs.entry(qc.block_id).or_default().push(qc);
+                return Ok(None);
             }
 
             let res = hs
@@ -887,6 +1051,7 @@ impl Node {
         }
         Ok(())
     }
+
 
     /// Helper used by genesis init to fetch our VRF pubkey.
     fn my_vrf_pubkey(&self) -> [u8; 32] {
@@ -1068,7 +1233,7 @@ impl Node {
     }
 
     fn simulate_block(
-        &self,
+        &mut self,
         limits: BlockSelectionLimits,
     ) -> Result<(BuiltBlock, ApplyResult, Balances, Nonces, Commitments, Available, u64), ProduceError> {
         // ---- VORTEX: PoS gating & deterministic metadata ----
@@ -1086,8 +1251,12 @@ impl Node {
             } else if let Some(b) = self.block_store.get(&ph) {
                 (ph, b.header.height)
             } else {
+                // Parent header missing: request it and skip proposing this slot.
+                // Once the block arrives (via BlockResponse/Proposal), buffered QCs
+                // will allow progress.
+                self.request_block(ph);
                 return Err(ProduceError::HeaderBuild(
-                    "missing high_qc parent header; waiting for proposal".into()
+                    "awaiting high_qc parent header fetch".into()
                 ));
             }
         } else {
@@ -1138,25 +1307,18 @@ impl Node {
             .chain
             .schedule
             .fallback_leader_for_bundle(bundle_start);
+        // Only propose if VRF-eligible OR we are the deterministic fallback leader for this bundle.
+        // Do NOT rely on being the HotStuff leader alone; proposing otherwise can create
+        // QCs for blocks that will later fail Chain verification and stall height.
         if !vrf_eligible(me.stake, total, &vrf_out, self.chain.tau) {
-            if am_consensus_leader {
-                // If alias fallback for this bundle selects us, prefer fallback path
-                // by clearing VRF fields so chain accepts via schedule.
-                if fallback == Some(proposer_id) {
-                    vrf_out = [0u8; 32];
-                    vrf_pre = [0u8; 32];
-                    vrf_proof.clear();
-                }
-                // Else keep the proof (might still pass tie-breaker/threshold if near boundary).
-            } else {
-                // Not elected via VRF. Only continue if we're the deterministic fallback leader.
-                if fallback != Some(proposer_id) {
-                    return Err(ProduceError::NotProposer { slot, leader: fallback, mine: Some(proposer_id) });
-                }
-                // Use empty VRF fields to signal alias fallback.
+            if fallback == Some(proposer_id) {
+                // Signal alias fallback by clearing VRF fields (chain will verify against schedule).
                 vrf_out = [0u8; 32];
                 vrf_pre = [0u8; 32];
                 vrf_proof.clear();
+            } else {
+                // Not eligible and not fallback → don't propose this slot/view.
+                return Err(ProduceError::NotProposer { slot, leader: fallback, mine: Some(proposer_id) });
             }
         }
     
@@ -1496,6 +1658,9 @@ impl Node {
 
     pub fn debug_last_apply_error(&self) -> Option<String> { self.last_apply_error.clone() }
 
+    pub fn debug_last_vote_skip_reason(&self) -> Option<String> { self.last_vote_skip_reason.clone() }
+    pub fn debug_last_vote_skip_view(&self) -> Option<u64> { self.last_vote_skip_view }
+
     /// Total number of blocks currently stored in the ephemeral block_store
     pub fn debug_block_store_len(&self) -> usize { self.block_store.len() }
 
@@ -1798,5 +1963,69 @@ mod tests {
         let bid = header_id(&built.block.header);
         assert_eq!(hs.state.high_qc.block_id, bid);
         assert_eq!(hs.state.high_qc.view, built.block.header.view);
+    }
+
+    #[test]
+    fn header_eligibility_checks_fallback_leader() {
+        // Build a simple node with two validators and default schedule/seed
+        let cfg = MempoolConfig {
+            max_avails_per_block: 10,
+            max_reveals_per_block: 10,
+            max_commits_per_block: 10,
+            max_pending_commits_per_account: 10,
+            commit_ttl_blocks: 2,
+            reveal_window_blocks: 2,
+        };
+        let mp = MempoolImpl::new(cfg);
+        let mut node = Node::new(mp.clone(), SigningKey::from_bytes(&[1u8;32]));
+
+        // Two active validators (ids 0,1) with deterministic keys
+        let ed0 = SigningKey::from_bytes(&[1u8; 32]).verifying_key().to_bytes();
+        let ed1 = SigningKey::from_bytes(&[2u8; 32]).verifying_key().to_bytes();
+        let bls0 = BlsSigner::from_sk_bytes(&[10u8; 32]).unwrap();
+        let bls1 = BlsSigner::from_sk_bytes(&[11u8; 32]).unwrap();
+        let v0 = Validator { id: 0, ed25519_pubkey: ed0, bls_pubkey: Some(bls0.public_key_bytes()), vrf_pubkey: [3u8; 32], stake: 1_000, status: ValidatorStatus::Active };
+        let v1 = Validator { id: 1, ed25519_pubkey: ed1, bls_pubkey: Some(bls1.public_key_bytes()), vrf_pubkey: [4u8; 32], stake: 1_000, status: ValidatorStatus::Active };
+        node.init_with_shared_validator_set(vec![v0, v1], bls0);
+
+        // Next block will have slot/height = 1
+        let slot = 1u64;
+        let epoch = node.chain.clock.current_epoch(slot);
+        let bundle_start = node.chain.clock.bundle_start(slot, DEFAULT_BUNDLE_LEN);
+        let expected = node.chain.schedule.fallback_leader_for_bundle(bundle_start).expect("leader");
+
+        // Build a header using the non-leader and no VRF proof → ineligible
+        let non_leader = 1 - (expected as i64) as i64; // 0 or 1 other side
+        let non_leader = if non_leader < 0 { 0 } else { non_leader as u64 };
+        let h_bad = crate::types::BlockHeader {
+            parent_hash: node.chain.tip_hash,
+            height: 1,
+            txs_root: [0u8;32],
+            receipts_root: [0u8;32],
+            gas_used: 0,
+            randomness: [0u8;32],
+            reveal_set_root: [0u8;32],
+            il_root: [0u8;32],
+            exec_base_fee: node.chain.fee_state.exec_base,
+            commit_base_fee: node.chain.fee_state.commit_base,
+            avail_base_fee: node.chain.fee_state.commit_base,
+            timestamp: 0,
+            slot,
+            epoch,
+            proposer_id: non_leader,
+            signature: [0u8;64],
+            bundle_len: DEFAULT_BUNDLE_LEN,
+            vrf_preout: [0u8;32],
+            vrf_output: [0u8;32],
+            vrf_proof: vec![],
+            view: 1,
+            justify_qc_hash: [0u8;32],
+        };
+        assert_eq!(node.header_is_eligible(&h_bad), false);
+
+        // Same but with the expected fallback leader → eligible
+        let mut h_ok = h_bad.clone();
+        h_ok.proposer_id = expected;
+        assert_eq!(node.header_is_eligible(&h_ok), true);
     }
 }

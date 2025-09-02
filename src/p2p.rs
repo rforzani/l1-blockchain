@@ -48,6 +48,10 @@ pub enum ConsensusMessage {
     },
     /// Gossip slashing evidence for misbehavior
     SlashEvidence(SlashingEvidence),
+    /// Request a block by its header id
+    BlockRequest { block_id: Hash, sender_id: ValidatorId },
+    /// Provide a full block in response to a request
+    BlockResponse { block: Block, sender_id: ValidatorId },
 }
 
 /// P2P Network Behaviour combining all protocols
@@ -252,6 +256,8 @@ impl ConsensusNetwork {
             "hotstuff-qcs",
             "hotstuff-view-changes",
             "hotstuff-slash-evidence",
+            "hotstuff-block-req",
+            "hotstuff-block-resp",
         ];
         
         for topic_str in &topics {
@@ -371,6 +377,18 @@ impl ConsensusNetwork {
             self.broadcast_message(msg)?;
         }
         Ok(())
+    }
+
+    /// Broadcast a request for a specific block header/body
+    pub fn broadcast_block_request(&self, block_id: Hash) -> Result<()> {
+        let msg = ConsensusMessage::BlockRequest { block_id, sender_id: self.validator_id };
+        self.broadcast_message(msg)
+    }
+
+    /// Broadcast a block in response to a request
+    pub fn broadcast_block_response(&self, block: Block) -> Result<()> {
+        let msg = ConsensusMessage::BlockResponse { block, sender_id: self.validator_id };
+        self.broadcast_message(msg)
     }
 
     /// Broadcast a view change message
@@ -603,7 +621,9 @@ impl NetworkTask {
                 ConsensusMessage::Proposal { sender_id, .. } |
                 ConsensusMessage::Vote { sender_id, .. } |
                 ConsensusMessage::QC { sender_id, .. } |
-                ConsensusMessage::ViewChange { sender_id, .. } => {
+                ConsensusMessage::ViewChange { sender_id, .. } |
+                ConsensusMessage::BlockRequest { sender_id, .. } |
+                ConsensusMessage::BlockResponse { sender_id, .. } => {
                     self.validator_to_peer.lock().unwrap().insert(*sender_id, source);
                 }
                 ConsensusMessage::SlashEvidence(_) => {}
@@ -625,6 +645,8 @@ impl NetworkTask {
             ConsensusMessage::QC { .. } => IdentTopic::new("hotstuff-qcs"),
             ConsensusMessage::ViewChange { .. } => IdentTopic::new("hotstuff-view-changes"),
             ConsensusMessage::SlashEvidence(_) => IdentTopic::new("hotstuff-slash-evidence"),
+            ConsensusMessage::BlockRequest { .. } => IdentTopic::new("hotstuff-block-req"),
+            ConsensusMessage::BlockResponse { .. } => IdentTopic::new("hotstuff-block-resp"),
         };
         
         let data = serde_json::to_vec(&msg)

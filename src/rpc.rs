@@ -267,6 +267,8 @@ struct HotStuffDebugResp {
     validator_id: Option<u64>,
     aggregators: Vec<AggregatorEntryResp>,
     parent_index_len: Option<usize>,
+    last_vote_skip_view: Option<u64>,
+    last_vote_skip_reason: Option<String>,
 }
 
 async fn debug_hotstuff(State(state): State<AppState>) -> Json<HotStuffDebugResp> {
@@ -278,6 +280,8 @@ async fn debug_hotstuff(State(state): State<AppState>) -> Json<HotStuffDebugResp
         validator_id: None,
         aggregators: Vec::new(),
         parent_index_len: None,
+        last_vote_skip_view: None,
+        last_vote_skip_reason: None,
     };
     if let Some(hs) = node.hotstuff() {
         resp.current_view = Some(hs.state.current_view);
@@ -286,6 +290,8 @@ async fn debug_hotstuff(State(state): State<AppState>) -> Json<HotStuffDebugResp
         resp.validator_id = Some(hs.validator_id as u64);
         resp.parent_index_len = node.debug_parent_index_len();
     }
+    resp.last_vote_skip_view = node.debug_last_vote_skip_view();
+    resp.last_vote_skip_reason = node.debug_last_vote_skip_reason();
     if let Some(entries) = node.debug_hotstuff_aggregators() {
         for (view, bid, votes, quorum) in entries {
             resp.aggregators.push(AggregatorEntryResp { view, block_id: hex::encode(bid), votes, quorum });
