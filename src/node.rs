@@ -537,9 +537,11 @@ impl Node {
         };
 
         if header.vrf_proof.is_empty() {
-            // Alias fallback path: proposer must match schedule
+            // Alias fallback path: proposer must match schedule or HotStuff view leader
+            let view_leader = self.leader_for_view(header.view);
             match self.chain.schedule.fallback_leader_for_bundle(bundle_start) {
                 Some(expected) if expected == header.proposer_id => Ok(()),
+                _ if header.proposer_id == view_leader => Ok(()),
                 _ => Err("fallback_mismatch".into()),
             }
         } else {
@@ -1979,14 +1981,17 @@ mod tests {
         let mp = MempoolImpl::new(cfg);
         let mut node = Node::new(mp.clone(), SigningKey::from_bytes(&[1u8;32]));
 
-        // Two active validators (ids 0,1) with deterministic keys
+        // Three active validators (ids 0,1,2) with deterministic keys
         let ed0 = SigningKey::from_bytes(&[1u8; 32]).verifying_key().to_bytes();
         let ed1 = SigningKey::from_bytes(&[2u8; 32]).verifying_key().to_bytes();
+        let ed2 = SigningKey::from_bytes(&[3u8; 32]).verifying_key().to_bytes();
         let bls0 = BlsSigner::from_sk_bytes(&[10u8; 32]).unwrap();
         let bls1 = BlsSigner::from_sk_bytes(&[11u8; 32]).unwrap();
+        let bls2 = BlsSigner::from_sk_bytes(&[12u8; 32]).unwrap();
         let v0 = Validator { id: 0, ed25519_pubkey: ed0, bls_pubkey: Some(bls0.public_key_bytes()), vrf_pubkey: [3u8; 32], stake: 1_000, status: ValidatorStatus::Active };
         let v1 = Validator { id: 1, ed25519_pubkey: ed1, bls_pubkey: Some(bls1.public_key_bytes()), vrf_pubkey: [4u8; 32], stake: 1_000, status: ValidatorStatus::Active };
-        node.init_with_shared_validator_set(vec![v0, v1], bls0);
+        let v2 = Validator { id: 2, ed25519_pubkey: ed2, bls_pubkey: Some(bls2.public_key_bytes()), vrf_pubkey: [5u8; 32], stake: 1_000, status: ValidatorStatus::Active };
+        node.init_with_shared_validator_set(vec![v0, v1, v2], bls0);
 
         // Next block will have slot/height = 1
         let slot = 1u64;
@@ -1994,9 +1999,12 @@ mod tests {
         let bundle_start = node.chain.clock.bundle_start(slot, DEFAULT_BUNDLE_LEN);
         let expected = node.chain.schedule.fallback_leader_for_bundle(bundle_start).expect("leader");
 
-        // Build a header using the non-leader and no VRF proof → ineligible
-        let non_leader = 1 - (expected as i64) as i64; // 0 or 1 other side
-        let non_leader = if non_leader < 0 { 0 } else { non_leader as u64 };
+        // Build a header using a validator that is neither the fallback leader nor the view leader
+        let view_leader = node.leader_for_view(1);
+        let non_leader = [0u64,1u64,2u64]
+            .into_iter()
+            .find(|id| *id != expected && *id != view_leader)
+            .expect("other validator");
         let h_bad = crate::types::BlockHeader {
             parent_hash: node.chain.tip_hash,
             height: 1,

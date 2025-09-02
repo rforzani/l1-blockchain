@@ -1,20 +1,19 @@
 // tests/hotstuff_consensus.rs
 
-use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, Signer};
 use bitvec::vec::BitVec;
 
 use l1_blockchain::{
     consensus::HotStuff,
-    crypto::bls::{BlsSigner, vote_msg, BlsAggregate},
-    types::{HotStuffState, Pacemaker, QC, Hash},
+    crypto::bls::BlsSigner,
+    types::{HotStuffState, Pacemaker, QC, Block, BlockHeader},
     node::{Node, ConsensusConfig, PacemakerConfig},
     mempool::{MempoolImpl, MempoolConfig, BlockSelectionLimits},
     p2p::create_test_network,
     pos::registry::ValidatorId,
-    codec::qc_commitment,
+    codec::{qc_commitment, header_signing_bytes},
     crypto::hash_bytes_sha256,
+    chain::DEFAULT_BUNDLE_LEN,
 };
 
 /// Helper to create a valid genesis QC for testing  
@@ -215,6 +214,114 @@ async fn test_three_node_consensus_basic_proposal() {
     println!("Node 0 high_qc view: {}", hs_0.state.high_qc.view);
     println!("Node 1 high_qc view: {}", hs_1.state.high_qc.view);
     println!("Node 2 high_qc view: {}", hs_2.state.high_qc.view);
+}
+
+#[tokio::test]
+async fn test_view_leader_without_alias_gathers_votes() {
+    // Create BLS keys and signers for three validators
+    let bls_key_0 = [40u8; 32];
+    let bls_key_1 = [41u8; 32];
+    let bls_key_2 = [42u8; 32];
+    let bls_signer_0 = BlsSigner::from_sk_bytes(&bls_key_0).unwrap();
+    let bls_signer_1 = BlsSigner::from_sk_bytes(&bls_key_1).unwrap();
+    let bls_signer_2 = BlsSigner::from_sk_bytes(&bls_key_2).unwrap();
+    let active_bls_pks = vec![
+        bls_signer_0.public_key_bytes(),
+        bls_signer_1.public_key_bytes(),
+        bls_signer_2.public_key_bytes(),
+    ];
+
+    // Shared genesis QC
+    let genesis_qc = create_genesis_qc(&[bls_signer_0.clone(), bls_signer_1.clone(), bls_signer_2.clone()]);
+
+    // Validator set and schedule used for leader computation
+    use l1_blockchain::pos::registry::{Validator, ValidatorStatus, StakingConfig, ValidatorSet};
+    use l1_blockchain::pos::schedule::{AliasSchedule, ProposerSchedule};
+    let validators = vec![
+        Validator { id: 0, ed25519_pubkey: SigningKey::from_bytes(&[1u8;32]).verifying_key().to_bytes(), bls_pubkey: Some(bls_signer_0.public_key_bytes()), vrf_pubkey: hash_bytes_sha256(&[150u8;32]), stake: 1_000_000, status: ValidatorStatus::Active },
+        Validator { id: 1, ed25519_pubkey: SigningKey::from_bytes(&[2u8;32]).verifying_key().to_bytes(), bls_pubkey: Some(bls_signer_1.public_key_bytes()), vrf_pubkey: hash_bytes_sha256(&[151u8;32]), stake: 1_000_000, status: ValidatorStatus::Active },
+        Validator { id: 2, ed25519_pubkey: SigningKey::from_bytes(&[3u8;32]).verifying_key().to_bytes(), bls_pubkey: Some(bls_signer_2.public_key_bytes()), vrf_pubkey: hash_bytes_sha256(&[152u8;32]), stake: 1_000_000, status: ValidatorStatus::Active },
+    ];
+    let cfg = StakingConfig { min_stake:1, unbonding_epochs:1, max_validators:u32::MAX };
+    let set = ValidatorSet::from_genesis(0, &cfg, validators.clone());
+    let seed = hash_bytes_sha256(b"l1-blockchain/test-epoch-seed:v1");
+    let mut schedule = AliasSchedule::new();
+    schedule.rebuild(0, 1_024, &set, seed);
+
+    // Determine a view where view leader differs from alias fallback leader
+    let alias_leader = schedule.fallback_leader_for_bundle(0).expect("alias");
+    let mut view: u64 = 1;
+    let mut view_leader = schedule.leader_for_view(view).expect("leader");
+    while view_leader == alias_leader {
+        view += 1;
+        view_leader = schedule.leader_for_view(view).expect("leader");
+    }
+
+    // Build nodes and networks
+    let mut node_0 = create_test_node_with_shared_validators(0, validators.clone(), bls_signer_0, active_bls_pks.clone(), genesis_qc.clone());
+    let mut node_1 = create_test_node_with_shared_validators(1, validators.clone(), bls_signer_1, active_bls_pks.clone(), genesis_qc.clone());
+    let mut node_2 = create_test_node_with_shared_validators(2, validators.clone(), bls_signer_2, active_bls_pks.clone(), genesis_qc.clone());
+    let networks = create_test_network(vec![0,1,2]).await.expect("network");
+    node_0.set_consensus_network(networks[0].clone());
+    node_1.set_consensus_network(networks[1].clone());
+    node_2.set_consensus_network(networks[2].clone());
+
+    // Align HotStuff views
+    for n in [&mut node_0, &mut node_1, &mut node_2] {
+        if let Some(hs) = n.hotstuff_mut() { hs.state.current_view = view; }
+    }
+
+    // Manually craft block with empty VRF proof
+    let qc_hash = qc_commitment(genesis_qc.view, &genesis_qc.block_id, &genesis_qc.agg_sig, &genesis_qc.bitmap);
+    let mut header = BlockHeader {
+        parent_hash: genesis_qc.block_id,
+        height: 1,
+        txs_root: [0u8;32],
+        receipts_root: [0u8;32],
+        gas_used: 0,
+        randomness: [0u8;32],
+        reveal_set_root: [0u8;32],
+        il_root: [0u8;32],
+        exec_base_fee: 0,
+        commit_base_fee: 0,
+        avail_base_fee: 0,
+        timestamp: 0,
+        slot: 1,
+        epoch: 0,
+        proposer_id: view_leader,
+        signature: [0u8;64],
+        bundle_len: DEFAULT_BUNDLE_LEN,
+        vrf_preout: [0u8;32],
+        vrf_output: [0u8;32],
+        vrf_proof: Vec::new(),
+        view,
+        justify_qc_hash: qc_hash,
+    };
+    let preimage = header_signing_bytes(&header);
+    let signer = SigningKey::from_bytes(&[(view_leader + 1) as u8;32]);
+    header.signature = signer.sign(&preimage).to_bytes();
+    let block = Block::new(Vec::new(), header, genesis_qc.clone());
+
+    // Broadcast proposal from view leader
+    networks[view_leader as usize].broadcast_proposal(block, None).unwrap();
+
+    // Process messages to propagate proposal and votes
+    for _ in 0..2 {
+        node_0.process_consensus_messages().unwrap();
+        node_1.process_consensus_messages().unwrap();
+        node_2.process_consensus_messages().unwrap();
+    }
+
+    // Verify some node collected a vote for this view
+    let mut found = false;
+    for n in [&node_0, &node_1, &node_2] {
+        let hs = n.hotstuff().unwrap();
+        if hs.debug_aggregators().iter().any(|(v, _bid, c)| *v == view && *c >= 1) {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "proposal should gather votes");
 }
 
 #[tokio::test]
